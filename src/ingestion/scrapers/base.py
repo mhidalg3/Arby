@@ -1,0 +1,100 @@
+"""Base class for platform-specific scrapers.
+
+Each platform implementation lives in its own module under this directory.
+The base class defines the contract; concrete scrapers handle the platform's
+quirks (auth, rate limits, API shape, anti-bot countermeasures).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+
+import structlog
+
+log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class RawOddsSnapshot:
+    """A single odds observation as scraped from a platform.
+
+    `raw_*` fields preserve the platform's original strings so the semantic
+    layer can resolve them to canonical identifiers without losing context.
+    """
+
+    platform: str
+    platform_event_id: str
+    raw_event_name: str
+    raw_market_name: str
+    raw_outcome_name: str
+    decimal_odds: float
+    max_stake: float | None
+    timestamp: float  # unix epoch seconds
+
+
+class BaseScraper(ABC):
+    """Contract for platform scrapers.
+
+    Concrete subclasses implement `fetch_live_soccer()` to yield snapshots
+    from a single polling pass. The framework calls this in a loop with
+    error handling and back-off.
+    """
+
+    platform_name: str
+    poll_interval_sec: float = 5.0
+    backoff_seconds_on_error: float = 30.0
+
+    @abstractmethod
+    async def fetch_live_soccer(self) -> AsyncIterator[RawOddsSnapshot]:
+        """Yield odds snapshots for all currently-live soccer matches.
+
+        Implementations should yield as data becomes available rather than
+        buffering an entire response — this lets downstream consumers begin
+        processing while the next page is fetched.
+        """
+        # Empty async generator stub; subclasses must override.
+        if False:  # pragma: no cover
+            yield  # type: ignore[unreachable]
+
+    async def poll_forever(
+        self,
+        output_queue: asyncio.Queue[RawOddsSnapshot],
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
+        """Run an infinite polling loop with error handling and back-off."""
+        stop = stop_event or asyncio.Event()
+        bound_log = log.bind(platform=self.platform_name)
+        bound_log.info("scraper.started", poll_interval_sec=self.poll_interval_sec)
+
+        while not stop.is_set():
+            try:
+                count = 0
+                async for snapshot in self.fetch_live_soccer():
+                    await output_queue.put(snapshot)
+                    count += 1
+                bound_log.debug("scraper.poll_complete", snapshots=count)
+            except asyncio.CancelledError:
+                bound_log.info("scraper.cancelled")
+                raise
+            except Exception as exc:
+                bound_log.exception(
+                    "scraper.poll_failed",
+                    error=str(exc),
+                    backoff_seconds=self.backoff_seconds_on_error,
+                )
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=self.backoff_seconds_on_error)
+                    break  # stop was set during backoff
+                except TimeoutError:
+                    continue
+
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.poll_interval_sec)
+                break
+            except TimeoutError:
+                pass
+
+        bound_log.info("scraper.stopped")
