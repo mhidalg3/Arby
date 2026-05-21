@@ -1,9 +1,4 @@
 # Arby
-#    ________  ________  ________  ________ 
-#   /        \/        \/       / /    /   \
-#  /         /         /        \/         /
-# /         /        _/         /\__      / 
-# \___/____/\____/___/\________/   \_____/  
 
 Cross-platform sports betting arbitrage detection and execution for Argentine soccer markets.
 
