@@ -96,7 +96,7 @@ class PartitionPair(Base):
     validated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class OpportunityStatus(str, enum.Enum):
+class OpportunityStatus(enum.StrEnum):
     DETECTED = "detected"
     APPROVED = "approved"
     LEG_A_PENDING = "leg_a_pending"

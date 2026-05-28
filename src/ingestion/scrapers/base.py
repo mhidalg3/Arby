@@ -21,12 +21,19 @@ log = structlog.get_logger(__name__)
 class RawOddsSnapshot:
     """A single odds observation as scraped from a platform.
 
-    `raw_*` fields preserve the platform's original strings so the semantic
-    layer can resolve them to canonical identifiers without losing context.
+    `raw_*` fields preserve the platform's user-facing labels so the
+    semantic layer can resolve them to canonical identifiers without
+    losing context. `platform_*_id` fields are the platform's own
+    stable handles, used by downstream layers to address the same
+    selection across snapshots (staleness checks, eventual bet
+    placement) without relying on string matching against labels that
+    may change.
     """
 
     platform: str
     platform_event_id: str
+    platform_market_id: str
+    platform_outcome_id: str
     raw_event_name: str
     raw_market_name: str
     raw_outcome_name: str
@@ -55,9 +62,12 @@ class BaseScraper(ABC):
         buffering an entire response — this lets downstream consumers begin
         processing while the next page is fetched.
         """
-        # Empty async generator stub; subclasses must override.
+        # Empty async generator stub; subclasses must override. The
+        # never-reached `yield` is what tells the type checker this is
+        # an async generator (rather than a coroutine returning an
+        # AsyncIterator), which is what subclasses actually implement.
         if False:  # pragma: no cover
-            yield  # type: ignore[unreachable]
+            yield
 
     async def poll_forever(
         self,

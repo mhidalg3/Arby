@@ -37,6 +37,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "ipython>=8.0",
+    "pyyaml>=6.0",
+    "types-pyyaml>=6.0",
 ]
 
 [build-system]

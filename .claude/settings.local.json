@@ -1,6 +1,34 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(uv run *)",
+      "Bash(uv sync *)",
+      "Skill(claude-api)",
+      "Bash(INGESTION_RUN_SECONDS=1800 uv run python scripts/run_ingestion_daemon.py)",
+      "Bash(echo \"ingestion exited $?\")",
+      "Bash(DETECTOR_RUN_SECONDS=1800 DETECTOR_MIN_MARGIN_PCT=0.5 uv run python scripts/run_arb_detector.py)",
+      "Bash(echo \"detector exited $?\")",
+      "Bash(docker exec *)",
+      "Bash(echo \"odds:raw = $\\(docker exec arby-redis redis-cli XLEN odds:raw\\)\")",
+      "Bash(echo \"arb:opportunities = $\\(docker exec arby-redis redis-cli XLEN arb:opportunities\\)\")",
+      "Read(//private/tmp/**)",
+      "Bash(echo \"  odds:raw          = $\\(docker exec arby-redis redis-cli XLEN odds:raw\\)\")",
+      "Bash(echo \"  arb:opportunities = $\\(docker exec arby-redis redis-cli XLEN arb:opportunities\\)\")",
+      "Bash(docker compose *)",
+      "Bash(mkdir -p /tmp/arby_smoke_30min)",
+      "Bash(INGESTION_RUN_SECONDS=1810 uv run python scripts/run_ingestion_daemon.py)",
+      "Bash(echo \"ingestion PID=$!\")",
+      "Bash(grep -B1 \"^platform$\")",
+      "Bash(grep -v \"^--$\")",
+      "Bash(grep -v \"^platform$\")",
+      "Bash(python3)",
+      "Bash(kill -9 47694 47699)",
+      "Bash(pkill -9 -f \"recon_watchdog\")",
+      "Bash(KICKOFF_UTC=2026-05-27T22:00:00Z uv run *)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "postgres"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

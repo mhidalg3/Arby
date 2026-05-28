@@ -1,0 +1,859 @@
+# Labeled partition validation test set.
+#
+# Each entry is a candidate pair of bets and a ground-truth label indicating
+# whether the pair forms a valid partition (P(A ∪ B) = 1 and P(¬A ∧ ¬B) = 0)
+# under the given match context.
+#
+# The partition validator's job is to label each pair correctly. False
+# positives (predicting `valid` when the truth is `invalid`) are the dangerous
+# error: they cause the system to place an unhedged bet. The cases below are
+# weighted to expose the common trap shapes — win/loss without a draw, integer
+# over/under push, asian handicap overlap, scope mismatch between halves and
+# full match, double-chance overlap, goalscorer overlap, and knockout vs
+# 90-minute scope confusion.
+#
+# Add new cases via the partition-test-case-generator skill.
+
+# ---- BTTS (both teams to score) ----
+
+- id: btts_clean_yes_no
+  desc_a: "Ambos equipos marcan: Sí"
+  desc_b: "Ambos equipos marcan: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Strict binary: in any match either both teams score or at least one does not."
+  edge_case_category: btts
+
+- id: btts_yes_vs_no_libertadores_group
+  desc_a: "BTTS Yes"
+  desc_b: "BTTS No"
+  match_context: {competition: "Copa Libertadores", stage: "group_stage", is_knockout: false}
+  expected: valid
+  reasoning: "BTTS yes/no partitions outcome space regardless of competition or stage."
+  edge_case_category: btts
+
+- id: btts_yes_vs_no_final_with_et
+  desc_a: "Ambos equipos marcan: Sí (todo el partido incluyendo tiempo extra)"
+  desc_b: "Ambos equipos marcan: No (todo el partido incluyendo tiempo extra)"
+  match_context: {competition: "Copa Argentina", stage: "final", is_knockout: true}
+  expected: valid
+  reasoning: "BTTS scope (full match incl. ET) is explicit and consistent on both sides; binary holds."
+  edge_case_category: btts
+
+- id: btts_yes_vs_no_river_boca
+  desc_a: "Ambos marcan"
+  desc_b: "No ambos marcan"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Lexical variants of BTTS yes/no still form a strict binary."
+  edge_case_category: btts
+
+- id: btts_first_half_clean
+  desc_a: "Ambos marcan en el primer tiempo: Sí"
+  desc_b: "Ambos marcan en el primer tiempo: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "BTTS scoped to first half is a clean binary within that scope."
+  edge_case_category: btts
+
+- id: btts_yes_vs_winner_mismatch
+  desc_a: "Ambos marcan: Sí"
+  desc_b: "Gana Boca Juniors"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Different markets: Boca can win 2-1 (both score, Boca wins — overlap) or 1-0 (no BTTS, Boca wins — overlap) or draw 1-1 (covered by A only) or lose (covered by neither)."
+  edge_case_category: different_market
+
+- id: btts_full_vs_first_half_scope_mismatch
+  desc_a: "Ambos marcan en el partido completo: Sí"
+  desc_b: "Ambos marcan en el primer tiempo: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Scopes mismatch: a match where only one team scores in 1H but both score in 2H satisfies both legs — overlap."
+  edge_case_category: scope_mismatch
+
+# ---- Over / Under total goals (half-line, safe) ----
+
+- id: ou_2_5_total_clean
+  desc_a: "Más de 2.5 goles"
+  desc_b: "Menos de 2.5 goles"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Half-goal line cannot push; every match has either ≥3 or ≤2 total goals."
+  edge_case_category: half_line
+
+- id: ou_1_5_total_clean
+  desc_a: "Over 1.5 goles"
+  desc_b: "Under 1.5 goles"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Strict 1.5 line: 0 or 1 goals → under; 2+ → over."
+  edge_case_category: half_line
+
+- id: ou_3_5_total_clean
+  desc_a: "Más de 3.5 goles totales"
+  desc_b: "Menos de 3.5 goles totales"
+  match_context: {competition: "Copa de la Liga Profesional", stage: "group_stage", is_knockout: false}
+  expected: valid
+  reasoning: "Half line at 3.5 partitions cleanly."
+  edge_case_category: half_line
+
+- id: ou_0_5_total_clean
+  desc_a: "Over 0.5"
+  desc_b: "Under 0.5"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Goal scored vs no goal scored — clean binary at the 0.5 line."
+  edge_case_category: half_line
+
+- id: ou_4_5_total_clean
+  desc_a: "Más de 4.5 goles"
+  desc_b: "Menos de 4.5 goles"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Half line at 4.5 partitions cleanly."
+  edge_case_category: half_line
+
+- id: ou_2_5_first_half
+  desc_a: "Over 2.5 goles primer tiempo"
+  desc_b: "Under 2.5 goles primer tiempo"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Half-goal line within a consistent (first-half) scope partitions cleanly."
+  edge_case_category: half_line
+
+- id: ou_1_5_team_specific
+  desc_a: "River Plate más de 1.5 goles anotados"
+  desc_b: "River Plate menos de 1.5 goles anotados"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Team-scoped half line is a clean binary on that team's goal count."
+  edge_case_category: half_line
+
+- id: ou_9_5_corners
+  desc_a: "Más de 9.5 córners en el partido"
+  desc_b: "Menos de 9.5 córners en el partido"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Corner count half line partitions cleanly."
+  edge_case_category: half_line
+
+# ---- Over / Under with integer line (PUSH trap) ----
+
+- id: ou_2_integer_push
+  desc_a: "Más de 2 goles"
+  desc_b: "Menos de 2 goles"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Exactly 2 goals creates a push: bets are refunded on both legs, so the partition is undefined for that outcome."
+  edge_case_category: integer_push
+
+- id: ou_3_integer_push
+  desc_a: "Over 3 goals"
+  desc_b: "Under 3 goals"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Push at exactly 3 goals — not a strict partition."
+  edge_case_category: integer_push
+
+- id: ou_corners_10_push
+  desc_a: "Más de 10 córners"
+  desc_b: "Menos de 10 córners"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Push on exactly 10 corners breaks the binary."
+  edge_case_category: integer_push
+
+- id: ou_cards_4_push
+  desc_a: "Más de 4 tarjetas amarillas"
+  desc_b: "Menos de 4 tarjetas amarillas"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Exact 4 yellow cards pushes."
+  edge_case_category: integer_push
+
+- id: ou_team_1_push
+  desc_a: "Boca más de 1 gol"
+  desc_b: "Boca menos de 1 gol"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Exactly 1 Boca goal pushes — neither leg wins outright."
+  edge_case_category: integer_push
+
+- id: ou_first_half_1_push
+  desc_a: "Over 1 gol primer tiempo"
+  desc_b: "Under 1 gol primer tiempo"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "First-half integer line pushes on exactly 1 goal."
+  edge_case_category: integer_push
+
+# ---- 1X2 collapsed to 2-way via double chance ----
+
+- id: dc_home_vs_x2
+  desc_a: "Gana Boca Juniors"
+  desc_b: "Empate o gana River Plate"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "'Boca wins' (1) vs 'Draw or River wins' (X2) — strict 3-way partition collapsed to 2-way."
+  edge_case_category: double_chance_complement
+
+- id: dc_away_vs_1x
+  desc_a: "Gana Independiente"
+  desc_b: "Racing Club gana o empate"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Away (2) vs Home-or-Draw (1X) partitions cleanly."
+  edge_case_category: double_chance_complement
+
+- id: dc_draw_vs_12
+  desc_a: "Empate"
+  desc_b: "Gana San Lorenzo o gana Vélez Sarsfield"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Draw (X) vs No-Draw (12) — clean binary."
+  edge_case_category: double_chance_complement
+
+- id: dc_draw_vs_either_wins
+  desc_a: "Empate"
+  desc_b: "Cualquiera de los dos equipos gana"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Draw vs not-draw is binary at full time of a non-knockout match."
+  edge_case_category: double_chance_complement
+
+- id: dc_1x_vs_2_libertadores
+  desc_a: "Boca Juniors gana o empate"
+  desc_b: "Gana el visitante"
+  match_context: {competition: "Copa Libertadores", stage: "group_stage", is_knockout: false}
+  expected: valid
+  reasoning: "1X vs 2 — clean partition of the 3-way market."
+  edge_case_category: double_chance_complement
+
+- id: dc_home_vs_not_home
+  desc_a: "Gana el local"
+  desc_b: "No gana el local"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Trivial complement on home result."
+  edge_case_category: double_chance_complement
+
+- id: dc_draw_vs_not_draw
+  desc_a: "Empate al final del tiempo regular"
+  desc_b: "No empate al final del tiempo regular"
+  match_context: {competition: "Copa Argentina", stage: "round_of_16", is_knockout: true}
+  expected: valid
+  reasoning: "Draw vs not-draw at 90 min is binary even in knockout — the bet is on the 90-min state, not the tie outcome."
+  edge_case_category: double_chance_complement
+
+- id: dc_away_vs_not_away
+  desc_a: "Gana Newell's Old Boys"
+  desc_b: "Newell's Old Boys no gana"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Win vs not-win on a named team is a strict binary."
+  edge_case_category: double_chance_complement
+
+- id: dc_1x_vs_12_overlap
+  desc_a: "Boca gana o empate (1X)"
+  desc_b: "Boca gana o gana visitante (12)"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both contain Boca-wins outcome — overlap, not a partition."
+  edge_case_category: double_chance_overlap
+
+- id: dc_1x_vs_x2_overlap_draw
+  desc_a: "Doble oportunidad 1X"
+  desc_b: "Doble oportunidad X2"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both contain the draw — overlap on X."
+  edge_case_category: double_chance_overlap
+
+- id: dc_12_vs_x2_overlap_away
+  desc_a: "12 (no empate)"
+  desc_b: "X2 (no gana el local)"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both contain the away-win outcome — overlap."
+  edge_case_category: double_chance_overlap
+
+- id: 1x2_home_vs_away_missing_draw_regular
+  desc_a: "Gana Racing Club"
+  desc_b: "Gana Independiente"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Misses the draw outcome — Racing vs Independiente can tie."
+  edge_case_category: win_loss_trap_non_knockout
+
+# ---- Win/loss trap (the validator's most important catch) ----
+
+- id: win_loss_trap_clasico
+  desc_a: "Gana Boca Juniors"
+  desc_b: "Gana River Plate"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Superclásico in regular season can draw; partition misses X."
+  edge_case_category: win_loss_trap_non_knockout
+
+- id: win_loss_trap_estudiantes_banfield
+  desc_a: "Gana Estudiantes de La Plata"
+  desc_b: "Gana Banfield"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Regular-season match can draw — missing X outcome."
+  edge_case_category: win_loss_trap_non_knockout
+
+- id: win_loss_trap_libertadores_r16_90min
+  desc_a: "Gana Boca en tiempo regular"
+  desc_b: "Gana Palmeiras en tiempo regular"
+  match_context: {competition: "Copa Libertadores", stage: "round_of_16", is_knockout: true}
+  expected: invalid
+  reasoning: "Knockout match can still draw at 90 min and go to ET/penalties; partition misses the 90-min draw."
+  edge_case_category: win_loss_trap_knockout_90min
+
+- id: advance_knockout_qf
+  desc_a: "Avanza River Plate (eliminatoria)"
+  desc_b: "Eliminado River Plate (eliminatoria)"
+  match_context: {competition: "Copa Argentina", stage: "quarter_final", is_knockout: true}
+  expected: valid
+  reasoning: "In knockout one side advances and the other is eliminated; binary holds even with ET/penalties."
+  edge_case_category: to_advance_knockout
+
+- id: advance_knockout_final
+  desc_a: "Campeón: Racing Club"
+  desc_b: "Campeón: Boca Juniors"
+  match_context: {competition: "Copa Argentina", stage: "final", is_knockout: true}
+  expected: valid
+  reasoning: "A cup final produces a single champion via ET/penalties — exhaustive 2-way binary."
+  edge_case_category: to_advance_knockout
+
+- id: advance_knockout_sf
+  desc_a: "Clasifica a la final: Independiente"
+  desc_b: "Clasifica a la final: San Lorenzo"
+  match_context: {competition: "Copa Sudamericana", stage: "semi_final", is_knockout: true}
+  expected: valid
+  reasoning: "Semi-final has exactly one team that reaches the final from this tie."
+  edge_case_category: to_advance_knockout
+
+- id: advance_vs_match_winner_scope_mismatch
+  desc_a: "Avanza Vélez Sarsfield (eliminatoria completa)"
+  desc_b: "Gana Vélez Sarsfield en este partido (90 min)"
+  match_context: {competition: "Copa Libertadores", stage: "round_of_16", is_knockout: true}
+  expected: invalid
+  reasoning: "Different scopes: Vélez can lose the leg yet advance on aggregate, or win the leg and still be eliminated."
+  edge_case_category: to_qualify_scope_mismatch
+
+# ---- Asian Handicap ----
+
+- id: ah_complement_half_line_minus_1_5
+  desc_a: "River Plate -1.5"
+  desc_b: "Boca Juniors +1.5"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Complement on a half-goal AH line: River wins by ≥2 vs everything else."
+  edge_case_category: asian_handicap_half
+
+- id: ah_complement_half_line_minus_2_5
+  desc_a: "Racing Club -2.5"
+  desc_b: "Argentinos Juniors +2.5"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Half-goal AH complement at the 2.5 line: Racing wins by ≥3 vs everything else."
+  edge_case_category: asian_handicap_half
+
+- id: ah_overlap_same_team_pm_0_5
+  desc_a: "Boca AH -0.5"
+  desc_b: "Boca AH +0.5"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both bets are on Boca: -0.5 = Boca wins, +0.5 = Boca wins or draws. Overlap on Boca wins; not a partition."
+  edge_case_category: asian_handicap_overlap
+
+- id: ah_integer_push_minus_1
+  desc_a: "Estudiantes -1"
+  desc_b: "Banfield +1"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Integer AH pushes when winning margin is exactly 1; refund makes the partition undefined."
+  edge_case_category: asian_handicap_push
+
+- id: ah_quarter_line_pm_0_25
+  desc_a: "Newell's Old Boys -0.25"
+  desc_b: "Rosario Central +0.25"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Quarter-goal AH internally splits into two half-line bets; the draw outcome creates half-win/half-loss on each side, not a binary."
+  edge_case_category: asian_handicap_quarter
+
+- id: ah_three_quarter_line_pm_0_75
+  desc_a: "Talleres -0.75"
+  desc_b: "Huracán +0.75"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Three-quarter AH partially refunds when Talleres wins by exactly 1 — not a strict partition."
+  edge_case_category: asian_handicap_quarter
+
+# ---- Goalscorer ----
+
+- id: gs_anytime_cavani_yes_no
+  desc_a: "Edinson Cavani marca en cualquier momento: Sí"
+  desc_b: "Edinson Cavani marca en cualquier momento: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "A named player either scores at some point in the match or does not."
+  edge_case_category: goalscorer_complement
+
+- id: gs_anytime_borja_yes_no
+  desc_a: "Miguel Borja anota: Sí"
+  desc_b: "Miguel Borja anota: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Anytime scorer yes/no on a single player is a clean binary."
+  edge_case_category: goalscorer_complement
+
+- id: gs_first_bareiro_yes_no
+  desc_a: "Adam Bareiro marca el primer gol: Sí"
+  desc_b: "Adam Bareiro marca el primer gol: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "First-scorer-is-X yes/no covers all outcomes including 'no goal scored' on the 'No' side."
+  edge_case_category: goalscorer_complement
+
+- id: gs_last_solari_yes_no
+  desc_a: "Pablo Solari marca el último gol: Sí"
+  desc_b: "Pablo Solari marca el último gol: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Last-scorer-is-X yes/no is a clean binary; the 'No' side covers 0-0 too."
+  edge_case_category: goalscorer_complement
+
+- id: gs_two_players_overlap
+  desc_a: "Marca Lautaro Martínez"
+  desc_b: "Marca Ángel Di María"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both players can score in the same match — overlap. Also neither may score — gap. Not a partition."
+  edge_case_category: goalscorer_overlap
+
+- id: gs_player_vs_team_overlap
+  desc_a: "Marca Julián Álvarez"
+  desc_b: "Marca el equipo rival"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Álvarez scoring and the opponent scoring are independent: overlap on BTTS-yes outcomes; both legs lose on 0-0."
+  edge_case_category: goalscorer_overlap
+
+- id: gs_first_goal_two_players_overlap
+  desc_a: "Primer goleador: Carlos Tevez"
+  desc_b: "Primer goleador: Sebastián Villa"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "First goal can be scored by a third player or no goal at all — not exhaustive."
+  edge_case_category: goalscorer_overlap
+
+- id: gs_anytime_zarate_vs_alario
+  desc_a: "Marca en algún momento Mauro Zárate"
+  desc_b: "Marca en algún momento Lucas Alario"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Anytime-scorer on different players is independent — both can score, neither can score."
+  edge_case_category: goalscorer_overlap
+
+# ---- Half-time vs full-time scope ----
+
+- id: ht_result_clean_binary
+  desc_a: "Boca gana al medio tiempo"
+  desc_b: "Boca no gana al medio tiempo"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Within a single scope (HT), winning vs not winning is a clean binary."
+  edge_case_category: ht_ft_combo
+
+- id: htft_double_clean_binary
+  desc_a: "HT Boca / FT Boca"
+  desc_b: "HT Boca / FT no Boca"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Both bets conditioned on Boca leading at HT; the FT branch is binary, so the conjunction with HT-Boca partitions HT-Boca-conditioned outcomes. Note: this only forms a full partition if the market is interpreted as conditional on HT-Boca; treat as valid for downstream conditional pricing."
+  edge_case_category: ht_ft_combo
+
+- id: ht_result_vs_ft_result_mismatch
+  desc_a: "Boca gana al medio tiempo"
+  desc_b: "Boca gana al final"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Different time scopes: Boca can lead at HT then draw/lose, or trail at HT then win — overlap AND gaps."
+  edge_case_category: ht_ft_confusion
+
+- id: ht_draw_vs_ft_draw_mismatch
+  desc_a: "Empate al medio tiempo"
+  desc_b: "Empate al final"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "HT-draw and FT-draw can each occur independently; overlap on matches drawn at both, gap on no-draws."
+  edge_case_category: ht_ft_confusion
+
+- id: ht_btts_yes_vs_ft_btts_no
+  desc_a: "Both teams score 1H: Yes"
+  desc_b: "Both teams score full match: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "BTTS-1H-yes implies BTTS-full-yes, so the FT 'no' leg excludes the 1H 'yes' set; combined they miss BTTS-1H-no AND BTTS-full-yes (a common pattern)."
+  edge_case_category: scope_mismatch
+
+- id: ht_over_1_5_vs_ft_under_1_5
+  desc_a: "Más de 1.5 goles en el primer tiempo"
+  desc_b: "Menos de 1.5 goles totales"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "1H ≥2 goals implies FT ≥2 goals; the FT-under-1.5 leg excludes 1H ≥2. Combined they miss matches with 1H ≤1 and FT ≥2."
+  edge_case_category: scope_mismatch
+
+# ---- Specific minute / time window ----
+
+- id: first_15_goal_yes_no
+  desc_a: "Gol en los primeros 15 minutos: Sí"
+  desc_b: "Gol en los primeros 15 minutos: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Goal-in-first-N-minutes yes/no is a clean binary."
+  edge_case_category: time_window
+
+- id: first_goal_before_30
+  desc_a: "Primer gol antes del minuto 30"
+  desc_b: "Primer gol después del minuto 30 o no hay gol"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Explicit 'or no goal' tail on the second leg covers the empty-match outcome."
+  edge_case_category: time_window
+
+- id: first_goal_1h_vs_2h_missing_no_goal
+  desc_a: "Primer gol en el primer tiempo"
+  desc_b: "Primer gol en el segundo tiempo"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "If no goal is scored, neither bet wins — missing 0-0 outcome."
+  edge_case_category: time_window_missing_no_goal
+
+# ---- Cards ----
+
+- id: red_card_yes_no
+  desc_a: "Tarjeta roja en el partido: Sí"
+  desc_b: "Tarjeta roja en el partido: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Red card yes/no across the full match is a clean binary."
+  edge_case_category: card_yes_no
+
+- id: yellow_cards_ou_5_5
+  desc_a: "Más de 5.5 tarjetas amarillas"
+  desc_b: "Menos de 5.5 tarjetas amarillas"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Yellow-card total at a half line partitions cleanly."
+  edge_case_category: half_line
+
+- id: card_team_specific_overlap
+  desc_a: "Boca recibe tarjeta roja"
+  desc_b: "River recibe tarjeta roja"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both teams can receive red cards in the same match — not exclusive. Both can also avoid them — not exhaustive."
+  edge_case_category: card_overlap
+
+# ---- Penalties ----
+
+- id: penalty_awarded_yes_no
+  desc_a: "Penal cobrado en el partido: Sí"
+  desc_b: "Penal cobrado en el partido: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Penalty-awarded yes/no is a clean binary."
+  edge_case_category: penalty_yes_no
+
+- id: penalty_scored_yes_no
+  desc_a: "Penal convertido en el partido: Sí"
+  desc_b: "Penal convertido en el partido: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Penalty-converted yes/no is a clean binary."
+  edge_case_category: penalty_yes_no
+
+- id: penalty_by_team_overlap
+  desc_a: "Penal a favor de Racing Club"
+  desc_b: "Penal a favor de Independiente"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both teams can be awarded penalties in the same match — not exclusive. Neither may be — not exhaustive."
+  edge_case_category: penalty_overlap
+
+# ---- Exact goal count ----
+
+- id: exactly_0_goals_vs_at_least_one
+  desc_a: "Resultado 0-0"
+  desc_b: "Al menos un gol en el partido"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "0-0 vs at-least-one-goal is a strict binary."
+  edge_case_category: exact_count
+
+- id: exactly_2_goals_vs_not
+  desc_a: "Exactamente 2 goles totales"
+  desc_b: "Cualquier cantidad de goles distinta de 2"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Exact count vs not-exact-count on integer goal totals partitions cleanly."
+  edge_case_category: exact_count
+
+- id: two_specific_scores_partial
+  desc_a: "Resultado 1-0"
+  desc_b: "Resultado 2-1"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Two specific correct scores cover only two outcomes; the partition is missing all other scorelines."
+  edge_case_category: correct_score_partial
+
+# ---- Correct score ----
+
+- id: correct_score_set_vs_complement
+  desc_a: "Boca gana 2-1, 3-1 o 3-2"
+  desc_b: "Cualquier otro resultado"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "An enumerated set of scorelines vs 'any other result' is a valid binary when 'other' is well-defined."
+  edge_case_category: correct_score_partial
+
+# ---- Half with most goals ----
+
+- id: half_most_goals_first_invalid
+  desc_a: "Más goles en el primer tiempo"
+  desc_b: "Más goles en el segundo tiempo"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "A tie (equal goals each half) is possible — missing the 'equal' outcome including 0-0."
+  edge_case_category: half_with_most_goals
+
+- id: half_most_goals_with_equal
+  desc_a: "Más goles en el primer tiempo"
+  desc_b: "Empate de goles entre tiempos o más en el segundo"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Tie case absorbed into the second leg; partition is now exhaustive."
+  edge_case_category: half_with_most_goals
+
+- id: half_with_first_goal_overlap
+  desc_a: "Primer gol en el primer tiempo"
+  desc_b: "Más goles en el primer tiempo"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Different markets that overlap on matches where the first goal is in 1H AND 1H has more goals."
+  edge_case_category: different_market
+
+# ---- Team to score first ----
+
+- id: team_first_goal_clean
+  desc_a: "Boca anota primero"
+  desc_b: "Boca no anota primero"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Binary on whether Boca scores first — the 'No' side covers opponent-scores-first and 0-0."
+  edge_case_category: team_first_goal
+
+- id: team_first_goal_missing_0_0
+  desc_a: "Boca anota primero"
+  desc_b: "River anota primero"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "0-0 outcome is in neither set — not exhaustive."
+  edge_case_category: missing_no_goal
+
+- id: team_first_goal_full_match
+  desc_a: "Vélez Sarsfield anota el primer gol del partido"
+  desc_b: "Vélez Sarsfield no anota el primer gol del partido"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Team-first-goal yes/no scoped to the full match is binary."
+  edge_case_category: team_first_goal
+
+# ---- Result + BTTS combos ----
+
+- id: result_btts_combo_missing
+  desc_a: "Boca gana y BTTS Sí"
+  desc_b: "Boca gana y BTTS No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both require Boca to win — missing all draw and away-win outcomes."
+  edge_case_category: combo_missing_outcomes
+
+- id: result_btts_combo_complement
+  desc_a: "Boca gana y BTTS Sí"
+  desc_b: "No (Boca gana y BTTS Sí)"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Trivial complement: any bet vs its explicit negation is a partition."
+  edge_case_category: combo_missing_outcomes
+
+- id: winner_to_nil_vs_not
+  desc_a: "River Plate gana sin recibir gol"
+  desc_b: "River Plate no gana sin recibir gol"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Win-to-nil yes/no on a named team is a clean binary."
+  edge_case_category: combo_missing_outcomes
+
+# ---- Total goals ranges ----
+
+- id: total_goals_0_to_3_vs_4_plus
+  desc_a: "0 a 3 goles totales"
+  desc_b: "4 o más goles totales"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Inclusive integer ranges partition the natural numbers — clean binary."
+  edge_case_category: exact_count
+
+- id: total_goals_range_overlap_3
+  desc_a: "0 a 3 goles totales"
+  desc_b: "3 o más goles totales"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both include exactly 3 goals — overlap."
+  edge_case_category: range_overlap
+
+- id: total_goals_range_gap_3
+  desc_a: "0 a 2 goles totales"
+  desc_b: "4 o más goles totales"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Exactly 3 goals is in neither range — gap."
+  edge_case_category: range_gap
+
+# ---- HT/FT combos ----
+
+- id: htft_combo_specific_overlap
+  desc_a: "HT empate / FT Boca"
+  desc_b: "HT Boca / FT Boca"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "Both end with Boca winning at FT but require different HT states; together they cover only two of many Boca-wins paths, missing 'HT visitante / FT Boca' and all non-Boca-wins outcomes."
+  edge_case_category: combo_missing_outcomes
+
+- id: ht_winner_binary_complement
+  desc_a: "Algún equipo lidera al medio tiempo"
+  desc_b: "Empate al medio tiempo"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "HT state is exactly 'someone leads' or 'draw' — clean binary."
+  edge_case_category: ht_ft_combo
+
+- id: clean_sheet_yes_no
+  desc_a: "Boca termina sin recibir gol"
+  desc_b: "Boca recibe al menos un gol"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Clean-sheet yes/no on a named team is a clean binary."
+  edge_case_category: clean_sheet
+
+# ---- Wording / synonyms ----
+
+- id: btts_synonym_cross_language
+  desc_a: "Both Teams To Score: Yes"
+  desc_b: "Ambos equipos marcan: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Cross-language phrasing for the same binary; validator must recognize semantic equivalence."
+  edge_case_category: wording_synonyms
+
+- id: 1x2_synonym_local_visitante
+  desc_a: "Gana el local"
+  desc_b: "Empate o gana el visitante"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Spanish home/away terminology mapped onto 1 vs X2 — same partition as dc_home_vs_x2."
+  edge_case_category: wording_synonyms
+
+- id: similar_words_different_markets
+  desc_a: "Boca anota primero"
+  desc_b: "Boca marca último"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "First-scorer and last-scorer are different markets; Boca can do both (one goal match, or first and last of several) or neither."
+  edge_case_category: different_market
+
+# ---- To-qualify (knockout) ----
+
+- id: to_qualify_libertadores
+  desc_a: "Clasifica River Plate (eliminatoria)"
+  desc_b: "Clasifica Cerro Porteño (eliminatoria)"
+  match_context: {competition: "Copa Libertadores", stage: "round_of_16", is_knockout: true}
+  expected: valid
+  reasoning: "Exactly one side advances from a knockout tie — exhaustive 2-way binary."
+  edge_case_category: to_qualify
+
+- id: to_qualify_vs_to_win_leg
+  desc_a: "Clasifica Independiente (eliminatoria)"
+  desc_b: "Gana Independiente este partido (90 min)"
+  match_context: {competition: "Copa Sudamericana", stage: "quarter_final", is_knockout: true}
+  expected: invalid
+  reasoning: "Different scopes (tie vs single leg); Independiente can lose this leg yet advance on aggregate, or win this leg and be eliminated."
+  edge_case_category: to_qualify_scope_mismatch
+
+- id: to_win_cup_outright
+  desc_a: "Boca campeón Copa Argentina"
+  desc_b: "Otro equipo campeón Copa Argentina"
+  match_context: {competition: "Copa Argentina", stage: "final", is_knockout: true}
+  expected: valid
+  reasoning: "Outright tournament winner: Boca vs anyone else is exhaustive."
+  edge_case_category: outright_tournament
+
+# ---- Niche ----
+
+- id: own_goal_anytime_yes_no
+  desc_a: "Hay gol en contra en el partido: Sí"
+  desc_b: "Hay gol en contra en el partido: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Own-goal yes/no is a clean binary when both books use the same own-goal definition."
+  edge_case_category: own_goal
+
+- id: var_decision_yes_no
+  desc_a: "Decisión revertida por VAR: Sí"
+  desc_b: "Decisión revertida por VAR: No"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "VAR overturn yes/no is a clean binary on the match."
+  edge_case_category: var
+
+- id: corners_ou_10_5
+  desc_a: "Más de 10.5 córners en el partido"
+  desc_b: "10.5 o menos córners en el partido"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Corner total at a half line partitions cleanly."
+  edge_case_category: half_line
+
+- id: clean_sheet_both_teams_overlap
+  desc_a: "Local termina con valla invicta"
+  desc_b: "Visitante termina con valla invicta"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: invalid
+  reasoning: "0-0 means both have clean sheets — overlap. Scoreful matches where neither has a clean sheet are missing — gap."
+  edge_case_category: clean_sheet
+
+# ---- Team-scores binaries ----
+
+- id: team_to_score_yes_no
+  desc_a: "Boca anota al menos un gol"
+  desc_b: "Boca no anota ningún gol"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "Team-scores yes/no is a clean binary on that team's goal count."
+  edge_case_category: team_first_goal
+
+- id: any_team_three_or_more_goals
+  desc_a: "Algún equipo anota 3 o más goles"
+  desc_b: "Ningún equipo llega a 3 goles"
+  match_context: {competition: "Liga Profesional", stage: "regular_season", is_knockout: false}
+  expected: valid
+  reasoning: "'Some team ≥3' vs 'no team ≥3' is the strict negation — clean binary."
+  edge_case_category: exact_count

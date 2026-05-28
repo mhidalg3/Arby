@@ -1,128 +1,152 @@
 """Dutch book arbitrage detection.
 
-Given two complementary bets (where P(A∪B)=1 and P(¬A∧¬B)=0), determine
-whether the implied probabilities sum to less than 1, and if so compute
-the optimal stake allocation that guarantees a profit regardless of outcome.
+Given a set of mutually exclusive and exhaustive outcomes (a partition) priced
+across one or more platforms, determine whether the implied probabilities sum
+to less than 1 and, if so, return the allocation that locks in a profit
+regardless of which outcome occurs.
 
-This module is intentionally pure: no I/O, no LLM calls, no async. It is
-the deterministic financial core that every other component depends on.
+The detector is N-way: it accepts a sequence of `OddsQuote`s of length ≥ 2.
+For Argentine soccer the common shapes are:
+    - 2-way: BTTS yes/no, over/under, draw-no-bet
+    - 3-way: 1X2 (home win / draw / away win)
+    - 4+    : Asian handicap quarter-lines and similar
+
+This module is intentionally pure: no I/O, no LLM calls, no async. It is the
+deterministic financial core that every other component depends on. The
+mechanical "how much do we put on each leg" problem lives in
+`src.arbitrage.stake_allocator`; this file is responsible for deciding whether
+an arb exists, what its theoretical and realized margins are, and packaging
+the result.
 
 Caller responsibilities:
-    - Verify that the two outcomes form a valid partition (handled upstream
+    - Verify that the supplied quotes form a valid partition (handled upstream
       by the semantic layer's partition validator).
-    - Verify that the two quotes refer to the same underlying match.
-    - Verify that the two quotes are from different platforms.
+    - Verify that all quotes refer to the same underlying match.
+    - Verify that no two quotes cover the same outcome (one quote per partition
+      cell). This module does not deduplicate.
 
-This module does not validate those preconditions because doing so would
-require coupling to the storage layer. Tests in tests/unit/test_dutch_book.py
-exercise the math; integration tests verify the full pipeline.
+These preconditions are not checked here because doing so would require
+coupling to the storage and semantic layers. Tests in
+tests/unit/test_dutch_book.py exercise the math; integration tests verify the
+full pipeline.
 """
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
+from src.arbitrage.quotes import OddsQuote
+from src.arbitrage.stake_allocator import allocate_maxmin
 
-@dataclass(frozen=True)
-class OddsQuote:
-    """A single odds quotation from one platform on one outcome."""
-
-    platform: str
-    market_id: str  # canonical market identifier, same across platforms
-    outcome: str  # canonical outcome identifier within the market
-    decimal_odds: float
-    max_stake: float | None  # platform-imposed liquidity cap; None = unbounded
-    timestamp: float  # unix epoch seconds, for staleness checks upstream
+# Re-exported so callers (and tests) can keep importing OddsQuote from here.
+__all__ = ["ArbitrageOpportunity", "OddsQuote", "detect_arbitrage"]
 
 
 @dataclass(frozen=True)
 class ArbitrageOpportunity:
-    """A detected Dutch book opportunity with computed optimal allocation."""
+    """A detected Dutch book opportunity with computed optimal allocation.
 
-    leg_a: OddsQuote
-    leg_b: OddsQuote
-    stake_a: float
-    stake_b: float
+    `margin_pct` is the theoretical margin intrinsic to the odds
+    (`(1 - overround) * 100`). `realized_roi_pct` is the actual return on the
+    capital we will deploy after liquidity caps and stake rounding have been
+    applied; it can be strictly lower than `margin_pct` when rounding breaks
+    the equal-payout property. Both are reported so callers can distinguish a
+    soft market from a placement-constrained one.
+    """
+
+    legs: tuple[OddsQuote, ...]
+    stakes: tuple[float, ...]
     total_stake: float
     guaranteed_profit: float
     margin_pct: float
+    realized_roi_pct: float
+    capital_utilization: float
 
 
 def detect_arbitrage(
-    quote_a: OddsQuote,
-    quote_b: OddsQuote,
+    quotes: Sequence[OddsQuote],
     budget: float,
     min_margin_pct: float = 1.0,
 ) -> ArbitrageOpportunity | None:
-    """Detect a Dutch book opportunity between two complementary bets.
+    """Detect a Dutch book opportunity across N complementary quotes.
 
     Args:
-        quote_a: Odds quote for outcome A from platform X.
-        quote_b: Odds quote for outcome B (the complement of A) from platform Y.
-        budget: Total capital available to allocate across both legs.
-        min_margin_pct: Minimum margin (in percent) below which we return None
-            even though an arb mathematically exists. This filters out
+        quotes: Two or more odds quotes, one per cell of the partition.
+        budget: Total capital available to allocate across all legs.
+        min_margin_pct: Minimum realized ROI (in percent) below which we
+            return None even when an arb mathematically exists. Filters out
             opportunities too small to overcome fees and slippage.
 
     Returns:
-        An ArbitrageOpportunity with optimal stake allocation if an arb
-        exists and meets the margin threshold; None otherwise.
+        An ArbitrageOpportunity with the optimal allocation if an arb exists,
+        meets the margin threshold, and is placeable under each platform's
+        min_stake / stake_increment constraints; otherwise None.
 
     Raises:
-        ValueError: If decimal odds are not strictly greater than 1.0, or
-            if budget is non-positive.
+        ValueError: If fewer than two quotes are supplied, any decimal odds
+            are not strictly greater than 1.0, budget is non-positive, or any
+            `stake_increment` is non-positive.
     """
-    if quote_a.decimal_odds <= 1.0 or quote_b.decimal_odds <= 1.0:
-        raise ValueError(
-            f"Decimal odds must be > 1.0; got {quote_a.decimal_odds=}, "
-            f"{quote_b.decimal_odds=}"
-        )
-    if budget <= 0:
-        raise ValueError(f"Budget must be positive; got {budget=}")
+    if len(quotes) < 2:
+        raise ValueError(f"At least two quotes required; got {len(quotes)}")
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError(f"Budget must be a finite positive value; got {budget=}")
+    for q in quotes:
+        if not math.isfinite(q.decimal_odds) or q.decimal_odds <= 1.0:
+            raise ValueError(
+                f"Decimal odds must be a finite value > 1.0; got {q.decimal_odds=} "
+                f"on {q.platform}/{q.outcome}"
+            )
+        if q.max_stake is not None and (not math.isfinite(q.max_stake) or q.max_stake <= 0):
+            raise ValueError(
+                f"max_stake must be a finite positive value when set; got "
+                f"{q.max_stake=} on {q.platform}/{q.outcome}"
+            )
+        if q.min_stake is not None and (not math.isfinite(q.min_stake) or q.min_stake < 0):
+            raise ValueError(
+                f"min_stake must be a finite non-negative value when set; got "
+                f"{q.min_stake=} on {q.platform}/{q.outcome}"
+            )
+        if q.stake_increment is not None and (
+            not math.isfinite(q.stake_increment) or q.stake_increment <= 0
+        ):
+            raise ValueError(
+                f"stake_increment must be a finite positive value when set; got "
+                f"{q.stake_increment=} on {q.platform}/{q.outcome}"
+            )
 
     # Dutch book condition: implied probabilities sum to less than 1.
-    overround = 1.0 / quote_a.decimal_odds + 1.0 / quote_b.decimal_odds
-
+    overround = sum(1.0 / q.decimal_odds for q in quotes)
     if overround >= 1.0:
         return None
 
     margin_pct = (1.0 - overround) * 100.0
+    # Cheap early exit. Realized ROI is checked again after allocation because
+    # stake rounding can erode it further.
     if margin_pct < min_margin_pct:
         return None
 
-    # Optimal allocation: stake each leg so that the payout is identical
-    # regardless of which outcome occurs. Derivation:
-    #   payout_a = stake_a * odds_a  must equal  payout_b = stake_b * odds_b
-    #   stake_a + stake_b = budget
-    # Solving: stake_a = budget / (odds_a * overround)
-    stake_a = budget / (quote_a.decimal_odds * overround)
-    stake_b = budget / (quote_b.decimal_odds * overround)
+    stakes = allocate_maxmin(quotes, budget)
+    if stakes is None:
+        return None
 
-    # Apply liquidity caps. If a platform won't accept the optimal stake,
-    # we must scale BOTH legs down proportionally to maintain the hedge.
-    # Scaling only one leg breaks the equal-payout property and creates
-    # directional exposure.
-    if quote_a.max_stake is not None and stake_a > quote_a.max_stake:
-        scale = quote_a.max_stake / stake_a
-        stake_a *= scale
-        stake_b *= scale
-
-    if quote_b.max_stake is not None and stake_b > quote_b.max_stake:
-        scale = quote_b.max_stake / stake_b
-        stake_a *= scale
-        stake_b *= scale
-
-    total_stake = stake_a + stake_b
-    # Payout is equal on both legs by construction, so we can compute profit
-    # from either side.
-    guaranteed_profit = stake_a * quote_a.decimal_odds - total_stake
+    total_stake = sum(stakes)
+    # After rounding the legs no longer pay out equally; the guaranteed profit
+    # is bounded by whichever outcome pays the least.
+    payouts = [s * q.decimal_odds for q, s in zip(quotes, stakes, strict=True)]
+    guaranteed_profit = min(payouts) - total_stake
+    realized_roi_pct = guaranteed_profit / total_stake * 100.0
+    if realized_roi_pct < min_margin_pct:
+        return None
 
     return ArbitrageOpportunity(
-        leg_a=quote_a,
-        leg_b=quote_b,
-        stake_a=stake_a,
-        stake_b=stake_b,
+        legs=tuple(quotes),
+        stakes=stakes,
         total_stake=total_stake,
         guaranteed_profit=guaranteed_profit,
         margin_pct=margin_pct,
+        realized_roi_pct=realized_roi_pct,
+        capital_utilization=total_stake / budget,
     )
