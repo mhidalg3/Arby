@@ -1,5 +1,52 @@
 # Project Ledger
 
+## 2026-05-29 — Recon harness can now capture WebSocket frames (enables Betsson live-odds recon)
+
+**Context:** Betsson's `accordion/v1` is prematch-only; in-play odds
+arrive over a **WebSocket pub/sub channel** (OBG `?obg/sportsbook/
+transient/events|markets/...` topics — already noted in RECON_LOG
+2026-05-25 but never captured, because the recon harness only logged
+HTTP requests + a HAR, and the HAR does not record WS frames). So we
+literally could not recon Betsson live. This adds that capability.
+
+**Change (`scripts/recon/recon.py`):**
+- New `websocket_frames.jsonl` artifact: every WS frame (both
+  directions) with `ts / ws_url / dir / payload`, via a
+  `page.on("websocket", ...)` handler attached before navigation.
+- Pure serializer `_ws_frame_row` — text stored verbatim, binary
+  base64-encoded + flagged, oversized frames truncated (cap
+  `MAX_WS_FRAME_CHARS = 200_000`) so artifacts stay bounded/readable.
+  Defensive to Playwright passing the payload directly vs wrapped.
+- Always-on (empty file when a site uses no WS; negligible cost).
+- 5 unit tests (`test_recon_ws_capture.py`). Full suite **470 passed**,
+  ruff + mypy clean.
+
+**Executed same session** on a live match (Ligue 1 Nice vs
+Saint-Étienne, event `f-rdwm7m-uK0yqVgGGcW5KIg`): captured **3,404 WS
+frames**. Betsson live odds = **Diffusion pub/sub WebSocket**
+(`wss://pba.betsson.bet.ar/diffusion`); subscribe to
+`?obg/sportsbook/transient/markets/<eventId>/` + `events/<eventId>/`.
+Frames are Diffusion binary deltas keyed by topic ID (decoding them →
+odds is the next phase). Full notes: RECON_LOG 2026-05-29 betsson;
+artifacts `recon/artifacts/betsson/20260529-194942/`.
+
+**Harness bug fixed this session:** a late `request`/WS event firing
+during `context.close()` wrote to the already-closed JSONL stream and
+crashed teardown (exit 1, after artifacts were saved). Both loggers now
+guard `if stream.closed: return`. Artifacts from the crashing run were
+intact; the fix makes teardown clean.
+
+**State:** Capability built + tested (470 + WS tests pass) AND validated
+live. Going into PR #1 (extends its recon.py changes). The Betsson
+prematch scraper is unaffected.
+
+**Next:** decode the Diffusion binary delta format → live odds (via a
+Diffusion client lib or reverse-engineering the captured frames), then
+add a Betsson live WS subscriber scraper (cf. `bplay_sse.py`), keeping
+`accordion/v1` for not-yet-live fixtures.
+
+---
+
 ## 2026-05-29 — 90-min live observation RESULTS (Sudáfrica vs Nicaragua) + Betsson UA bug fixed
 
 **Context:** Ran a 171-cycle / 90-min (30s interval) multi-platform

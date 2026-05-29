@@ -9,6 +9,49 @@ the raw artifacts for detail.
 
 ---
 
+### 2026-05-29 — betsson — LIVE (in-play) odds transport: **Diffusion WebSocket pub/sub** (captured)
+
+**Goal:** find Betsson's in-play odds source. The HTTP `accordion/v1`
+widget is prematch-only — it returns `{"data":{}}` once a match goes
+live (confirmed during the 2026-05-29 cross-platform test). Live odds
+were known to be pushed (the prematch `event/v2` response carries a
+`topics` array of `?obg/sportsbook/transient/...` channels) but never
+captured, because the recon harness only logged HTTP + a HAR and the HAR
+does not record WebSocket frames.
+
+**Method:** added WebSocket frame capture to `scripts/recon/recon.py`
+(`websocket_frames.jsonl`), then ran a headed recon deep-linked to a
+**live** match — Ligue 1 Nice vs Saint-Étienne, event
+`f-rdwm7m-uK0yqVgGGcW5KIg`. Artifacts:
+`recon/artifacts/betsson/20260529-194942/`.
+
+**Findings:**
+- **Transport = Diffusion** (Push Technology's pub/sub platform), at
+  `wss://pba.betsson.bet.ar/diffusion?ty=WB&v=28&...`. Captured 3,404
+  frames in the dwell window (3,401 recv / 3 sent).
+- **Subscription protocol** (the 3 sent frames — `obg/gossip/subscribe`):
+  to receive an event's live odds, subscribe to these Diffusion topics:
+  - `?obg/sportsbook/transient/markets/<eventId>/` — market/odds updates
+  - `?obg/sportsbook/transient/events/<eventId>/` — event data
+  - `?obg/sportsbook/transient/events/.*/fixture/phase` — match clock/phase
+- **Frame format:** Diffusion binary wire protocol. A topic-registration
+  frame (partly ASCII-readable) carries the topic path + metadata; then
+  odds arrive as **binary deltas keyed by a numeric topic ID** (opaque
+  without implementing the Diffusion delta/CBOR decoding + topic-ID map).
+  6 of 3,404 frames were plain text (control/handshake).
+
+**Open / next:**
+- Decode the Diffusion delta format → live odds values. Options: a
+  Diffusion JS/Python client library, or reverse-engineer the binary
+  deltas from the captured frames. This is the substantial follow-up.
+- Then add a Betsson live scraper (likely a WS subscriber, cf.
+  `bplay_sse.py` for the realtime-feed pattern), keeping the existing
+  prematch `accordion/v1` scraper for not-yet-live fixtures.
+- Harness fix made this session: loggers now guard against a closed
+  stream (a late event during `context.close()` was crashing teardown).
+
+---
+
 ### 2026-05-26 — bplay — domestic LIVE odds transport: **SSE, not WebSocket** (protocol decoded)
 
 **Goal:** the prior recon ("ws-deportespba.bplay.bet.ar exists →
