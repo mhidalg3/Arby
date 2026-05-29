@@ -39,9 +39,16 @@ class TestKnownBlockPages:
         reason = block_reason_from("Just a moment...", "<html></html>")
         assert reason is not None
 
-    def test_cloudflare_managed_challenge_html(self) -> None:
-        html = '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate"></script>'
-        reason = block_reason_from("", html)
+    def test_real_managed_challenge_caught_by_body(self) -> None:
+        """A genuine CF managed-challenge interstitial — caught by its
+        title + body text, not by the always-present orchestration script."""
+        html = (
+            '<html><head><title>Just a moment...</title></head><body>'
+            "Enable JavaScript and cookies to continue."
+            '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate">'
+            "</script></body></html>"
+        )
+        reason = block_reason_from("Just a moment...", html)
         assert reason is not None
 
     def test_unusual_activity_challenge(self) -> None:
@@ -66,6 +73,20 @@ class TestRealPages:
 
     def test_empty_inputs_not_flagged(self) -> None:
         assert block_reason_from("", "") is None
+
+    def test_cf_orchestration_script_alone_not_flagged(self) -> None:
+        """Cloudflare injects /cdn-cgi/challenge-platform/ into every page
+        it fronts; its mere presence is NOT a block. Flagging it aborted
+        every Betano recon on the homepage (2026-05-29)."""
+        title = "Apuestas deportivas online | Betano"
+        html = (
+            '<html><head><title>Apuestas deportivas online | Betano</title>'
+            '</head><body><div class="sportsbook">'
+            '<a href="/sport/futbol/">Fútbol</a></div>'
+            '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate">'
+            "</script></body></html>"
+        )
+        assert block_reason_from(title, html) is None
 
     def test_odds_content_not_flagged(self) -> None:
         """A page that happens to contain the word 'security' in an

@@ -290,6 +290,11 @@ async def main() -> int:
         default=None,
         help="Entry URL. Defaults to the platform's canonical landing page; pass explicitly to recon a specific match URL.",
     )
+    parser.add_argument(
+        "--channel",
+        default=None,
+        help="Browser channel, e.g. 'chrome' to drive installed Google Chrome instead of bundled Chromium (closes the Chromium-for-Testing fingerprint gap).",
+    )
     args = parser.parse_args()
 
     url = args.url or DEFAULT_URLS.get(args.platform)
@@ -320,6 +325,7 @@ async def main() -> int:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=args.headless,
+            channel=args.channel,
             locale=LOCALE,
             timezone_id=TIMEZONE_ID,
             viewport=VIEWPORT,

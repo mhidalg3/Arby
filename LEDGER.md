@@ -1,5 +1,155 @@
 # Project Ledger
 
+## 2026-05-29 — Betano deep recon SUCCESS: pre-match endpoint captured + block-detector false-positive fixed (the real blocker)
+
+**Context:** After correcting the morning record (see entry below), ran
+a clean deep recon (>24h later, per user) to capture the one missing
+piece — the pre-match odds endpoint.
+
+**Root cause found (this changes the morning's story again):** The
+harness was never getting past the homepage on Betano because of a
+**false positive in `block_detect`**, not a real block. The HTML
+pattern `/cdn-cgi/challenge-platform/` matched the Cloudflare
+orchestration script that CF injects into *every* page it fronts — so
+`_check_block` aborted on the homepage step before any navigation. This
+is why every Betano recon (including this morning's "successes", which
+were actually exit-3 aborts with `nav_steps: []` — their danae data was
+just the homepage's own XHRs landing in the HAR before the abort)
+stopped at the homepage. On a clean/warm profile Betano was NOT blocking
+us at all.
+
+**Fix:** Removed the `/cdn-cgi/challenge-platform/` regex from
+`scripts/recon/block_detect.py` `_HTML_PATTERNS`. A genuine CF
+interstitial is still caught by title (`"just a moment"`,
+`"attention required"`) and body (`"enable javascript and cookies to
+continue"`, `"verify you are human"`, `"ray id"`) signatures, so no real
+coverage lost. Updated the test that encoded the bug
+(`test_recon_block_detect.py`): the bare orchestration script now
+asserts NOT-blocked; a real interstitial (title+body) still asserts
+blocked. 9 tests pass; ruff + mypy clean.
+
+**Recon runs (all `--channel chrome`, same warm profile):**
+- `20260529-145858` — false-positive abort on homepage (confirmed the bug:
+  370 reqs, 0 splash, data API responded, yet exit 3).
+- `20260529-150241` — fixed detector; homepage→cookie-consent→click Fútbol
+  OK. (SPA: Fútbol renders client-side without a route change; generic
+  match selectors don't match Betano's DOM.)
+- `20260529-150524` — warm deep-link to `/sport/futbol/proximos-partidos-hoy/`
+  → SUCCESS. Title "Fútbol - Partidos de Hoy", 901 reqs, 0 splash.
+
+**Endpoint map captured (the deliverable):**
+- **Pre-match odds:** `GET /api/home/top-events-v2/` → normalized
+  `{events, leagues, markets, selections}`. Selection carries
+  `price` (decimal odds); market `type:"MR12"` = 1X2 match result; event
+  has `participants[{teamId,name}]`, `leagueId`, `sportId:"FOOT"`,
+  `startTime`, `url:/cuotas-de-partido/{slug}/{eventId}/`. Saved
+  `prematch_top_events_v2.json`.
+- **Upcoming-coupon nav:** `/api/home/upcoming-coupons` (coupon skeleton;
+  events lazy-load per coupon via `/upcomingcoupon/?sid=FOOT`). Saved
+  `prematch_upcoming_coupons.json`.
+- **Live odds:** `danae-webapi/api/live/overview/latest` + `/{eventId}`;
+  layout `danae-webapi/api/layout/live`. Danae query params:
+  `queryOperatorId=19`, `queryLanguageId=8`, `queryPlatformType=1`.
+- **Reference catalogs (for canonicalization):**
+  `/api/static-content/assets/{teams (9.7MB), leagues, regions, players}`.
+  Saved `static_leagues.json`, `static_regions.json`.
+- **Per-event full market depth — NOT captured:** lives at
+  `/cuotas-de-partido/{slug}/{eventId}/` (`totalMarketsAvailable` up to
+  833). Only needed if we scrape beyond listing-level 1X2.
+
+**Code change:** `--channel` flag added to `recon.py` (drive installed
+Chrome via `launch_persistent_context(channel=...)`). Both bundled
+Chromium and Chrome load Betano fine once the profile is clean.
+
+**State:** Betano recon is DONE for a pre-match scraper build — the 1X2
+feed (`/api/home/top-events-v2/`) and the canonicalization catalogs are
+captured. Betano becomes the 4th platform alongside Betsson + BetWarrior
++ Bplay. **Next:** build `src/ingestion/scrapers/betano.py` against
+`/api/home/top-events-v2/` for pre-match 1X2; decide whether live
+(`danae-webapi/api/live/overview`) is in scope. Optional follow-up
+recon: the per-event `/cuotas-de-partido/.../{eventId}/` endpoint for
+full market depth.
+
+**Errors:** (1) `block_detect` false positive — fixed (above). It had
+silently capped every prior Betano recon at the homepage. (2) Generic
+`MATCH_LINK_SELECTORS` don't match Betano's DOM (match-open click
+failed) — not needed here since the warm deep-link worked; revisit only
+if per-event recon is wanted.
+
+---
+
+## 2026-05-29 — Betano recon retry: UNBLOCKED by wiping the profile dir (block was profile-state-bound, NOT an IP watchlist)
+
+**Context:** At 2026-05-28 21:00 ART (2026-05-29 00:32 UTC) we retried
+the Betano recon. Goal: re-establish access and capture the live/
+pre-match data endpoints. Trial mode — obtain recon info, don't
+stress-test the stealth.
+
+**What happened (corrected — supersedes the interrupted writeup):**
+Three headed runs, same IP throughout:
+- `20260529-003159` (00:32) — bundled Chromium-for-Testing
+  (UA `Chrome/148`), **reusing the persistent profile dir** → BLOCKED:
+  Kaizen splash + CF challenge, `nav_steps: []`, 33 requests, 20 splash
+  assets, **0 data calls**. Harness `block_detect` caught it and aborted
+  (exit 3) — failed safe, no hammering.
+- `20260529-004152` (00:41) — **same bundled Chromium build, same UA
+  `Chrome/148`, but with the profile dir WIPED** → SUCCESS: 361
+  requests, **0 splash**, live data API loaded
+  (`/danae-webapi/api/layout/live`, `/danae-webapi/api/live/overview/latest`).
+- `20260529-004503` (00:45) — **real installed Google Chrome via the new
+  `--channel chrome` flag** (UA `Chrome/147`), wiped profile → SUCCESS:
+  identical 361 requests / 0 splash / 2 data calls.
+
+User visually confirmed both successful runs: normal site rendered, no
+splash, no detection popup.
+
+**Decisive finding:** Run `004152` used the *identical Chromium build
+and UA* as the blocked run `003159` on the *same IP* — the only changed
+variable was wiping the profile dir, and it cleared the block within
+~10 minutes. Therefore the Betano/Kaizen block was bound to
+**persistent browser-profile state (cookies/localStorage in
+`user_data_dir`)**, NOT a persistent IP/profile watchlist and NOT the
+Chromium-for-Testing fingerprint. The earlier "24h is insufficient /
+homepage permanently blocked / can't un-profile" conclusion was WRONG —
+it was drawn solely from the dirty-profile run `003159`, and the prior
+session was interrupted (API error on a `thinking`-block edit) before
+the two subsequent SUCCESS runs were recorded. Memory corrected to match.
+
+**Code change (uncommitted):** Added `--channel` arg to
+`scripts/recon/recon.py` (passes through to
+`launch_persistent_context(channel=...)`) so the harness can drive
+installed Chrome instead of bundled Chromium-for-Testing, closing the
+CfT fingerprint gap. Both Chromium and Chrome channels now load Betano
+fine once the profile is clean.
+
+**State:** Betano browser-recon path is **ALIVE** again — both data
+feeds confirmed reachable. Caveats: `nav_steps` was empty (homepage-only;
+the 2 `danae-webapi` calls are the homepage live feed), and no PNG
+screenshots were captured (the harness only shoots screenshots on nav
+steps) — so verification rests on request-level HAR evidence plus the
+user's direct visual confirmation, not a saved screenshot. The pre-match
+endpoint still has NOT been captured (needs a homepage→pre-match click
+nav). 3-platform stack (Betsson + BetWarrior + Bplay) unaffected.
+
+**Next:**
+1. Commit the `--channel` flag.
+2. Re-run Betano recon with a WIPED profile and a real nav step
+   (homepage → pre-match-today click) to capture the pre-match endpoint.
+   Keep one-session-per-day discipline.
+3. Make profile-wipe-between-sessions the default for re-recon (it is
+   what cleared the block); see updated `recon-bot-protection-cautions`.
+
+**Errors:** (1) Tooling behaved correctly throughout — the harness
+blocked-and-aborted on the dirty run as designed. (2) The prior session
+hit an API 400 ("`thinking` blocks in the latest assistant message
+cannot be modified") mid-LEDGER-edit and was interrupted, leaving the
+wrong "STILL BLOCKED" entry committed to the working tree; this entry
+replaces it. (3) Forensic note: distinguishing the runs required reading
+the HAR user-agents, since `summary.json` does not record the channel —
+consider logging the channel/profile-clean flag into `summary.json`.
+
+---
+
 ## 2026-05-28 — DESIGN DISCUSSION: cross-jurisdiction (PBA × CABA) arbitrage — feasibility + recommended two-operator architecture
 
 **Status: discussion only. Nothing implemented. No decision made.**
