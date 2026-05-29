@@ -1,5 +1,188 @@
 # Project Ledger
 
+## 2026-05-29 — 90-min live observation RESULTS (Sudáfrica vs Nicaragua) + Betsson UA bug fixed
+
+**Context:** Ran a 171-cycle / 90-min (30s interval) multi-platform
+odds observation on the live friendly, to watch API/odds behavior and
+validate the Betsson fix. Throwaway observer (`/tmp/live_observe.py`);
+time-series at `recon/artifacts/live_test/20260529-160520/` (gitignored).
+Betano polled via `fetch_live_soccer` (live), BetWarrior via the
+friendlies competition, Betsson surgically via `fetch_event_quotes`.
+
+**Reliability over 90 min:**
+- **Betano: 171/171 cycles, 0 errors.** httpx + browser headers held
+  against Cloudflare for the full run at 30s cadence. The scraper is
+  solid.
+- **BetWarrior: 160/171** (11 graceful absences, 0 errors — match
+  dropped from the friendlies feed during suspensions / near full-time).
+- **Betsson: 0/171 live** — prematch-only widget returns `{"data":{}}`
+  in-play (handled as absent, not error). Live widget = open follow-up.
+
+**Odds behavior:** heavy, continuous movement tracking the match. Betano
+home 1.17→1.98 (68 changes), draw 6.0→1.95 (91), away ranged 14.5–25.0
+(94) — classic "favorite never pulls away, draw shortens" arc. Both
+books tracked each other (margins mostly 1.02–1.07). **Structural
+finding: Betano priced the away longshot (Nicaragua) ~2× higher than
+BetWarrior the whole match** (Betano 19.5–24 vs BetWarrior 10.5–12) —
+the most persistent cross-book disagreement.
+
+**Arb windows: 2 sub-1.0 margins, BOTH non-actionable — and instructive:**
+- **c87, margin 0.9099 (apparent 9.9% arb): PHANTOM.** BetWarrior had
+  been absent for 2 cycles, then reappeared with a stale/transitional
+  quote (draw 7.0, away 21.0) wildly off its own next-cycle values
+  (3.5/10.5). The "arb" evaporated by c88. Classic stale-quote false
+  positive on re-appearance after suspension.
+- **c164, margin 0.9946 (0.5%): borderline,** driven by Betano's
+  persistently-high Nicaragua price + BetWarrior's home price. Too thin
+  to survive latency/suspension/stake limits.
+- **Takeaway:** live in-play throws phantom arbs from stale/suspended
+  quotes; genuine thin edges get eaten by latency. This empirically
+  justifies the `src/risk/` Tier-2 re-fetch-before-place + staleness
+  gating. Do NOT act on a single-snapshot in-play margin.
+
+**State:** Betano scraper validated end-to-end (90 min sustained).
+Betsson odds ingestion repaired (UA bug — see entry below). Full suite
+**465 passed**, mypy clean. Uncommitted: Betano scraper + Betsson UA fix
++ tests + LEDGER. Ready to fold into the PR.
+
+**Follow-ups surfaced:** (1) Betsson live-odds widget recon; (2) Betano
+`/upcomingcoupon/?sid=FOOT` for full pre-match coverage; (3) consider a
+shared browser-UA default across all scrapers (WAFs tighten); (4) the
+Betano/BetWarrior away-price gap — investigate whether it ever yields a
+robust (non-phantom) edge.
+
+---
+
+## 2026-05-29 — LIVE TEST: Betano scraper works against the real API; cross-platform ingestion validated on Sudáfrica vs Nicaragua
+
+**Context:** First live test of the Betano scraper (and a cross-platform
+ingestion check) on the international friendly Sudáfrica vs Nicaragua
+(kickoff 13:00 PBA / 16:00 UTC). User-authorized real-API calls for this
+test.
+
+**Headline result — the big unknown is RESOLVED:** a plain `httpx`
+client with browser-like headers **clears Cloudflare on BOTH Betano
+endpoints**. No browser fetch layer needed.
+- Pre-match `/api/home/top-events-v2/` → JSON, 45–48 FOOT 1X2 snapshots;
+  captured the match at 1.19 / 6.4 / 14.0 (home/draw/away).
+- Live `/danae-webapi/api/live/overview/latest` → JSON, 237 live FOOT
+  1X2 snapshots; same match once it went live, same 1.19 / 6.4 / 14.0.
+The match transitioned out of `top-events-v2` into the live feed at
+kickoff — expected prematch→live behavior.
+
+**Cross-platform capture of the match (1X2 home/draw/away):**
+- **Betano** 1.19 / 6.4 / 14.0 (both modes) ✅
+- **BetWarrior** 1.18 / 6.75 / 15.0 ✅ (competition `international_friendly_matches`)
+- **Betsson** — 0 snapshots under `futbol/internacionales/` ⚠️ (see below)
+- **Bplay** — not covered (XML scraper does only 5 marquee tournaments;
+  friendlies flow through the WebSocket channel it doesn't consume)
+Best-of-book implied sum = 1/1.19 + 1/6.75 + 1/15.0 = **1.055 (5.5%
+margin) → no arbitrage**, as expected. Pipeline validated regardless:
+same match pulled from ≥2 books and compared.
+
+**Findings / follow-ups:**
+1. **Betano `top-events-v2` is featured-only** (~25 curated events), NOT
+   comprehensive pre-match coverage. It happened to feature this
+   friendly pre-kickoff. For full pre-match coverage we need the
+   `/upcomingcoupon/?sid=FOOT` per-coupon endpoint (recon captured only
+   the coupon skeleton; its data call shape is not yet frozen). The
+   **live** mode IS comprehensive (237 events). → Treat live mode as the
+   primary Betano feed; `top-events-v2` pre-match as partial until the
+   upcoming-coupon endpoint is reconned + added.
+2. **Betsson returned 0 — diagnosed as TWO issues (one fixed).** Not a
+   slug gap: discovery found the match fine
+   (`futbol/internacionales/amistosos-internacionales/sudafrica-nicaragua`,
+   event `f-XofNqv4POkmG7kmfywi-nQ`, 35 friendlies discovered).
+   (a) **UA 403 bug — FIXED.** The odds endpoint
+   (`/api/sb/v1/widgets/accordion/v1`) WAF returns a 403 HTML block page
+   to the default `python-httpx` UA; `categories/v2` tolerated it, which
+   masked it (discovery worked, every odds call 403'd → zero snapshots).
+   Added a browser `User-Agent` to the Betsson scraper headers + a
+   regression test. Confirmed live: 403 → 200 with full odds JSON.
+   **Implication: Betsson odds ingestion was fully broken before this.**
+   (b) **Live-widget gap — follow-up.** `accordion/v1` is prematch-only;
+   once the match went in-play it returns `{"data": {}}`. Betsson live
+   odds are a different widget the scraper doesn't consume (analogous to
+   Betano's separate prematch/live endpoints). Needs a Betsson live
+   recon. So Betsson captured the match pre-kickoff but not in-play.
+3. **`deportespba.bplay.bet.ar` is NOT a new backend** — our Bplay
+   scraper already uses it as `BASE_URL` for the XML odds feeds. The
+   "standard" `pba.bplay.bet.ar` is the SPA shell (what recon browsed).
+   The user's planned deeper recon on `deportespba.*` should focus on the
+   WebSocket (`ws-deportespba.bplay.bet.ar`) for domestic/friendly
+   coverage the XML pattern doesn't serve.
+
+**State:** Betano scraper validated end-to-end against the live API in
+both modes. The httpx-vs-Cloudflare risk noted in the build entry is
+cleared. Code unchanged by the test (no fixes needed). Ready to PR the
+Betano scraper + the recon `--channel`/block_detect commit. Observation
+scripts were throwaway (`/tmp`), not committed.
+
+**Errors:** None in the Betano path. Betsson friendly-coverage gap and
+the top-events-v2 partial-coverage limit are logged as follow-ups, not
+regressions.
+
+---
+
+## 2026-05-29 — Betano ingestion scraper built (live + pre-match, one parser, mode-parameterized)
+
+**Context:** With the recon contract frozen, built the 4th-platform
+scraper `src/ingestion/scrapers/betano.py` so Betano joins Betsson +
+BetWarrior + Bplay. Goal: scrape both pre-match and in-play 1X2 odds.
+
+**Decision — one module, parameterized by `mode`, NOT one combined pass
+and NOT two files.** Both Betano feeds (live `danae-webapi/api/live/
+overview/latest`; pre-match `/api/home/top-events-v2/`) return the SAME
+normalized `{events, markets, selections}` danae shape, so the parser
+(`_parse_danae_soccer_1x2`) is shared. But in-play odds move every few
+seconds while pre-match drifts over minutes, and the framework's
+`poll_forever` drives one `fetch_live_soccer()` at one interval — a
+single combined pass would force one cadence and couple failures. So
+`BetanoScraper(mode="live"|"prematch")` selects endpoint + cadence
+(live 4s, pre-match 45s); run two instances. (Contrast bplay's two files,
+justified there by two transports REST vs SSE — here it's one transport.)
+
+**Key choices:**
+- **Both modes emit `platform="betano"`** (not `betano-live`/`-prematch`):
+  same book, so two labels would let the arb engine see a false
+  self-arbitrage between the feeds.
+- **Canonical 1X2 = MRES / typeId 1 only.** The `MR12` "SuperCuotas"
+  promo (typeId 2850) is excluded — enhanced-odds promos have different
+  stake caps/terms, unsafe for clean arb. Selections `1/X/2` → home/
+  draw/away (1,2 resolved to participant names; X → "Empate").
+- Parser skips non-FOOT, virtuals (`isVirtual`), esports (url contains
+  "esports"), and outright events (≠2 participants).
+- Reuses `RateLimitGuard` (per-mode breaker `betano-live`/`betano-prematch`)
+  and raises `BetanoContractError` on schema drift / non-JSON
+  (Cloudflare challenge) / HTTP ≥400 — same dumb-scraper discipline as
+  Betsson. `max_stake=None` (not in public feed).
+
+**State:** Code + 11 unit tests (synthetic danae fixtures via
+`httpx.MockTransport`). Full suite **464 passed**, ruff + mypy(strict)
+clean. NOT yet committed — holding for the live test. Scraper is not yet
+wired into any runner/verifier (callers instantiate scrapers directly,
+e.g. `risk/refreshers.py` for Betsson); wire-in is follow-up.
+
+**Open risk (UNVALIDATED):** Betano is Cloudflare + Kaizen protected and
+the API was only ever confirmed via a real browser. Whether a plain
+`httpx` client clears Cloudflare is unknown — the live test today is
+exactly what proves/disproves it. Browser-like headers are set to help;
+if it 403s / returns the HTML splash, the guard opens and surfaces a
+`BetanoContractError` (do NOT hammer). Fallback if httpx is blocked:
+drive the feed through the Playwright recon harness (browser context)
+instead of raw httpx.
+
+**Next:** live test against a match today → if httpx works, open the PR
+(this scraper + the committed recon `--channel`/block_detect fix); if
+blocked, pivot the fetch layer to a browser context. Then wire Betano
+into the ingestion runner + canonicalization (needs the
+`/api/static-content/assets/{teams,leagues,regions}` catalogs captured
+in recon).
+
+**Errors:** None — clean build.
+
+---
+
 ## 2026-05-29 — Betano deep recon SUCCESS: pre-match endpoint captured + block-detector false-positive fixed (the real blocker)
 
 **Context:** After correcting the morning record (see entry below), ran

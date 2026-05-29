@@ -227,6 +227,22 @@ class TestConstruction:
         assert s._fixture_cache_ttl_sec == DEFAULT_FIXTURE_TTL_SEC
         await client.aclose()
 
+    async def test_sends_browser_user_agent(self) -> None:
+        """The odds-endpoint WAF 403s a non-browser UA (confirmed live
+        2026-05-29). Every request must carry a browser User-Agent."""
+        seen: list[str] = []
+
+        def capturing_handler(req: httpx.Request) -> httpx.Response:
+            seen.append(req.headers.get("user-agent", ""))
+            return _default_handler(req)
+
+        client = _make_client(capturing_handler)
+        s = BetssonScraper(http_client=client)
+        _ = [snap async for snap in s.fetch_live_soccer()]
+        await client.aclose()
+        assert seen  # at least one request went out
+        assert all("Mozilla/5.0" in ua and "httpx" not in ua for ua in seen)
+
 
 # ---- Fixture discovery ----
 
