@@ -86,6 +86,7 @@ import structlog
 
 from src.ingestion.rate_limit import CircuitOpenError, RateLimitGuard
 from src.ingestion.scrapers.base import BaseScraper, RawOddsSnapshot
+from src.ingestion.scrapers.bplay import BROWSER_USER_AGENT
 
 log = structlog.get_logger(__name__)
 
@@ -201,10 +202,12 @@ class BplayPbaSSEScraper(BaseScraper):
         self._idle_backoff_sec = idle_rediscovery_backoff_sec
         self._log = log.bind(platform=self.platform_name, mode="sse")
         self._discovery_headers: dict[str, str] = {
+            "User-Agent": BROWSER_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml",
             "Referer": SPA_ORIGIN + "/",
         }
         self._sse_headers: dict[str, str] = {
+            "User-Agent": BROWSER_USER_AGENT,
             "Accept": "text/event-stream",
             "Origin": SPA_ORIGIN,
             "Referer": SPA_ORIGIN + "/en-vivo",

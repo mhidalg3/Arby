@@ -1,5 +1,51 @@
 # Project Ledger
 
+## 2026-05-30 — In-play stress test (PSG vs Arsenal, UCL final): Bplay UA bug fixed; phantom-arb evidence
+
+**Context:** Used the live UCL final (2nd half) to stress-test in-play
+ingestion across all 4 platforms and fix what broke. 35-cycle / ~50-min
+observation; time-series `recon/artifacts/live_test/ucl-20260530-171328/`.
+
+**Fix — Bplay was returning ZERO (same UA class of bug as Betsson):**
+Bplay's WAF now serves stubs to the default `python-httpx` UA — XML feeds
+empty, `/en-vivo` a 269-byte shell, both **HTTP 200** (even more silent
+than Betsson's 403). A browser UA → real 500KB SSR page + valid XML.
+Added `BROWSER_USER_AGENT` to `bplay.py` (`_XML_HEADERS`), imported into
+`bplay_sse.py` (`_discovery_headers`, `_sse_headers`). Bplay then ingested
+the match live via SSE. 3 of 4 platforms have now hit the missing-UA bug
+(Betano had it from the start) → centralizing one UA in `base.py` is a
+strong follow-up. Bplay unit tests still pass (30).
+
+**In-play scorecard (this match):**
+- Betano 33/35, BetWarrior 32/35, Bplay 29/35 cycles — all 0 errors;
+  absences are SSE/feed gaps + match end.
+- **Betsson 0/35** — live = Diffusion WS, still un-decoded (the one
+  remaining in-play gap; separate large task).
+- Three books tracked a dramatic match (Arsenal leading → PSG equalized
+  → headed to a draw) within a few % of each other.
+
+**KEY FINDING — naive in-play margin = phantom arbs.** 10 of 33 cycles
+showed margin < 1.0 (min **0.7132**), but **every one is a stale-quote
+artifact, zero executable.** At c10 the 0.71 came from Bplay's SSE lagging
+~90s through PSG's equalizer (still pricing Arsenal at 1.56 while Betano/
+BetWarrior had repriced to ~even); best-of combined the stale Bplay home
+(7.5) with a fresh away price. It vanished the moment Bplay caught up. The
+other 8 (0.97–0.999) are books drifting at different latencies as Arsenal's
+win-price ran out toward a draw. **This is the clearest evidence yet that
+single-snapshot cross-book in-play margins are dangerous — the `src/risk/`
+Tier-2 re-fetch + staleness/simultaneity gate is mandatory before acting,
+especially in-play where feeds lag through goals.** Also noted: Bplay's SSE
+per-cycle stream window makes its "latest" the laggiest of the three —
+a per-platform staleness weight worth carrying into the risk layer.
+
+**State:** In-play ingestion working on Betano + BetWarrior + Bplay;
+Betsson live still pending the Diffusion decode. Uncommitted backlog to
+land: (a) credentials/`--login` infra (recon `--login`, `src/credentials.py`,
+keyring dep), (b) this Bplay UA fix. Logged-in recon is the next planned
+step (accounts now exist).
+
+---
+
 ## 2026-05-29 — Recon harness can now capture WebSocket frames (enables Betsson live-odds recon)
 
 **Context:** Betsson's `accordion/v1` is prematch-only; in-play odds
