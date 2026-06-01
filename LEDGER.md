@@ -1,5 +1,31 @@
 # Project Ledger
 
+## 2026-06-01 — Credentials / login infra (manual-login profile + OS keychain)
+
+**Context:** Stand up secure handling of sportsbook logins for logged-in
+recon (bet-slip `max_stake`) and eventual bet execution — without secrets
+ever touching the repo, env files, or chat.
+
+**Two mechanisms:**
+- **Manual login → persistent browser profile** (`recon.py --login`):
+  opens the site headed, waits for a by-hand login (handles 2FA/captcha),
+  and the session saves into the gitignored `recon/profile/<platform>/`.
+  Stores NO credentials; records no HAR/request log (so the login POST is
+  never captured). Best for logged-in recon.
+- **OS keychain** (`src/credentials.py`): per-platform username/password in
+  the macOS Keychain (service `arby`), set via
+  `python -m src.credentials set <platform>`. `Credential.password` is
+  excluded from `repr` so it can't leak into logs. For automated re-login
+  / execution. `.env.example` documents both; no secrets in `.env`.
+
+**State:** All four platform logins configured by the user and verified
+retrievable (storage only — no functional login test, which would risk
+2FA/lockout). Dep added: `keyring`. Tests: `test_credentials.py`
+(monkeypatched keychain). Not yet wired into any automated login flow —
+live odds recon needs none of this (the feeds are anonymous).
+
+---
+
 ## 2026-05-30 — In-play stress test (PSG vs Arsenal, UCL final): Bplay UA bug fixed; phantom-arb evidence
 
 **Context:** Used the live UCL final (2nd half) to stress-test in-play

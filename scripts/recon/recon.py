@@ -354,6 +354,32 @@ async def _recon(context: BrowserContext, args: argparse.Namespace, out_dir: Pat
         )
 
 
+async def _manual_login(context: BrowserContext, args: argparse.Namespace) -> None:
+    """Open the site headed and wait for the operator to log in by hand.
+
+    The persistent profile saves the session on `context.close()`, so we
+    store no credentials and 2FA / captcha are handled manually in the
+    browser. Blocks on `input()` (off the event loop) until the operator
+    confirms they're logged in."""
+    page = context.pages[0] if context.pages else await context.new_page()
+    print(f"\n[login] Opening {args.url} — log in MANUALLY in the browser window.", flush=True)
+    with contextlib.suppress(PlaywrightError):
+        await page.goto(args.url, wait_until="domcontentloaded", timeout=45000)
+    print(
+        "[login] Complete the login (including any 2FA / captcha) in the browser, "
+        "then come back here.",
+        flush=True,
+    )
+    await asyncio.to_thread(
+        input, "[login] Press Enter once you are logged in to save the session... "
+    )
+    await _settle(page, networkidle_timeout_ms=5000)
+    title = ""
+    with contextlib.suppress(Exception):
+        title = await page.title()
+    print(f"[login] Current page: {title} | {page.url}", flush=True)
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="First-pass sportsbook recon")
     parser.add_argument(
@@ -374,6 +400,13 @@ async def main() -> int:
         default=None,
         help="Browser channel, e.g. 'chrome' to drive installed Google Chrome instead of bundled Chromium (closes the Chromium-for-Testing fingerprint gap).",
     )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="Open the site headed and wait for a MANUAL login, then save the "
+        "session into the persistent profile. Stores no credentials; handles "
+        "2FA/captcha by hand. Re-run without --login to recon logged-in.",
+    )
     args = parser.parse_args()
 
     url = args.url or DEFAULT_URLS.get(args.platform)
@@ -385,12 +418,38 @@ async def main() -> int:
         return 2
     args.url = url
 
+    profile_dir = PROFILE_ROOT_BASE / args.platform
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.login:
+        if args.headless:
+            print(
+                "error: --login needs a visible browser; do not pass --headless",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"Platform: {args.platform}\nProfile:  {profile_dir}\nURL:      {args.url}")
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=False,
+                channel=args.channel,
+                locale=LOCALE,
+                timezone_id=TIMEZONE_ID,
+                viewport=VIEWPORT,
+            )
+            await apply_stealth(context)
+            try:
+                await _manual_login(context, args)
+            finally:
+                await context.close()  # persists the logged-in session
+        print("\nSession saved to the profile. Re-run without --login to recon logged-in.")
+        return 0
+
     session_id = _ts()
     artifact_root = ARTIFACT_ROOT_BASE / args.platform
-    profile_dir = PROFILE_ROOT_BASE / args.platform
     out_dir = artifact_root / session_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    profile_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Platform: {args.platform}")
     print(f"Session:  {session_id}")
