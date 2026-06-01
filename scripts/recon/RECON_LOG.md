@@ -9,6 +9,43 @@ the raw artifacts for detail.
 
 ---
 
+### 2026-05-30 — betsson — Diffusion live feed DECODED (zlib + CBOR; 1X2 odds extracted)
+
+**Goal:** decode the Betsson live WebSocket frames captured on 2026-05-29
+so we can build an in-play scraper like the other platforms.
+
+**Protocol cracked** (from the 3,404 captured frames,
+`recon/artifacts/betsson/20260529-194942/websocket_frames.jsonl`):
+- Two server frame types dominate: `0x00` = topic **specifications**
+  (path + properties: `_CREATOR`, `PUBLISH_VALUES_ONLY true`, `REMOVAL
+  "when no updates for 10m"`), `0x84` = topic **values**.
+- A `0x84` value frame is: `84` + a short header + a **zlib** stream
+  (`78 01 …`). Decompress → **CBOR**. Because `PUBLISH_VALUES_ONLY=true`,
+  every frame is a FULL value — no binary-delta application needed.
+- CBOR shapes: `t==32` = fixture/event messages; **`t==27` = market
+  messages**: `{id, t:27, d:{ei, mti, odds}}`.
+- `d.mti` is the market code — **same codes as the prematch accordion**
+  (`MW3W`=1X2, `MTG2W`, `BTTS`, `DC`, …). `d.odds` maps selection id →
+  `{"of":{"1":"<decimal>","2":"<american>"}, "sof":{<segmentUUID>:…}}`.
+  **`of["1"]` is the decimal price**; `sof` is per-customer-segment
+  pricing (ignore for arb).
+- **The 1X2 selection ids end in `-home`/`-draw`/`-away`** (identical to
+  the accordion), so outcomes need no external mapping. Verified live:
+  Nice vs St-Étienne MW3W = home 2.55 / draw 2.25 / away 3.90.
+
+**Built:** `src/ingestion/scrapers/betsson_diffusion.py` — pure decoder
+(`decode_value_frame`, `market_1x2_odds`), tested against a real captured
+frame (`tests/fixtures/betsson_diffusion_mw3w.b64`). Deps: `cbor2`.
+
+**Open / next:** the live WS **subscriber** (the Diffusion connect
+handshake + the `obg/gossip/subscribe` frames + keepalive/reconnect)
+feeding this decoder. The 3 subscribe frames are captured; the connect
+handshake (URL `?ty=WB&v=28&…` + the server's session-token first frame)
+and keepalive still need live iteration to nail. That's the remaining
+build for `betsson_ws.py`.
+
+---
+
 ### 2026-05-29 — betsson — LIVE (in-play) odds transport: **Diffusion WebSocket pub/sub** (captured)
 
 **Goal:** find Betsson's in-play odds source. The HTTP `accordion/v1`
