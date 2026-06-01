@@ -30,6 +30,24 @@ cookie-based so cookies suffice. Needs a user re-run to validate live.)
 **State:** 3/4 logged-in limit captures done (Betsson 20M flat, Betano
 dynamic ~11.86M, Bplay payout-cap 999,999,999/odds). Remaining: BetWarrior.
 
+**Update (re-run with the session fix — VALIDATED + corrected finding):**
+- The `storage_state` fix WORKS: `--login` then `--interactive` opened
+  already-logged-in, and the `--interactive` HAR has **no login POST**
+  (creds stay out). Session-persistence fix confirmed live.
+  Artifacts: `recon/artifacts/bplay/20260601-213146/` (HAR sanitized).
+- **Correction on Bplay's max bet:** the "9,999,999" cap the operator hit
+  is the **web stake-input field limit (7 digits)**, NOT the betting cap.
+  Proof: Colombia (odd 1.09) and Costa Rica (odd 19) BOTH capped at the
+  same 9,999,999 despite 17× odds difference — a payout-derived cap would
+  diverge. The API accepted 9,999,999 for both (`accept=true`, no msg);
+  Costa Rica's payout was 200,899,979.91, far under `max_winning`
+  999,999,999 → the API had headroom for more. So the true API ceiling is
+  the payout cap (max_winning/odds); 9,999,999 is a UI artifact. For the
+  API-driven bot, treat Bplay's stake limit as effectively non-binding
+  (payout-cap ~1B), not 9,999,999. (Confirming the API accepts >9,999,999
+  would need a direct-API probe bypassing the web input — deferred; not
+  needed given our small stakes.)
+
 ---
 
 ## 2026-06-01 — Logged-in recon: Betano stake limits captured + validated (DYNAMIC, per-bet)
