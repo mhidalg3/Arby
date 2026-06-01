@@ -393,6 +393,32 @@ async def _manual_login(context: BrowserContext, args: argparse.Namespace) -> No
     print(f"[login] Current page: {title} | {page.url}", flush=True)
 
 
+def _session_state_path(platform: str) -> Path:
+    """Where `--login` stashes the full session. The persistent profile
+    drops SESSION-ONLY cookies (no Expires/Max-Age) on close — which is how
+    e.g. Bplay's JSESSIONID/playerSession auth is stored — so a plain
+    profile re-open is logged out. `storage_state` captures those; we
+    re-inject them on later runs. Lives under the gitignored profile dir."""
+    return PROFILE_ROOT_BASE / f"{platform}-session.json"
+
+
+async def _restore_session(context: BrowserContext, platform: str) -> None:
+    """Re-inject the login session saved by `--login` (the session-only
+    cookies the persistent profile can't keep). No-op if none saved."""
+    path = _session_state_path(platform)
+    if not path.exists():
+        return
+    try:
+        cookies = json.loads(path.read_text(encoding="utf-8")).get("cookies", [])
+    except (OSError, ValueError) as exc:
+        print(f"  ! session restore failed to read {path.name}: {exc}")
+        return
+    if cookies:
+        with contextlib.suppress(PlaywrightError):
+            await context.add_cookies(cookies)
+            print(f"  · restored {len(cookies)} session cookies from {path.name}")
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="First-pass sportsbook recon")
     parser.add_argument(
@@ -468,9 +494,15 @@ async def main() -> int:
             await apply_stealth(context)
             try:
                 await _manual_login(context, args)
+                # Capture the FULL session (incl. session-only cookies the
+                # profile would drop) so later runs can restore it.
+                await context.storage_state(path=str(_session_state_path(args.platform)))
             finally:
-                await context.close()  # persists the logged-in session
-        print("\nSession saved to the profile. Re-run without --login to recon logged-in.")
+                await context.close()
+        print(
+            f"\nSession saved ({_session_state_path(args.platform).name}). "
+            "Re-run without --login to recon logged-in."
+        )
         return 0
 
     session_id = _ts()
@@ -498,6 +530,8 @@ async def main() -> int:
         )
         # Patch automation tells before any navigation.
         await apply_stealth(context)
+        # Re-inject a saved login session (session-only cookies the profile drops).
+        await _restore_session(context, args.platform)
         nav_error: str | None = None
         try:
             await _recon(context, args, out_dir)

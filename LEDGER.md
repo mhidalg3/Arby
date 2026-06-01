@@ -1,5 +1,37 @@
 # Project Ledger
 
+## 2026-06-01 — Logged-in recon: Bplay limits + the `--login` session-persistence fix
+
+**Max bet (Bplay):** the bet-slip (`POST ws-deportespba.bplay.bet.ar/
+bettingslip/update`, SportNCO) exposes **no explicit max-stake field** —
+only **`max_winning` = 999,999,999** (payout cap). Entered stakes 2 →
+9,999,999 were ALL accepted with no limit message, so the cap wasn't hit.
+**Effective max stake = max_winning / odds** (this 1X2: Colombia @ 1.09 →
+≈ 917M). To capture the exact site-shown "Apuesta Máxima", re-capture
+clicking the max button (`icon_maxbet.svg`). Artifacts:
+`recon/artifacts/bplay/20260601-211813/` (HAR sanitized).
+
+**Root cause — why `--login` didn't persist for Bplay (now fixed):** Bplay's
+auth cookies (`JSESSIONID`, `playerSession`, `playerId`, `sessionId`, …) are
+all **SESSION-ONLY** (no Expires/Max-Age). Browsers don't write session-only
+cookies to disk, so `launch_persistent_context` drops them on close → the
+next run is logged out (hence the operator had to log in again during
+`--interactive`, leaking creds into that HAR). Betsson/Betano carried fine
+because their auth rides persistent cookies / localStorage.
+
+**Fix (`recon.py`):** `--login` now saves the FULL session via Playwright
+`storage_state` (captures session-only cookies + origins) to the gitignored
+`recon/profile/<platform>-session.json`; normal/`--interactive` runs
+re-inject it with `context.add_cookies(...)`. So the proper flow —
+`--login` once, then `--interactive` on the restored session — keeps the
+login POST out of the HAR. (localStorage not yet restored; Bplay auth is
+cookie-based so cookies suffice. Needs a user re-run to validate live.)
+
+**State:** 3/4 logged-in limit captures done (Betsson 20M flat, Betano
+dynamic ~11.86M, Bplay payout-cap 999,999,999/odds). Remaining: BetWarrior.
+
+---
+
 ## 2026-06-01 — Logged-in recon: Betano stake limits captured + validated (DYNAMIC, per-bet)
 
 **Finding — Betano stake limits are PER-BET/DYNAMIC**, unlike Betsson's flat
