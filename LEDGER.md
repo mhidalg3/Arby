@@ -1,5 +1,37 @@
 # Project Ledger
 
+## 2026-06-01 — Logged-in recon: Betano stake limits captured + validated (DYNAMIC, per-bet)
+
+**Finding — Betano stake limits are PER-BET/DYNAMIC**, unlike Betsson's flat
+account cap. Source: authenticated `POST /api/betslipcombo/limits` →
+`{"data":{"min":58103.85,"max":11857928.57}}` for the test 1X2 (Colombia
+win, odds ≈ 1.14). **max = 11,857,928.57 matches the website's stated max
+EXACTLY** → validated. The bet-slip flow (`/api/betslip/v3/updatebets`,
+`/api/betslip/v3/getbetslip`) showed the bet at amount 11,857,928.57 /
+returns 13,518,038.57. Artifacts: `recon/artifacts/betano/20260601-210025/`.
+
+**Risk-layer implication:** Betano's max/min vary per selection (the limit
+is computed server-side from odds/payout caps), so the risk/execution layer
+must **query `/api/betslipcombo/limits` per bet** rather than use a static
+constant. Contrast Betsson (flat 20M account cap from user-context). Both
+patterns now known; the policy layer needs per-platform handling.
+
+**Process note + credential hygiene:** the two commands were run in REVERSE
+order (interactive capture before `--login`), so the operator logged in
+DURING the HAR-recording `--interactive` run — putting the
+`POST /myaccount/login` credentials AND session cookies into the HAR. The
+capture is still fully useful (login was active → authenticated bet-slip
+data captured), but I **sanitized the HAR**: redacted the login body + 698
+Cookie/Set-Cookie/Authorization headers, cleared cookie arrays; odds/limit
+data preserved. **Going forward: run `--login` FIRST**, then `--interactive`
+on the already-authenticated profile — that's the whole point of keeping
+them separate (the login POST never touches a HAR).
+
+**State:** Betsson + Betano logged-in limits captured + validated. Remaining:
+BetWarrior, Bplay.
+
+---
+
 ## 2026-06-01 — Logged-in recon: Betsson stake limits captured + validated
 
 **Context:** First logged-in recon. Added `recon.py --interactive` (hold +
