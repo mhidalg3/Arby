@@ -1,5 +1,27 @@
 # Project Ledger
 
+## 2026-06-01 — `betsson_ws.py` LIVE-VALIDATED — all 4 platforms now do in-play
+
+**Context:** Live test of `BetssonWsScraper` against an in-play match
+(Austria vs Túnez friendly, half-time; event `f-5QvL3jntkEyj6aK02fCJhA`).
+
+**Result — worked first try, no iteration needed.** The passive-capture-
+derived connect handshake + subscribe + keepalive held against the live
+Diffusion server. `fetch_event_odds` connected, subscribed, and decoded
+the live MW3W 1X2 in one 25 s stream window: Austria 3.9 / draw 2.1 /
+Túnez 2.7. Cross-checked vs Betano (4.2/2.27/2.62) and BetWarrior
+(3.7/2.23/2.85) — Betsson's decoded odds land right in the middle and the
+home/draw/away mapping is correct. So the decode is verified against
+ground truth, not just "well-formed".
+
+**State:** **All four platforms now ingest live in-play 1X2** (Betano,
+BetWarrior, Bplay, Betsson). PR #2's "needs live validation" caveat is
+resolved. Open follow-ups remain: wire `fetch_live_soccer`'s
+`live_event_ids` to the HTTP fixture discovery, and enrich team names.
+Best-of-book on this match ≈ 1.03 (no arb), as expected.
+
+---
+
 ## 2026-06-01 — Betsson live WS scraper built (`betsson_ws.py`) — Diffusion subscriber
 
 **Context:** Turn the decoded Diffusion protocol into a live in-play
