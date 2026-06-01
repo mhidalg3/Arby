@@ -333,9 +333,22 @@ async def _recon(context: BrowserContext, args: argparse.Namespace, out_dir: Pat
                 await _check_block(page, "match")
                 await _snapshot(page, "05_match", "Match detail", out_dir, nav_steps)
 
-        # Let any late XHR / polling settle so we capture them in the HAR.
-        print("\n[6] Idle to capture late traffic...", flush=True)
-        await asyncio.sleep(5)
+        if args.interactive:
+            # Logged-in capture: hold (HAR + WS still recording) while the
+            # operator adds a selection to the bet slip by hand, which is
+            # what surfaces stake limits (max_stake) the public feeds omit.
+            print(
+                "\n[6] INTERACTIVE: in the browser, add a selection to the bet slip "
+                "(do NOT place the bet) to surface stake limits, then return here.",
+                flush=True,
+            )
+            await asyncio.to_thread(
+                input, "[interactive] Press Enter when done to stop capturing... "
+            )
+        else:
+            # Let any late XHR / polling settle so we capture them in the HAR.
+            print("\n[6] Idle to capture late traffic...", flush=True)
+            await asyncio.sleep(5)
     finally:
         request_stream.close()
         ws_stream.close()
@@ -407,6 +420,13 @@ async def main() -> int:
         "session into the persistent profile. Stores no credentials; handles "
         "2FA/captcha by hand. Re-run without --login to recon logged-in.",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="After navigating, HOLD (still recording HAR/WS) until you press "
+        "Enter — for logged-in bet-slip capture (add a selection by hand to "
+        "surface stake limits). Use a profile already logged in via --login.",
+    )
     args = parser.parse_args()
 
     url = args.url or DEFAULT_URLS.get(args.platform)
@@ -417,6 +437,13 @@ async def main() -> int:
         )
         return 2
     args.url = url
+
+    if args.interactive and args.headless:
+        print(
+            "error: --interactive needs a visible browser; do not pass --headless",
+            file=sys.stderr,
+        )
+        return 2
 
     profile_dir = PROFILE_ROOT_BASE / args.platform
     profile_dir.mkdir(parents=True, exist_ok=True)
