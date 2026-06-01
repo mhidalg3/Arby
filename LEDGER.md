@@ -1,5 +1,35 @@
 # Project Ledger
 
+## 2026-06-01 — `betsson_ws` fetch_live_soccer discovery wired + live-validated
+
+**Context:** `fetch_live_soccer` previously needed an injected event-id
+source. Wired real discovery and validated it live.
+
+**Approach:** the Diffusion fixture-phase feed has no sportId, but the HTTP
+categories tree definitively marks soccer (the `futbol/…` slugs). So:
+discover soccer event ids via the existing `BetssonScraper` fixture
+discovery → subscribe to all their market topics over one Diffusion
+connection → **only in-running events publish on the transient channel**,
+so the live filter falls out for free (no per-event liveness probe needed).
+
+**Bug found + fixed via the live run:** 217 soccer candidates × per-selector
+frames overflowed the single-byte conversation id (>255). Confirmed live
+that one `obg/gossip/subscribe` frame accepts MANY selectors, so now
+selectors are sent in **batched frames** (`_SUBSCRIBE_BATCH=50`, markets-
+only for the multi-event path) — ~5 frames, conv id stays tiny.
+
+**Live result:** discovered 217 soccer events, surfaced **~15 currently-live
+matches** with correct 1X2 (Austria–Túnez 4.6/1.85/2.88, Georgia–Rumanía,
+Colombia–Costa Rica, Austria–Jordania, …). +2 unit tests
+(`_discover_live_events` override / empty). 484 tests, ruff + mypy clean.
+
+**State:** Betsson live in-play is now fully autonomous (discovery +
+subscribe + decode), matching the other platforms. Remaining nicety: team
+names come from the categories slug (event-level names not pulled from the
+feed) — good enough for cross-platform matching.
+
+---
+
 ## 2026-06-01 — `betsson_ws.py` LIVE-VALIDATED — all 4 platforms now do in-play
 
 **Context:** Live test of `BetssonWsScraper` against an in-play match

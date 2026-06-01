@@ -56,7 +56,23 @@ def test_non_1x2_or_non_market_values_yield_nothing() -> None:
 
 
 async def test_fetch_live_soccer_without_source_is_empty() -> None:
-    """No event-id source → no subscriptions, no network, no snapshots."""
+    """No http_client and no discover override → no subscriptions, no
+    network, no snapshots."""
     scraper = BetssonWsScraper()
     out = [s async for s in scraper.fetch_live_soccer()]
     assert out == []
+
+
+async def test_discover_uses_injected_override() -> None:
+    async def fake_discover() -> list[tuple[str, str]]:
+        return [("f-A", "Team A vs Team B"), ("f-C", "Team C vs Team D")]
+
+    scraper = BetssonWsScraper(discover=fake_discover)
+    assert await scraper._discover_live_events() == [
+        ("f-A", "Team A vs Team B"),
+        ("f-C", "Team C vs Team D"),
+    ]
+
+
+async def test_discover_without_source_is_empty() -> None:
+    assert await BetssonWsScraper()._discover_live_events() == []

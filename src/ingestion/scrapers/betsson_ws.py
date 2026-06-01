@@ -36,11 +36,17 @@ import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Final
 
+import httpx
 import structlog
 from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
 from src.ingestion.scrapers.base import BaseScraper, RawOddsSnapshot
+from src.ingestion.scrapers.betsson import (
+    DEFAULT_SOCCER_SLUG_PREFIXES,
+    BetssonContractError,
+    BetssonScraper,
+)
 from src.ingestion.scrapers.betsson_diffusion import (
     MARKET_1X2,
     MARKET_MESSAGE_TYPE,
@@ -78,6 +84,9 @@ _RAW_MARKET_NAME = "Ganador del partido"  # the MW3W 1X2 market's human label
 DEFAULT_STREAM_DURATION_SEC: Final[float] = 20.0
 _CONNECT_TIMEOUT_SEC: Final[float] = 15.0
 _MAX_FRAME_BYTES: Final[int] = 1 << 24  # initial snapshots can be large
+# Topic selectors per obg/gossip/subscribe frame — one frame carries many
+# (verified live). Batching keeps the conversation id and frame count small.
+_SUBSCRIBE_BATCH: Final[int] = 50
 
 
 def _connect_url() -> str:
@@ -128,8 +137,11 @@ class BetssonWsScraper(BaseScraper):
     """Live in-play 1X2 odds for Betsson PBA via the Diffusion WS feed.
 
     ``fetch_event_odds(event_id)`` is the surgical single-event path.
-    ``fetch_live_soccer()`` needs a ``live_event_ids`` source (e.g. the
-    HTTP scraper's fixture discovery) to know which events to subscribe to.
+    ``fetch_live_soccer()`` discovers candidate soccer events from the HTTP
+    categories tree (needs an ``http_client``) and subscribes to them; only
+    events that are actually in-running publish on the Diffusion transient
+    channel, so the live filter is implicit. Inject ``discover`` to override
+    the event source (e.g. in tests).
     """
 
     platform_name = "betsson-pba"
@@ -139,11 +151,15 @@ class BetssonWsScraper(BaseScraper):
     def __init__(
         self,
         *,
+        http_client: httpx.AsyncClient | None = None,
         stream_duration_sec: float = DEFAULT_STREAM_DURATION_SEC,
-        live_event_ids: Callable[[], Awaitable[list[str]]] | None = None,
+        discover: Callable[[], Awaitable[list[tuple[str, str]]]] | None = None,
+        soccer_slug_prefixes: tuple[str, ...] = DEFAULT_SOCCER_SLUG_PREFIXES,
     ) -> None:
+        self._http_client = http_client
         self._stream_duration_sec = stream_duration_sec
-        self._live_event_ids = live_event_ids
+        self._discover = discover
+        self._soccer_slug_prefixes = soccer_slug_prefixes
         self._log = log.bind(platform=self.platform_name, mode="ws")
 
     async def fetch_event_odds(
@@ -152,38 +168,67 @@ class BetssonWsScraper(BaseScraper):
         """Subscribe to one event and return its latest 1X2 snapshot per
         selection seen during the stream window."""
         latest: dict[str, RawOddsSnapshot] = {}
-        async for snap in self._stream([event_id], {event_id: raw_event_name}):
+        selectors = [markets_selector(event_id), events_selector(event_id)]
+        async for snap in self._stream(selectors, {event_id: raw_event_name}):
             latest[snap.platform_outcome_id] = snap
         return list(latest.values())
 
     async def fetch_live_soccer(self) -> AsyncIterator[RawOddsSnapshot]:
-        if self._live_event_ids is None:
-            self._log.warning("ws.no_event_source")
+        candidates = await self._discover_live_events()
+        if not candidates:
+            self._log.debug("ws.no_candidate_events")
             return
-        event_ids = await self._live_event_ids()
-        if not event_ids:
-            self._log.debug("ws.no_live_events")
-            return
-        async for snap in self._stream(event_ids, {}):
+        names = dict(candidates)
+        # Subscribe to every soccer event's market topic; only in-running
+        # events publish on the transient channel, so non-live ones are
+        # silently filtered. (events-topic omitted here — markets carry the
+        # odds; keeps the subscription set half the size.)
+        selectors = [markets_selector(event_id) for event_id, _ in candidates]
+        self._log.debug("ws.subscribing", candidates=len(selectors))
+        async for snap in self._stream(selectors, names):
             yield snap
 
     # ---- internals ----
 
+    async def _discover_live_events(self) -> list[tuple[str, str]]:
+        """Return ``(event_id, name)`` for candidate soccer events. The HTTP
+        categories tree marks which events are soccer (the live filter then
+        falls out of the Diffusion subscription — non-live events don't
+        publish on the transient channel). Override via ``discover``."""
+        if self._discover is not None:
+            return await self._discover()
+        if self._http_client is None:
+            self._log.warning("ws.no_discovery_source")
+            return []
+        scraper = BetssonScraper(
+            self._http_client, soccer_slug_prefixes=self._soccer_slug_prefixes
+        )
+        try:
+            fixtures = await scraper._discover_soccer_fixtures()
+        except BetssonContractError as exc:
+            self._log.warning("ws.discovery_failed", error=str(exc))
+            return []
+        return [(fx.event_id, scraper._event_name_from_slug(fx.slug)) for fx in fixtures]
+
     async def _stream(
-        self, event_ids: list[str], names: dict[str, str]
+        self, selectors: list[str], names: dict[str, str]
     ) -> AsyncIterator[RawOddsSnapshot]:
-        """Open a connection, subscribe to the events' markets, and yield 1X2
-        snapshots for the stream window. A transport failure is logged and
-        ends the cycle (the polling framework backs off)."""
+        """Open a connection, subscribe to the given topic selectors, and
+        yield 1X2 snapshots for the stream window. Selectors are sent in
+        batched frames (one ``obg/gossip/subscribe`` carries many) to keep
+        the conversation id small and the frame count low. A transport
+        failure is logged and ends the cycle (the framework backs off)."""
+        if not selectors:
+            return
         try:
             async with connect(
                 _connect_url(), open_timeout=_CONNECT_TIMEOUT_SEC, max_size=_MAX_FRAME_BYTES
             ) as ws:
-                conv = 1
-                for event_id in event_ids:
-                    for selector in (markets_selector(event_id), events_selector(event_id)):
-                        await ws.send(encode_subscribe_frame(conv, selector))
-                        conv += 1
+                for conv, start in enumerate(
+                    range(0, len(selectors), _SUBSCRIBE_BATCH), start=1
+                ):
+                    batch = selectors[start : start + _SUBSCRIBE_BATCH]
+                    await ws.send(encode_subscribe_frame(conv, *batch))
                 deadline = time.monotonic() + self._stream_duration_sec
                 while (remaining := deadline - time.monotonic()) > 0:
                     try:
