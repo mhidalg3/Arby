@@ -1,5 +1,35 @@
 # Project Ledger
 
+## 2026-06-01 — Logged-in recon COMPLETE (4/4): BetWarrior has no pre-bet max
+
+**BetWarrior (Kambi) exposes NO pre-fetchable max stake** — confirmed at the
+API level, matching the operator's observation (no max button, no cap
+warning) on Canada vs Uzbekistan. Evidence (artifacts
+`recon/artifacts/betwarrior/20260601-230058/`, HAR sanitized):
+- The bet-slip server call `POST cf-al-auth-api.kambicdn.com/player/api/
+  v2019/bwargbap/coupon/validate.json` returns only
+  `{"status":"SUCCESS","validSession":true}` — no stake/limit fields.
+- `punter/session.json` has no limit/balance/max fields either.
+- The `maxStake` strings in the HAR are UI labels/translations
+  ("Apuesta Max"), not values.
+So Kambi enforces any cap **server-side at placement only** (a `placebet`
+call the operator didn't make — which would actually place a bet). For the
+risk layer: no exposed cap → use a conservative policy default; effectively
+non-binding at our sizes. (Login-first worked again: no creds in the HAR.)
+
+**Logged-in stake-limit summary (all 4 platforms):**
+- **Betsson:** flat account cap — maxStake 20,000,000 / payout cap
+  100,000,000 / min 20 (user-context). Effective = min(20M, 100M/odds).
+- **Betano:** DYNAMIC per-bet — `POST /api/betslipcombo/limits` →
+  {min,max} (test: 58,103.85 / 11,857,928.57). Query per bet.
+- **Bplay:** payout-cap model — `max_winning` 999,999,999 → max = cap/odds;
+  the "9,999,999" is the web input field's 7-digit limit, not the API cap.
+- **BetWarrior:** none exposed pre-placement (Kambi).
+The `src/risk/` policy layer needs per-platform handling (flat vs dynamic
+vs payout-cap vs none), not one constant.
+
+---
+
 ## 2026-06-01 — Logged-in recon: Bplay limits + the `--login` session-persistence fix
 
 **Max bet (Bplay):** the bet-slip (`POST ws-deportespba.bplay.bet.ar/
