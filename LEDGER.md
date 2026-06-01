@@ -1,5 +1,44 @@
 # Project Ledger
 
+## 2026-06-01 — Logged-in recon: Betsson stake limits captured + validated
+
+**Context:** First logged-in recon. Added `recon.py --interactive` (hold +
+capture while the operator adds a selection to the bet slip by hand) and
+captured Betsson's authenticated bet-slip/account limits — the `max_stake`
+the public feeds omit.
+
+**Finding — Betsson stake-limit contract** (from authenticated GETs
+`/sb/fe-api/v1/user-context` and `/sb/fe-api/v2/configuration`; artifacts
+`recon/artifacts/betsson/20260601-204830/`):
+- `maximumStake` = **20,000,000 ARS** — matches the website's stated max for
+  the test 1X2 (Colombia vs Costa Rica) **exactly** → capture validated.
+- `minimumStake` = 20, `stakeIncrement` = 0.2, `maximumTotalStake` =
+  20,000,000, `minimumRemainingStake` = 20, **`maximumPayout` = 100,000,000**,
+  `currencyCode` = ARS.
+
+**Key insights:**
+- Limits are **account/platform-level** (user-context/configuration), NOT
+  per-market — so ONE logged-in capture per platform suffices (no
+  per-match capture). For this 1X2 the site's 20M matched the global, i.e.
+  no per-market override here.
+- **The payout cap binds the effective stake at high odds:** effective
+  max stake = min(`maximumStake`, `maximumPayout` / decimal_odds) =
+  min(20M, 100M/odds). At odds > 5 the 100M payout cap is the tighter
+  constraint. The risk layer should apply both.
+- 20M ARS per bet is far above our exposure caps, so Betsson's stake cap
+  is effectively non-binding for our sizes — but the payout/odds
+  interaction still matters for long-odds legs.
+- The live bet-slip itself is a Diffusion topic (`/api/sb/v2/topics/betslip`);
+  limits, though, come from the HTTP user-context — no WS decode needed.
+
+**State:** Betsson logged-in limits DONE (feeds the `src/risk/` policy
+default for betsson-pba: max_stake 20M, min 20, increment 0.2, payout cap
+100M, ARS). `recon.py --interactive` added (branch `recon/logged-in-capture`).
+**Next:** same `--login` + `--interactive` capture for Betano, BetWarrior,
+Bplay to get their limits.
+
+---
+
 ## 2026-06-01 — Credentials / login infra (manual-login profile + OS keychain)
 
 **Context:** Stand up secure handling of sportsbook logins for logged-in
