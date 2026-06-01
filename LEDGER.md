@@ -1,5 +1,80 @@
 # Project Ledger
 
+## 2026-06-01 — Betsson live WS scraper built (`betsson_ws.py`) — Diffusion subscriber
+
+**Context:** Turn the decoded Diffusion protocol into a live in-play
+scraper, so Betsson matches the other platforms.
+
+**Built:**
+- Extended `betsson_diffusion.py`: `decode_value_frame` now handles BOTH
+  `0x04` (raw CBOR) and `0x84` (zlib CBOR) — small live updates arrive
+  uncompressed, big snapshots compressed; the `0x80` bit = compression.
+  Added the subscribe-frame **encoder** (`encode_subscribe_frame` +
+  `markets_selector`/`events_selector`/`FIXTURE_PHASE_SELECTOR`) — a
+  golden test confirms it reproduces the captured subscribe frames
+  **byte-for-byte**. Exposed `outcome_of_selection` + `selection_decimal_price`.
+- `src/ingestion/scrapers/betsson_ws.py` — `BetssonWsScraper(BaseScraper)`,
+  `platform_name="betsson-pba"` (same book as the HTTP scraper).
+  `fetch_event_odds(event_id)` (surgical) + `fetch_live_soccer()` (needs a
+  `live_event_ids` source). Per-cycle: connect → subscribe markets/events
+  → stream a bounded window → decode → 1X2 snapshots (mirrors `bplay_sse`
+  to sidestep long-lived keepalive). Pure `market_value_to_snapshots`
+  tested against the real MW3W fixture.
+- Deps added: `cbor2`, `websockets`. Full suite **488 passed**, ruff +
+  mypy clean. New golden fixtures under `tests/fixtures/`.
+
+**State:** Protocol encode + decode are byte-verified against the real
+capture. The **network layer (connect handshake + keepalive) is NOT yet
+validated against a live server** — derived from a passive capture, so the
+first live run may need iteration (e.g. server-ping handling). That's the
+remaining step: a live test against an in-play Betsson match, like we did
+for the other platforms.
+
+**Open follow-ups:** (1) live-validate `betsson_ws` on a match (connect/
+keepalive/discovery); (2) wire `fetch_live_soccer`'s `live_event_ids` to
+the HTTP scraper's fixture discovery; (3) team names — the Diffusion feed
+gives `ei`/selection ids, not names, so enrich from categories if needed.
+
+**Uncommitted backlog:** (a) credentials/`--login` infra (+keyring), (b)
+the Betsson decoder + WS scraper (+cbor2, +websockets). Bplay UA fix
+already landed in PR #1.
+
+---
+
+## 2026-05-30 — Betsson live (Diffusion) feed DECODED: zlib + CBOR, 1X2 odds extractable
+
+**Context:** Closed the last in-play gap. Betsson pushes live odds over a
+Diffusion WebSocket; the captured frames were opaque binary. Decoded them
+from the 3,404-frame capture (no new Betsson traffic spent).
+
+**Protocol cracked:** server value frames are `0x84` + short header +
+**zlib**; decompressed payload is **CBOR**; topics publish full values
+(`PUBLISH_VALUES_ONLY=true`), so no delta application. Market messages
+(`t==27`) carry `d={ei, mti, odds}` with the SAME market codes as the
+prematch accordion (`MW3W`=1X2, etc.); `d.odds[selId].of["1"]` is the
+decimal price, and 1X2 selection ids end in `-home`/`-draw`/`-away` (no
+external outcome map needed). Verified: Nice vs St-Étienne 1X2 =
+2.55/2.25/3.90.
+
+**Built:** `src/ingestion/scrapers/betsson_diffusion.py` — pure decoder
+(`decode_value_frame` → CBOR map; `market_1x2_odds` → `(event_id,
+{home/draw/away: price})`). 6 unit tests incl. a golden test against a
+REAL captured frame (`tests/fixtures/betsson_diffusion_mw3w.b64`). Added
+`cbor2` dep. Full suite **482 passed**, ruff + mypy clean.
+
+**State:** The hard reverse-engineering ("un-decode") is DONE and tested.
+What remains for a working live scraper is the Diffusion WS **client**:
+the connect handshake (`?ty=WB&v=28…` + server session-token frame), the
+3 `obg/gossip/subscribe` frames (captured), and keepalive/reconnect —
+which needs live iteration against a match. That's the `betsson_ws.py`
+build (would slot beside `bplay_sse.py` as the realtime-subscriber
+pattern).
+
+**Uncommitted backlog now:** (a) credentials/`--login` infra (+keyring),
+(b) this Betsson decoder (+cbor2). The Bplay UA fix already landed in PR #1.
+
+---
+
 ## 2026-05-30 — In-play stress test (PSG vs Arsenal, UCL final): Bplay UA bug fixed; phantom-arb evidence
 
 **Context:** Used the live UCL final (2nd half) to stress-test in-play

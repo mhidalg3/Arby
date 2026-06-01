@@ -26,6 +26,8 @@ dependencies = [
     "pydantic-settings>=2.4",
     "python-dotenv>=1.0",
     "tenacity>=9.0",
+    "cbor2>=6.1.1",
+    "websockets>=16.0",
 ]
 
 [dependency-groups]
