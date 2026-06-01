@@ -112,6 +112,19 @@ MARKET_BTTS_PREFIX: Final[str] = "Ambos"
 # occasional slowness without letting a true outage stall the polling loop.
 DEFAULT_HTTP_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(15.0, connect=5.0)
 
+# Bplay's WAF now serves an empty/stub response to the default
+# python-httpx User-Agent (confirmed live 2026-05-30: XML feeds returned
+# nothing, /en-vivo served a 269-byte shell). A browser UA gets the real
+# payload — same silent WAF break fixed for Betsson on 2026-05-29.
+BROWSER_USER_AGENT: Final[str] = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+)
+_XML_HEADERS: Final[dict[str, str]] = {
+    "User-Agent": BROWSER_USER_AGENT,
+    "Accept": "application/xml,text/xml,*/*",
+}
+
 
 class BplayContractError(RuntimeError):
     """Bplay returned a payload that doesn't match the recon-frozen contract.
@@ -194,7 +207,9 @@ class BplayPbaScraper(BaseScraper):
         url = f"{BASE_URL}{ODDS_FEED_PATH.format(competition_id=competition_id)}"
         try:
             resp = await self._guard.get(
-                lambda: self._client.get(url, timeout=DEFAULT_HTTP_TIMEOUT)
+                lambda: self._client.get(
+                    url, headers=_XML_HEADERS, timeout=DEFAULT_HTTP_TIMEOUT
+                )
             )
         except CircuitOpenError as exc:
             # Circuit is open from a recent block/rate-limit — fail fast,

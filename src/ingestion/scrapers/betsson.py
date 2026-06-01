@@ -121,6 +121,15 @@ DEFAULT_FIXTURE_TTL_SEC = 300.0
 # answers in <500ms; this leaves headroom for AWS WAF challenges.
 DEFAULT_HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
+# The odds (accordion) endpoint's WAF returns HTTP 403 (an HTML block page)
+# to the default `python-httpx` User-Agent — confirmed live 2026-05-29. A
+# browser UA gets a 200. (categories/v2 tolerates the python UA, which long
+# masked this: discovery worked, every odds call 403'd → zero snapshots.)
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+)
+
 
 class BetssonContractError(RuntimeError):
     """The Betsson API returned a payload that doesn't match the recon-frozen contract.
@@ -186,6 +195,9 @@ class BetssonScraper(BaseScraper):
         # infrastructure change to break us.
         self._platform_headers: dict[str, str] = {
             "Accept": "application/json, text/plain, */*",
+            # Required by the odds-endpoint WAF — a non-browser UA gets a
+            # 403 HTML block page (see _BROWSER_USER_AGENT above).
+            "User-Agent": _BROWSER_USER_AGENT,
             "brandid": PLATFORM_BRAND_ID,
             "marketcode": MARKET_CODE,
             "x-sb-type": "b2b",

@@ -20,6 +20,10 @@ Output layout (per platform per run):
     recon/artifacts/<platform>/<UTC-timestamp>/
         network.har         — full network trace (Playwright HAR)
         requests.jsonl      — live log of every request (url/method/type)
+        websocket_frames.jsonl — every WebSocket frame (ts/url/dir/payload);
+                              the HAR does NOT record WS, and some platforms
+                              push live odds over WS (e.g. Betsson's OBG
+                              pub/sub) — this is how we recon in-play feeds
         summary.json        — nav steps with title + final URL each step
         NN_<slug>.png       — screenshot per nav step
         NN_<slug>.html      — full DOM dump per nav step
@@ -38,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import json
 import sys
@@ -52,6 +57,7 @@ from playwright.async_api import (
     Page,
     Request,
     ViewportSize,
+    WebSocket,
     async_playwright,
 )
 from playwright.async_api import Error as PlaywrightError
@@ -179,6 +185,10 @@ def _request_logger(stream: TextIO) -> Callable[[Request], None]:
     """Returns a callback that streams each request to a JSONL file."""
 
     def on_request(req: Request) -> None:
+        # Late events can fire during context teardown, after the finally
+        # block closed the stream — drop them rather than crash.
+        if stream.closed:
+            return
         entry = {
             "ts": datetime.now(UTC).isoformat(),
             "url": req.url,
@@ -191,11 +201,76 @@ def _request_logger(stream: TextIO) -> Callable[[Request], None]:
     return on_request
 
 
+# Cap a single WS frame's stored size — initial odds snapshots can be
+# large; we keep enough to read the shape without unbounded files.
+MAX_WS_FRAME_CHARS = 200_000
+
+
+def _ws_frame_row(
+    ws_url: str, direction: str, payload: str | bytes, max_len: int = MAX_WS_FRAME_CHARS
+) -> dict[str, object]:
+    """Build a JSONL row for one WebSocket frame (pure; no timestamp).
+
+    Text frames are stored as-is; binary frames are base64-encoded and
+    flagged. Oversized payloads are truncated with a `truncated` flag so
+    the artifact stays bounded."""
+    binary = False
+    if isinstance(payload, bytes):
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            text = base64.b64encode(payload).decode("ascii")
+            binary = True
+    else:
+        text = payload
+    truncated = len(text) > max_len
+    if truncated:
+        text = text[:max_len]
+    row: dict[str, object] = {
+        "ws_url": ws_url,
+        "dir": direction,
+        "binary": binary,
+        "payload": text,
+    }
+    if truncated:
+        row["truncated"] = True
+    return row
+
+
+def _websocket_logger(stream: TextIO) -> Callable[[WebSocket], None]:
+    """Returns a `page.on('websocket', ...)` callback that streams every
+    frame (both directions) to a JSONL file.
+
+    The HAR does not record WebSocket traffic, but some sportsbooks push
+    live/in-play odds over WS (e.g. Betsson's OBG `?obg/sportsbook/
+    transient/...` pub/sub) — this is the only way to recon those feeds."""
+
+    def on_websocket(ws: WebSocket) -> None:
+        def write(direction: str, frame: object) -> None:
+            # Late frames can fire during context teardown, after the
+            # finally block closed the stream — drop them rather than crash.
+            if stream.closed:
+                return
+            # Playwright may hand the payload directly or wrapped; handle both.
+            payload = getattr(frame, "payload", frame)
+            if not isinstance(payload, str | bytes):
+                return
+            row = {"ts": datetime.now(UTC).isoformat(), **_ws_frame_row(ws.url, direction, payload)}
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            stream.flush()
+
+        ws.on("framereceived", lambda frame: write("recv", frame))
+        ws.on("framesent", lambda frame: write("sent", frame))
+
+    return on_websocket
+
+
 async def _recon(context: BrowserContext, args: argparse.Namespace, out_dir: Path) -> None:
     nav_steps: list[dict[str, str]] = []
     requests_path = out_dir / "requests.jsonl"
     request_stream = requests_path.open("w", encoding="utf-8")
     context.on("request", _request_logger(request_stream))
+    ws_stream = (out_dir / "websocket_frames.jsonl").open("w", encoding="utf-8")
 
     pacing = pacing_for(args.platform)
     homepage = _homepage_of(args.url)
@@ -203,6 +278,9 @@ async def _recon(context: BrowserContext, args: argparse.Namespace, out_dir: Pat
 
     try:
         page = context.pages[0] if context.pages else await context.new_page()
+        # Capture WebSocket frames (live odds for OBG-style pub/sub feeds);
+        # the HAR doesn't record these. Attached before any navigation.
+        page.on("websocket", _websocket_logger(ws_stream))
         # One cursor for the whole session — continuous motion, like a
         # real hand that doesn't teleport between actions.
         cursor = HumanCursor(page, pacing)
@@ -260,6 +338,7 @@ async def _recon(context: BrowserContext, args: argparse.Namespace, out_dir: Pat
         await asyncio.sleep(5)
     finally:
         request_stream.close()
+        ws_stream.close()
         (out_dir / "summary.json").write_text(
             json.dumps(
                 {
@@ -289,6 +368,11 @@ async def main() -> int:
         "--url",
         default=None,
         help="Entry URL. Defaults to the platform's canonical landing page; pass explicitly to recon a specific match URL.",
+    )
+    parser.add_argument(
+        "--channel",
+        default=None,
+        help="Browser channel, e.g. 'chrome' to drive installed Google Chrome instead of bundled Chromium (closes the Chromium-for-Testing fingerprint gap).",
     )
     args = parser.parse_args()
 
@@ -320,6 +404,7 @@ async def main() -> int:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=args.headless,
+            channel=args.channel,
             locale=LOCALE,
             timezone_id=TIMEZONE_ID,
             viewport=VIEWPORT,

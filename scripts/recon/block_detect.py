@@ -48,10 +48,17 @@ _BODY_SIGNATURES = (
 )
 
 # Regexes checked against the raw HTML (e.g. block-page iframes).
+# NOTE: we deliberately do NOT match the bare `/cdn-cgi/challenge-platform/`
+# script reference. Cloudflare injects that orchestration script into the
+# HTML of *every* page it fronts, not just challenge interstitials — so
+# matching it flagged healthy Betano homepages and aborted every recon
+# before it could navigate (2026-05-29). A genuine CF interstitial is
+# caught instead by its title ("just a moment", "attention required") and
+# body text ("enable javascript and cookies to continue", "verify you are
+# human", "ray id"), which a normal page does not carry.
 _HTML_PATTERNS = (
     re.compile(r"landingpages\.kaizengaming\.com/[^\"']*splash-screen", re.I),
     re.compile(r"challenges\.cloudflare\.com", re.I),
-    re.compile(r"/cdn-cgi/challenge-platform/", re.I),
 )
 
 

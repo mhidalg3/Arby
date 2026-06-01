@@ -1,5 +1,431 @@
 # Project Ledger
 
+## 2026-05-30 — In-play stress test (PSG vs Arsenal, UCL final): Bplay UA bug fixed; phantom-arb evidence
+
+**Context:** Used the live UCL final (2nd half) to stress-test in-play
+ingestion across all 4 platforms and fix what broke. 35-cycle / ~50-min
+observation; time-series `recon/artifacts/live_test/ucl-20260530-171328/`.
+
+**Fix — Bplay was returning ZERO (same UA class of bug as Betsson):**
+Bplay's WAF now serves stubs to the default `python-httpx` UA — XML feeds
+empty, `/en-vivo` a 269-byte shell, both **HTTP 200** (even more silent
+than Betsson's 403). A browser UA → real 500KB SSR page + valid XML.
+Added `BROWSER_USER_AGENT` to `bplay.py` (`_XML_HEADERS`), imported into
+`bplay_sse.py` (`_discovery_headers`, `_sse_headers`). Bplay then ingested
+the match live via SSE. 3 of 4 platforms have now hit the missing-UA bug
+(Betano had it from the start) → centralizing one UA in `base.py` is a
+strong follow-up. Bplay unit tests still pass (30).
+
+**In-play scorecard (this match):**
+- Betano 33/35, BetWarrior 32/35, Bplay 29/35 cycles — all 0 errors;
+  absences are SSE/feed gaps + match end.
+- **Betsson 0/35** — live = Diffusion WS, still un-decoded (the one
+  remaining in-play gap; separate large task).
+- Three books tracked a dramatic match (Arsenal leading → PSG equalized
+  → headed to a draw) within a few % of each other.
+
+**KEY FINDING — naive in-play margin = phantom arbs.** 10 of 33 cycles
+showed margin < 1.0 (min **0.7132**), but **every one is a stale-quote
+artifact, zero executable.** At c10 the 0.71 came from Bplay's SSE lagging
+~90s through PSG's equalizer (still pricing Arsenal at 1.56 while Betano/
+BetWarrior had repriced to ~even); best-of combined the stale Bplay home
+(7.5) with a fresh away price. It vanished the moment Bplay caught up. The
+other 8 (0.97–0.999) are books drifting at different latencies as Arsenal's
+win-price ran out toward a draw. **This is the clearest evidence yet that
+single-snapshot cross-book in-play margins are dangerous — the `src/risk/`
+Tier-2 re-fetch + staleness/simultaneity gate is mandatory before acting,
+especially in-play where feeds lag through goals.** Also noted: Bplay's SSE
+per-cycle stream window makes its "latest" the laggiest of the three —
+a per-platform staleness weight worth carrying into the risk layer.
+
+**State:** In-play ingestion working on Betano + BetWarrior + Bplay;
+Betsson live still pending the Diffusion decode. Uncommitted backlog to
+land: (a) credentials/`--login` infra (recon `--login`, `src/credentials.py`,
+keyring dep), (b) this Bplay UA fix. Logged-in recon is the next planned
+step (accounts now exist).
+
+---
+
+## 2026-05-29 — Recon harness can now capture WebSocket frames (enables Betsson live-odds recon)
+
+**Context:** Betsson's `accordion/v1` is prematch-only; in-play odds
+arrive over a **WebSocket pub/sub channel** (OBG `?obg/sportsbook/
+transient/events|markets/...` topics — already noted in RECON_LOG
+2026-05-25 but never captured, because the recon harness only logged
+HTTP requests + a HAR, and the HAR does not record WS frames). So we
+literally could not recon Betsson live. This adds that capability.
+
+**Change (`scripts/recon/recon.py`):**
+- New `websocket_frames.jsonl` artifact: every WS frame (both
+  directions) with `ts / ws_url / dir / payload`, via a
+  `page.on("websocket", ...)` handler attached before navigation.
+- Pure serializer `_ws_frame_row` — text stored verbatim, binary
+  base64-encoded + flagged, oversized frames truncated (cap
+  `MAX_WS_FRAME_CHARS = 200_000`) so artifacts stay bounded/readable.
+  Defensive to Playwright passing the payload directly vs wrapped.
+- Always-on (empty file when a site uses no WS; negligible cost).
+- 5 unit tests (`test_recon_ws_capture.py`). Full suite **470 passed**,
+  ruff + mypy clean.
+
+**Executed same session** on a live match (Ligue 1 Nice vs
+Saint-Étienne, event `f-rdwm7m-uK0yqVgGGcW5KIg`): captured **3,404 WS
+frames**. Betsson live odds = **Diffusion pub/sub WebSocket**
+(`wss://pba.betsson.bet.ar/diffusion`); subscribe to
+`?obg/sportsbook/transient/markets/<eventId>/` + `events/<eventId>/`.
+Frames are Diffusion binary deltas keyed by topic ID (decoding them →
+odds is the next phase). Full notes: RECON_LOG 2026-05-29 betsson;
+artifacts `recon/artifacts/betsson/20260529-194942/`.
+
+**Harness bug fixed this session:** a late `request`/WS event firing
+during `context.close()` wrote to the already-closed JSONL stream and
+crashed teardown (exit 1, after artifacts were saved). Both loggers now
+guard `if stream.closed: return`. Artifacts from the crashing run were
+intact; the fix makes teardown clean.
+
+**State:** Capability built + tested (470 + WS tests pass) AND validated
+live. Going into PR #1 (extends its recon.py changes). The Betsson
+prematch scraper is unaffected.
+
+**Next:** decode the Diffusion binary delta format → live odds (via a
+Diffusion client lib or reverse-engineering the captured frames), then
+add a Betsson live WS subscriber scraper (cf. `bplay_sse.py`), keeping
+`accordion/v1` for not-yet-live fixtures.
+
+---
+
+## 2026-05-29 — 90-min live observation RESULTS (Sudáfrica vs Nicaragua) + Betsson UA bug fixed
+
+**Context:** Ran a 171-cycle / 90-min (30s interval) multi-platform
+odds observation on the live friendly, to watch API/odds behavior and
+validate the Betsson fix. Throwaway observer (`/tmp/live_observe.py`);
+time-series at `recon/artifacts/live_test/20260529-160520/` (gitignored).
+Betano polled via `fetch_live_soccer` (live), BetWarrior via the
+friendlies competition, Betsson surgically via `fetch_event_quotes`.
+
+**Reliability over 90 min:**
+- **Betano: 171/171 cycles, 0 errors.** httpx + browser headers held
+  against Cloudflare for the full run at 30s cadence. The scraper is
+  solid.
+- **BetWarrior: 160/171** (11 graceful absences, 0 errors — match
+  dropped from the friendlies feed during suspensions / near full-time).
+- **Betsson: 0/171 live** — prematch-only widget returns `{"data":{}}`
+  in-play (handled as absent, not error). Live widget = open follow-up.
+
+**Odds behavior:** heavy, continuous movement tracking the match. Betano
+home 1.17→1.98 (68 changes), draw 6.0→1.95 (91), away ranged 14.5–25.0
+(94) — classic "favorite never pulls away, draw shortens" arc. Both
+books tracked each other (margins mostly 1.02–1.07). **Structural
+finding: Betano priced the away longshot (Nicaragua) ~2× higher than
+BetWarrior the whole match** (Betano 19.5–24 vs BetWarrior 10.5–12) —
+the most persistent cross-book disagreement.
+
+**Arb windows: 2 sub-1.0 margins, BOTH non-actionable — and instructive:**
+- **c87, margin 0.9099 (apparent 9.9% arb): PHANTOM.** BetWarrior had
+  been absent for 2 cycles, then reappeared with a stale/transitional
+  quote (draw 7.0, away 21.0) wildly off its own next-cycle values
+  (3.5/10.5). The "arb" evaporated by c88. Classic stale-quote false
+  positive on re-appearance after suspension.
+- **c164, margin 0.9946 (0.5%): borderline,** driven by Betano's
+  persistently-high Nicaragua price + BetWarrior's home price. Too thin
+  to survive latency/suspension/stake limits.
+- **Takeaway:** live in-play throws phantom arbs from stale/suspended
+  quotes; genuine thin edges get eaten by latency. This empirically
+  justifies the `src/risk/` Tier-2 re-fetch-before-place + staleness
+  gating. Do NOT act on a single-snapshot in-play margin.
+
+**State:** Betano scraper validated end-to-end (90 min sustained).
+Betsson odds ingestion repaired (UA bug — see entry below). Full suite
+**465 passed**, mypy clean. Uncommitted: Betano scraper + Betsson UA fix
++ tests + LEDGER. Ready to fold into the PR.
+
+**Follow-ups surfaced:** (1) Betsson live-odds widget recon; (2) Betano
+`/upcomingcoupon/?sid=FOOT` for full pre-match coverage; (3) consider a
+shared browser-UA default across all scrapers (WAFs tighten); (4) the
+Betano/BetWarrior away-price gap — investigate whether it ever yields a
+robust (non-phantom) edge.
+
+---
+
+## 2026-05-29 — LIVE TEST: Betano scraper works against the real API; cross-platform ingestion validated on Sudáfrica vs Nicaragua
+
+**Context:** First live test of the Betano scraper (and a cross-platform
+ingestion check) on the international friendly Sudáfrica vs Nicaragua
+(kickoff 13:00 PBA / 16:00 UTC). User-authorized real-API calls for this
+test.
+
+**Headline result — the big unknown is RESOLVED:** a plain `httpx`
+client with browser-like headers **clears Cloudflare on BOTH Betano
+endpoints**. No browser fetch layer needed.
+- Pre-match `/api/home/top-events-v2/` → JSON, 45–48 FOOT 1X2 snapshots;
+  captured the match at 1.19 / 6.4 / 14.0 (home/draw/away).
+- Live `/danae-webapi/api/live/overview/latest` → JSON, 237 live FOOT
+  1X2 snapshots; same match once it went live, same 1.19 / 6.4 / 14.0.
+The match transitioned out of `top-events-v2` into the live feed at
+kickoff — expected prematch→live behavior.
+
+**Cross-platform capture of the match (1X2 home/draw/away):**
+- **Betano** 1.19 / 6.4 / 14.0 (both modes) ✅
+- **BetWarrior** 1.18 / 6.75 / 15.0 ✅ (competition `international_friendly_matches`)
+- **Betsson** — 0 snapshots under `futbol/internacionales/` ⚠️ (see below)
+- **Bplay** — not covered (XML scraper does only 5 marquee tournaments;
+  friendlies flow through the WebSocket channel it doesn't consume)
+Best-of-book implied sum = 1/1.19 + 1/6.75 + 1/15.0 = **1.055 (5.5%
+margin) → no arbitrage**, as expected. Pipeline validated regardless:
+same match pulled from ≥2 books and compared.
+
+**Findings / follow-ups:**
+1. **Betano `top-events-v2` is featured-only** (~25 curated events), NOT
+   comprehensive pre-match coverage. It happened to feature this
+   friendly pre-kickoff. For full pre-match coverage we need the
+   `/upcomingcoupon/?sid=FOOT` per-coupon endpoint (recon captured only
+   the coupon skeleton; its data call shape is not yet frozen). The
+   **live** mode IS comprehensive (237 events). → Treat live mode as the
+   primary Betano feed; `top-events-v2` pre-match as partial until the
+   upcoming-coupon endpoint is reconned + added.
+2. **Betsson returned 0 — diagnosed as TWO issues (one fixed).** Not a
+   slug gap: discovery found the match fine
+   (`futbol/internacionales/amistosos-internacionales/sudafrica-nicaragua`,
+   event `f-XofNqv4POkmG7kmfywi-nQ`, 35 friendlies discovered).
+   (a) **UA 403 bug — FIXED.** The odds endpoint
+   (`/api/sb/v1/widgets/accordion/v1`) WAF returns a 403 HTML block page
+   to the default `python-httpx` UA; `categories/v2` tolerated it, which
+   masked it (discovery worked, every odds call 403'd → zero snapshots).
+   Added a browser `User-Agent` to the Betsson scraper headers + a
+   regression test. Confirmed live: 403 → 200 with full odds JSON.
+   **Implication: Betsson odds ingestion was fully broken before this.**
+   (b) **Live-widget gap — follow-up.** `accordion/v1` is prematch-only;
+   once the match went in-play it returns `{"data": {}}`. Betsson live
+   odds are a different widget the scraper doesn't consume (analogous to
+   Betano's separate prematch/live endpoints). Needs a Betsson live
+   recon. So Betsson captured the match pre-kickoff but not in-play.
+3. **`deportespba.bplay.bet.ar` is NOT a new backend** — our Bplay
+   scraper already uses it as `BASE_URL` for the XML odds feeds. The
+   "standard" `pba.bplay.bet.ar` is the SPA shell (what recon browsed).
+   The user's planned deeper recon on `deportespba.*` should focus on the
+   WebSocket (`ws-deportespba.bplay.bet.ar`) for domestic/friendly
+   coverage the XML pattern doesn't serve.
+
+**State:** Betano scraper validated end-to-end against the live API in
+both modes. The httpx-vs-Cloudflare risk noted in the build entry is
+cleared. Code unchanged by the test (no fixes needed). Ready to PR the
+Betano scraper + the recon `--channel`/block_detect commit. Observation
+scripts were throwaway (`/tmp`), not committed.
+
+**Errors:** None in the Betano path. Betsson friendly-coverage gap and
+the top-events-v2 partial-coverage limit are logged as follow-ups, not
+regressions.
+
+---
+
+## 2026-05-29 — Betano ingestion scraper built (live + pre-match, one parser, mode-parameterized)
+
+**Context:** With the recon contract frozen, built the 4th-platform
+scraper `src/ingestion/scrapers/betano.py` so Betano joins Betsson +
+BetWarrior + Bplay. Goal: scrape both pre-match and in-play 1X2 odds.
+
+**Decision — one module, parameterized by `mode`, NOT one combined pass
+and NOT two files.** Both Betano feeds (live `danae-webapi/api/live/
+overview/latest`; pre-match `/api/home/top-events-v2/`) return the SAME
+normalized `{events, markets, selections}` danae shape, so the parser
+(`_parse_danae_soccer_1x2`) is shared. But in-play odds move every few
+seconds while pre-match drifts over minutes, and the framework's
+`poll_forever` drives one `fetch_live_soccer()` at one interval — a
+single combined pass would force one cadence and couple failures. So
+`BetanoScraper(mode="live"|"prematch")` selects endpoint + cadence
+(live 4s, pre-match 45s); run two instances. (Contrast bplay's two files,
+justified there by two transports REST vs SSE — here it's one transport.)
+
+**Key choices:**
+- **Both modes emit `platform="betano"`** (not `betano-live`/`-prematch`):
+  same book, so two labels would let the arb engine see a false
+  self-arbitrage between the feeds.
+- **Canonical 1X2 = MRES / typeId 1 only.** The `MR12` "SuperCuotas"
+  promo (typeId 2850) is excluded — enhanced-odds promos have different
+  stake caps/terms, unsafe for clean arb. Selections `1/X/2` → home/
+  draw/away (1,2 resolved to participant names; X → "Empate").
+- Parser skips non-FOOT, virtuals (`isVirtual`), esports (url contains
+  "esports"), and outright events (≠2 participants).
+- Reuses `RateLimitGuard` (per-mode breaker `betano-live`/`betano-prematch`)
+  and raises `BetanoContractError` on schema drift / non-JSON
+  (Cloudflare challenge) / HTTP ≥400 — same dumb-scraper discipline as
+  Betsson. `max_stake=None` (not in public feed).
+
+**State:** Code + 11 unit tests (synthetic danae fixtures via
+`httpx.MockTransport`). Full suite **464 passed**, ruff + mypy(strict)
+clean. NOT yet committed — holding for the live test. Scraper is not yet
+wired into any runner/verifier (callers instantiate scrapers directly,
+e.g. `risk/refreshers.py` for Betsson); wire-in is follow-up.
+
+**Open risk (UNVALIDATED):** Betano is Cloudflare + Kaizen protected and
+the API was only ever confirmed via a real browser. Whether a plain
+`httpx` client clears Cloudflare is unknown — the live test today is
+exactly what proves/disproves it. Browser-like headers are set to help;
+if it 403s / returns the HTML splash, the guard opens and surfaces a
+`BetanoContractError` (do NOT hammer). Fallback if httpx is blocked:
+drive the feed through the Playwright recon harness (browser context)
+instead of raw httpx.
+
+**Next:** live test against a match today → if httpx works, open the PR
+(this scraper + the committed recon `--channel`/block_detect fix); if
+blocked, pivot the fetch layer to a browser context. Then wire Betano
+into the ingestion runner + canonicalization (needs the
+`/api/static-content/assets/{teams,leagues,regions}` catalogs captured
+in recon).
+
+**Errors:** None — clean build.
+
+---
+
+## 2026-05-29 — Betano deep recon SUCCESS: pre-match endpoint captured + block-detector false-positive fixed (the real blocker)
+
+**Context:** After correcting the morning record (see entry below), ran
+a clean deep recon (>24h later, per user) to capture the one missing
+piece — the pre-match odds endpoint.
+
+**Root cause found (this changes the morning's story again):** The
+harness was never getting past the homepage on Betano because of a
+**false positive in `block_detect`**, not a real block. The HTML
+pattern `/cdn-cgi/challenge-platform/` matched the Cloudflare
+orchestration script that CF injects into *every* page it fronts — so
+`_check_block` aborted on the homepage step before any navigation. This
+is why every Betano recon (including this morning's "successes", which
+were actually exit-3 aborts with `nav_steps: []` — their danae data was
+just the homepage's own XHRs landing in the HAR before the abort)
+stopped at the homepage. On a clean/warm profile Betano was NOT blocking
+us at all.
+
+**Fix:** Removed the `/cdn-cgi/challenge-platform/` regex from
+`scripts/recon/block_detect.py` `_HTML_PATTERNS`. A genuine CF
+interstitial is still caught by title (`"just a moment"`,
+`"attention required"`) and body (`"enable javascript and cookies to
+continue"`, `"verify you are human"`, `"ray id"`) signatures, so no real
+coverage lost. Updated the test that encoded the bug
+(`test_recon_block_detect.py`): the bare orchestration script now
+asserts NOT-blocked; a real interstitial (title+body) still asserts
+blocked. 9 tests pass; ruff + mypy clean.
+
+**Recon runs (all `--channel chrome`, same warm profile):**
+- `20260529-145858` — false-positive abort on homepage (confirmed the bug:
+  370 reqs, 0 splash, data API responded, yet exit 3).
+- `20260529-150241` — fixed detector; homepage→cookie-consent→click Fútbol
+  OK. (SPA: Fútbol renders client-side without a route change; generic
+  match selectors don't match Betano's DOM.)
+- `20260529-150524` — warm deep-link to `/sport/futbol/proximos-partidos-hoy/`
+  → SUCCESS. Title "Fútbol - Partidos de Hoy", 901 reqs, 0 splash.
+
+**Endpoint map captured (the deliverable):**
+- **Pre-match odds:** `GET /api/home/top-events-v2/` → normalized
+  `{events, leagues, markets, selections}`. Selection carries
+  `price` (decimal odds); market `type:"MR12"` = 1X2 match result; event
+  has `participants[{teamId,name}]`, `leagueId`, `sportId:"FOOT"`,
+  `startTime`, `url:/cuotas-de-partido/{slug}/{eventId}/`. Saved
+  `prematch_top_events_v2.json`.
+- **Upcoming-coupon nav:** `/api/home/upcoming-coupons` (coupon skeleton;
+  events lazy-load per coupon via `/upcomingcoupon/?sid=FOOT`). Saved
+  `prematch_upcoming_coupons.json`.
+- **Live odds:** `danae-webapi/api/live/overview/latest` + `/{eventId}`;
+  layout `danae-webapi/api/layout/live`. Danae query params:
+  `queryOperatorId=19`, `queryLanguageId=8`, `queryPlatformType=1`.
+- **Reference catalogs (for canonicalization):**
+  `/api/static-content/assets/{teams (9.7MB), leagues, regions, players}`.
+  Saved `static_leagues.json`, `static_regions.json`.
+- **Per-event full market depth — NOT captured:** lives at
+  `/cuotas-de-partido/{slug}/{eventId}/` (`totalMarketsAvailable` up to
+  833). Only needed if we scrape beyond listing-level 1X2.
+
+**Code change:** `--channel` flag added to `recon.py` (drive installed
+Chrome via `launch_persistent_context(channel=...)`). Both bundled
+Chromium and Chrome load Betano fine once the profile is clean.
+
+**State:** Betano recon is DONE for a pre-match scraper build — the 1X2
+feed (`/api/home/top-events-v2/`) and the canonicalization catalogs are
+captured. Betano becomes the 4th platform alongside Betsson + BetWarrior
++ Bplay. **Next:** build `src/ingestion/scrapers/betano.py` against
+`/api/home/top-events-v2/` for pre-match 1X2; decide whether live
+(`danae-webapi/api/live/overview`) is in scope. Optional follow-up
+recon: the per-event `/cuotas-de-partido/.../{eventId}/` endpoint for
+full market depth.
+
+**Errors:** (1) `block_detect` false positive — fixed (above). It had
+silently capped every prior Betano recon at the homepage. (2) Generic
+`MATCH_LINK_SELECTORS` don't match Betano's DOM (match-open click
+failed) — not needed here since the warm deep-link worked; revisit only
+if per-event recon is wanted.
+
+---
+
+## 2026-05-29 — Betano recon retry: UNBLOCKED by wiping the profile dir (block was profile-state-bound, NOT an IP watchlist)
+
+**Context:** At 2026-05-28 21:00 ART (2026-05-29 00:32 UTC) we retried
+the Betano recon. Goal: re-establish access and capture the live/
+pre-match data endpoints. Trial mode — obtain recon info, don't
+stress-test the stealth.
+
+**What happened (corrected — supersedes the interrupted writeup):**
+Three headed runs, same IP throughout:
+- `20260529-003159` (00:32) — bundled Chromium-for-Testing
+  (UA `Chrome/148`), **reusing the persistent profile dir** → BLOCKED:
+  Kaizen splash + CF challenge, `nav_steps: []`, 33 requests, 20 splash
+  assets, **0 data calls**. Harness `block_detect` caught it and aborted
+  (exit 3) — failed safe, no hammering.
+- `20260529-004152` (00:41) — **same bundled Chromium build, same UA
+  `Chrome/148`, but with the profile dir WIPED** → SUCCESS: 361
+  requests, **0 splash**, live data API loaded
+  (`/danae-webapi/api/layout/live`, `/danae-webapi/api/live/overview/latest`).
+- `20260529-004503` (00:45) — **real installed Google Chrome via the new
+  `--channel chrome` flag** (UA `Chrome/147`), wiped profile → SUCCESS:
+  identical 361 requests / 0 splash / 2 data calls.
+
+User visually confirmed both successful runs: normal site rendered, no
+splash, no detection popup.
+
+**Decisive finding:** Run `004152` used the *identical Chromium build
+and UA* as the blocked run `003159` on the *same IP* — the only changed
+variable was wiping the profile dir, and it cleared the block within
+~10 minutes. Therefore the Betano/Kaizen block was bound to
+**persistent browser-profile state (cookies/localStorage in
+`user_data_dir`)**, NOT a persistent IP/profile watchlist and NOT the
+Chromium-for-Testing fingerprint. The earlier "24h is insufficient /
+homepage permanently blocked / can't un-profile" conclusion was WRONG —
+it was drawn solely from the dirty-profile run `003159`, and the prior
+session was interrupted (API error on a `thinking`-block edit) before
+the two subsequent SUCCESS runs were recorded. Memory corrected to match.
+
+**Code change (uncommitted):** Added `--channel` arg to
+`scripts/recon/recon.py` (passes through to
+`launch_persistent_context(channel=...)`) so the harness can drive
+installed Chrome instead of bundled Chromium-for-Testing, closing the
+CfT fingerprint gap. Both Chromium and Chrome channels now load Betano
+fine once the profile is clean.
+
+**State:** Betano browser-recon path is **ALIVE** again — both data
+feeds confirmed reachable. Caveats: `nav_steps` was empty (homepage-only;
+the 2 `danae-webapi` calls are the homepage live feed), and no PNG
+screenshots were captured (the harness only shoots screenshots on nav
+steps) — so verification rests on request-level HAR evidence plus the
+user's direct visual confirmation, not a saved screenshot. The pre-match
+endpoint still has NOT been captured (needs a homepage→pre-match click
+nav). 3-platform stack (Betsson + BetWarrior + Bplay) unaffected.
+
+**Next:**
+1. Commit the `--channel` flag.
+2. Re-run Betano recon with a WIPED profile and a real nav step
+   (homepage → pre-match-today click) to capture the pre-match endpoint.
+   Keep one-session-per-day discipline.
+3. Make profile-wipe-between-sessions the default for re-recon (it is
+   what cleared the block); see updated `recon-bot-protection-cautions`.
+
+**Errors:** (1) Tooling behaved correctly throughout — the harness
+blocked-and-aborted on the dirty run as designed. (2) The prior session
+hit an API 400 ("`thinking` blocks in the latest assistant message
+cannot be modified") mid-LEDGER-edit and was interrupted, leaving the
+wrong "STILL BLOCKED" entry committed to the working tree; this entry
+replaces it. (3) Forensic note: distinguishing the runs required reading
+the HAR user-agents, since `summary.json` does not record the channel —
+consider logging the channel/profile-clean flag into `summary.json`.
+
+---
+
 ## 2026-05-28 — DESIGN DISCUSSION: cross-jurisdiction (PBA × CABA) arbitrage — feasibility + recommended two-operator architecture
 
 **Status: discussion only. Nothing implemented. No decision made.**
