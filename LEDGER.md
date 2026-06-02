@@ -1,5 +1,156 @@
 # Project Ledger
 
+## 2026-06-01 — Logged-in recon COMPLETE (4/4): BetWarrior has no pre-bet max
+
+**BetWarrior (Kambi) exposes NO pre-fetchable max stake** — confirmed at the
+API level, matching the operator's observation (no max button, no cap
+warning) on Canada vs Uzbekistan. Evidence (artifacts
+`recon/artifacts/betwarrior/20260601-230058/`, HAR sanitized):
+- The bet-slip server call `POST cf-al-auth-api.kambicdn.com/player/api/
+  v2019/bwargbap/coupon/validate.json` returns only
+  `{"status":"SUCCESS","validSession":true}` — no stake/limit fields.
+- `punter/session.json` has no limit/balance/max fields either.
+- The `maxStake` strings in the HAR are UI labels/translations
+  ("Apuesta Max"), not values.
+So Kambi enforces any cap **server-side at placement only** (a `placebet`
+call the operator didn't make — which would actually place a bet). For the
+risk layer: no exposed cap → use a conservative policy default; effectively
+non-binding at our sizes. (Login-first worked again: no creds in the HAR.)
+
+**Logged-in stake-limit summary (all 4 platforms):**
+- **Betsson:** flat account cap — maxStake 20,000,000 / payout cap
+  100,000,000 / min 20 (user-context). Effective = min(20M, 100M/odds).
+- **Betano:** DYNAMIC per-bet — `POST /api/betslipcombo/limits` →
+  {min,max} (test: 58,103.85 / 11,857,928.57). Query per bet.
+- **Bplay:** payout-cap model — `max_winning` 999,999,999 → max = cap/odds;
+  the "9,999,999" is the web input field's 7-digit limit, not the API cap.
+- **BetWarrior:** none exposed pre-placement (Kambi).
+The `src/risk/` policy layer needs per-platform handling (flat vs dynamic
+vs payout-cap vs none), not one constant.
+
+---
+
+## 2026-06-01 — Logged-in recon: Bplay limits + the `--login` session-persistence fix
+
+**Max bet (Bplay):** the bet-slip (`POST ws-deportespba.bplay.bet.ar/
+bettingslip/update`, SportNCO) exposes **no explicit max-stake field** —
+only **`max_winning` = 999,999,999** (payout cap). Entered stakes 2 →
+9,999,999 were ALL accepted with no limit message, so the cap wasn't hit.
+**Effective max stake = max_winning / odds** (this 1X2: Colombia @ 1.09 →
+≈ 917M). To capture the exact site-shown "Apuesta Máxima", re-capture
+clicking the max button (`icon_maxbet.svg`). Artifacts:
+`recon/artifacts/bplay/20260601-211813/` (HAR sanitized).
+
+**Root cause — why `--login` didn't persist for Bplay (now fixed):** Bplay's
+auth cookies (`JSESSIONID`, `playerSession`, `playerId`, `sessionId`, …) are
+all **SESSION-ONLY** (no Expires/Max-Age). Browsers don't write session-only
+cookies to disk, so `launch_persistent_context` drops them on close → the
+next run is logged out (hence the operator had to log in again during
+`--interactive`, leaking creds into that HAR). Betsson/Betano carried fine
+because their auth rides persistent cookies / localStorage.
+
+**Fix (`recon.py`):** `--login` now saves the FULL session via Playwright
+`storage_state` (captures session-only cookies + origins) to the gitignored
+`recon/profile/<platform>-session.json`; normal/`--interactive` runs
+re-inject it with `context.add_cookies(...)`. So the proper flow —
+`--login` once, then `--interactive` on the restored session — keeps the
+login POST out of the HAR. (localStorage not yet restored; Bplay auth is
+cookie-based so cookies suffice. Needs a user re-run to validate live.)
+
+**State:** 3/4 logged-in limit captures done (Betsson 20M flat, Betano
+dynamic ~11.86M, Bplay payout-cap 999,999,999/odds). Remaining: BetWarrior.
+
+**Update (re-run with the session fix — VALIDATED + corrected finding):**
+- The `storage_state` fix WORKS: `--login` then `--interactive` opened
+  already-logged-in, and the `--interactive` HAR has **no login POST**
+  (creds stay out). Session-persistence fix confirmed live.
+  Artifacts: `recon/artifacts/bplay/20260601-213146/` (HAR sanitized).
+- **Correction on Bplay's max bet:** the "9,999,999" cap the operator hit
+  is the **web stake-input field limit (7 digits)**, NOT the betting cap.
+  Proof: Colombia (odd 1.09) and Costa Rica (odd 19) BOTH capped at the
+  same 9,999,999 despite 17× odds difference — a payout-derived cap would
+  diverge. The API accepted 9,999,999 for both (`accept=true`, no msg);
+  Costa Rica's payout was 200,899,979.91, far under `max_winning`
+  999,999,999 → the API had headroom for more. So the true API ceiling is
+  the payout cap (max_winning/odds); 9,999,999 is a UI artifact. For the
+  API-driven bot, treat Bplay's stake limit as effectively non-binding
+  (payout-cap ~1B), not 9,999,999. (Confirming the API accepts >9,999,999
+  would need a direct-API probe bypassing the web input — deferred; not
+  needed given our small stakes.)
+
+---
+
+## 2026-06-01 — Logged-in recon: Betano stake limits captured + validated (DYNAMIC, per-bet)
+
+**Finding — Betano stake limits are PER-BET/DYNAMIC**, unlike Betsson's flat
+account cap. Source: authenticated `POST /api/betslipcombo/limits` →
+`{"data":{"min":58103.85,"max":11857928.57}}` for the test 1X2 (Colombia
+win, odds ≈ 1.14). **max = 11,857,928.57 matches the website's stated max
+EXACTLY** → validated. The bet-slip flow (`/api/betslip/v3/updatebets`,
+`/api/betslip/v3/getbetslip`) showed the bet at amount 11,857,928.57 /
+returns 13,518,038.57. Artifacts: `recon/artifacts/betano/20260601-210025/`.
+
+**Risk-layer implication:** Betano's max/min vary per selection (the limit
+is computed server-side from odds/payout caps), so the risk/execution layer
+must **query `/api/betslipcombo/limits` per bet** rather than use a static
+constant. Contrast Betsson (flat 20M account cap from user-context). Both
+patterns now known; the policy layer needs per-platform handling.
+
+**Process note + credential hygiene:** the two commands were run in REVERSE
+order (interactive capture before `--login`), so the operator logged in
+DURING the HAR-recording `--interactive` run — putting the
+`POST /myaccount/login` credentials AND session cookies into the HAR. The
+capture is still fully useful (login was active → authenticated bet-slip
+data captured), but I **sanitized the HAR**: redacted the login body + 698
+Cookie/Set-Cookie/Authorization headers, cleared cookie arrays; odds/limit
+data preserved. **Going forward: run `--login` FIRST**, then `--interactive`
+on the already-authenticated profile — that's the whole point of keeping
+them separate (the login POST never touches a HAR).
+
+**State:** Betsson + Betano logged-in limits captured + validated. Remaining:
+BetWarrior, Bplay.
+
+---
+
+## 2026-06-01 — Logged-in recon: Betsson stake limits captured + validated
+
+**Context:** First logged-in recon. Added `recon.py --interactive` (hold +
+capture while the operator adds a selection to the bet slip by hand) and
+captured Betsson's authenticated bet-slip/account limits — the `max_stake`
+the public feeds omit.
+
+**Finding — Betsson stake-limit contract** (from authenticated GETs
+`/sb/fe-api/v1/user-context` and `/sb/fe-api/v2/configuration`; artifacts
+`recon/artifacts/betsson/20260601-204830/`):
+- `maximumStake` = **20,000,000 ARS** — matches the website's stated max for
+  the test 1X2 (Colombia vs Costa Rica) **exactly** → capture validated.
+- `minimumStake` = 20, `stakeIncrement` = 0.2, `maximumTotalStake` =
+  20,000,000, `minimumRemainingStake` = 20, **`maximumPayout` = 100,000,000**,
+  `currencyCode` = ARS.
+
+**Key insights:**
+- Limits are **account/platform-level** (user-context/configuration), NOT
+  per-market — so ONE logged-in capture per platform suffices (no
+  per-match capture). For this 1X2 the site's 20M matched the global, i.e.
+  no per-market override here.
+- **The payout cap binds the effective stake at high odds:** effective
+  max stake = min(`maximumStake`, `maximumPayout` / decimal_odds) =
+  min(20M, 100M/odds). At odds > 5 the 100M payout cap is the tighter
+  constraint. The risk layer should apply both.
+- 20M ARS per bet is far above our exposure caps, so Betsson's stake cap
+  is effectively non-binding for our sizes — but the payout/odds
+  interaction still matters for long-odds legs.
+- The live bet-slip itself is a Diffusion topic (`/api/sb/v2/topics/betslip`);
+  limits, though, come from the HTTP user-context — no WS decode needed.
+
+**State:** Betsson logged-in limits DONE (feeds the `src/risk/` policy
+default for betsson-pba: max_stake 20M, min 20, increment 0.2, payout cap
+100M, ARS). `recon.py --interactive` added (branch `recon/logged-in-capture`).
+**Next:** same `--login` + `--interactive` capture for Betano, BetWarrior,
+Bplay to get their limits.
+
+---
+
 ## 2026-06-01 — Credentials / login infra (manual-login profile + OS keychain)
 
 **Context:** Stand up secure handling of sportsbook logins for logged-in
