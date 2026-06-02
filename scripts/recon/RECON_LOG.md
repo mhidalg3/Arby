@@ -9,6 +9,29 @@ the raw artifacts for detail.
 
 ---
 
+### 2026-06-02 — ALL platforms — bet PLACEMENT contracts (real placements captured)
+
+One tiny real bet placed per platform (login-first `--interactive`; HARs
+sanitized). All four place over **HTTP** (Betsson's Diffusion WS is odds-only).
+Confirmation parsers built + tested in `src/execution/placers.py`.
+
+| Platform | Place endpoint | Request shape (key fields) | Confirmation (success markers) | State needed |
+|---|---|---|---|---|
+| **betano** | `POST /api/betslip/v3/place` | `{betslip:{hash, slipData, legs:[{eventId, tag, …, amount}]}}` | `data.accepted==true`, `data.receipts[0].{betId,totalAmount,totalOdds}` | **hash** from prior `getbetslip`/`updatebets` (slip must be built) |
+| **bplay** | `POST ws-deportespba.bplay.bet.ar/bettingslip` | `{context:{…}, data:{data:{betslip:{stake:{<outcomeId>:n}, accept:true}}, csrf_token}}` | `return=="OK"` + `message.type=="success"` ("Apuesta colocada"); `player.balance` updated | **csrf_token** + slip built (togglebet/update) |
+| **betwarrior** | `POST .../coupon.json` (Kambi) | `{couponRows:[{index,odds(×100),outcomeId,type:"SIMPLE"}], bets:[{couponRowIndexes,stake(×1000)}], requestId:<uuid>, channel:"WEB"}` | `status=="SUCCESS"`, `couponRef`, `coupon.bets[0].betRef` | **Authorization Bearer** (Kambi session); ~stateless POST |
+| **betsson** | `POST /api/sb/v2/coupons` (OBG) | `{bets:[{stake, oddsFormat:1, currencyCode:"ARS", betSelections:[{marketSelectionId, odds}]}], acceptOddsChanges:true}` | `couponStatus.couponStatusPollingResult=="Success"` + empty `couponPlacementErrors`, `couponId` | OBG headers (brandid/marketcode/x-sb-*) + session; ~stateless POST |
+
+**Notes:** Betsson + BetWarrior are ~stateless single POSTs (post the selection
+refs + stake directly). Betano + Bplay are stateful — the place request carries
+a `hash`/`csrf_token` from a prior slip-build call, so their LegPlacer must run
+the slip sequence first. Units differ: Kambi odds ×100 / stake ×1000; Betano +
+Betsson use decimal odds + ARS stake (the parsers normalise). Artifacts:
+`recon/artifacts/{betano/20260602-211506, bplay/20260602-210151,
+betwarrior/20260602-210806, betsson/20260602-213017}/`.
+
+---
+
 ### 2026-05-30 — betsson — Diffusion live feed DECODED (zlib + CBOR; 1X2 odds extracted)
 
 **Goal:** decode the Betsson live WebSocket frames captured on 2026-05-29
