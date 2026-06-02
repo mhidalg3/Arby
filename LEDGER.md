@@ -1,5 +1,38 @@
 # Project Ledger
 
+## 2026-06-02 — All four LegPlacers built (stateless + stateful slip sequences)
+
+**Context:** Completed the build+send half of the LegPlacer for all four
+platforms ahead of the Phase-1 trial. PR #7 covered Betsson/BetWarrior
+(stateless single POSTs) + the in-session transport; this adds the stateful two.
+
+**Decisions:**
+- **Betano** — stateful, fully reconstructable from the capture, no token
+  mystery (cookie auth): `plain-leg` (add selection → slip w/ hash) → `updatebets`
+  PATCH (set stake → **refreshed hash**) → `place` with that hash. The slip is
+  rebuilt from each response (`betano_slip_from_response`) before the next call;
+  `match_id`→eventId, `platform_outcome_id`→selectionId.
+- **Bplay** — stateful: `togglebet` → `place`, threading the rotated
+  `header.csrf_token` every SportNCO response returns. The first (bootstrap)
+  csrf lives in page JS state, NOT in the slip flow → injected via a
+  `bootstrap_csrf` async seam (reads it off the live page; the one piece
+  confirmed in the trial). Place is keyed to the match `event_url_key`.
+- **Betsson geolocation** — observed Betsson is the only platform that prompts
+  for browser geolocation (region/jurisdiction validation). `InSessionTransport`
+  now grants `geolocation` permission + pins a Buenos Aires coordinate on context
+  launch, so the session reads as in-jurisdiction instead of hanging on a prompt.
+
+**Errors/bugs fixed:** Bplay per-outcome `stake` map is **thousandths of ARS**
+(capture: total `"1.00"` ↔ map `1000`); the earlier builder put raw pesos — a
+1000× under-stake. Fixed + flagged as a MUST-verify-before-arming item.
+
+**State:** All four placers + transport are built, ruff/mypy clean, 549 tests
+pass (build→send→parse wiring tested via fake/sequence transports). Unvalidated
+live: the real in-session send, the Bplay bootstrap-csrf JS expression, whether
+Betano tolerates the trimmed slip subset / needs updatebets, and the Bplay
+stake unit. **Next:** Phase-1 real-money trial — one tiny bet through the
+executor with an armed transport, on explicit operator go.
+
 ## 2026-06-02 — DECISION: execution is deterministic (in-session API), NOT an LLM agent
 
 **Context:** Moving to Layer 4 (bet execution). Re-evaluated the documented

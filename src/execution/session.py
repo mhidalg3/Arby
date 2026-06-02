@@ -96,6 +96,11 @@ class InSessionTransport:
             channel=self._channel,
             locale="es-AR",
             timezone_id="America/Argentina/Buenos_Aires",
+            # Betsson (and possibly others) validate region via the browser
+            # geolocation prompt. Grant it + pin a Buenos Aires coordinate so the
+            # session reads as in-jurisdiction rather than hanging on a prompt.
+            permissions=["geolocation"],
+            geolocation={"latitude": -34.6037, "longitude": -58.3816},
         )
         await apply_stealth(self._context)
         await _restore_session(self._context, self._platform)
@@ -116,6 +121,14 @@ class InSessionTransport:
             self._log.info("transport.dry_run_goto", url=url)
             return
         await self._page.goto(url, wait_until="domcontentloaded", timeout=45000)
+
+    async def eval_js(self, expression: str) -> Any:
+        """Read a value out of the live page (e.g. Bplay's bootstrap CSRF from
+        the app's JS state). Dry-run returns None — no page is open."""
+        if self._dry_run:
+            self._log.info("transport.dry_run_eval")
+            return None
+        return await self._page.evaluate(expression)
 
     async def fetch(
         self,

@@ -74,19 +74,38 @@ def build_betwarrior_request(
     }
 
 
+def _bplay_context(url_key: str) -> dict[str, Any]:
+    return {
+        "url_key": url_key,
+        "version": "1.0.1",
+        "device": "web_vuejs_desktop",
+        "lang": "ag",
+        "timezone": "America/Buenos_Aires",
+        "url_params": {},
+    }
+
+
+def build_bplay_togglebet(outcome_id: int, csrf_token: str) -> dict[str, Any]:
+    """Bplay `/bettingslip/togglebet` — adds the selection to the server-side
+    slip. `csrf_token` is the current (bootstrap) token; the response returns a
+    fresh one under ``header.csrf_token`` for the next call."""
+    return {"context": _bplay_context("/"), "data": {"id": outcome_id, "csrf_token": csrf_token}}
+
+
+def bplay_csrf_from_response(resp: dict[str, Any]) -> str:
+    """The rotated CSRF a slip response hands forward (``header.csrf_token``)."""
+    return str(_d(resp.get("header")).get("csrf_token", "") or "")
+
+
 def build_bplay_request(
     *, url_key: str, outcome_id: int, stake_ars: float, csrf_token: str, date_ms: int
 ) -> dict[str, Any]:
-    """Bplay SportNCO `/bettingslip`. `csrf_token` comes from a prior slip call."""
+    """Bplay SportNCO `/bettingslip` (place). `csrf_token` is the latest rotated
+    token (from the togglebet response). The per-outcome ``stake`` map is in
+    thousandths of ARS (capture: total ``"1.00"`` ↔ map ``1000``); ``date_ms`` is
+    the current epoch-ms."""
     return {
-        "context": {
-            "url_key": url_key,
-            "version": "1.0.1",
-            "device": "web_vuejs_desktop",
-            "lang": "ag",
-            "timezone": "America/Buenos_Aires",
-            "url_params": {},
-        },
+        "context": _bplay_context(url_key),
         "data": {
             "data": {
                 "date": date_ms,
@@ -96,7 +115,7 @@ def build_bplay_request(
                     "formule": "single",
                     "combiboost_id": None,
                     "accept": True,
-                    "stake": {str(outcome_id): stake_ars},
+                    "stake": {str(outcome_id): round(stake_ars * 1000)},
                 },
             },
             "csrf_token": csrf_token,
@@ -104,17 +123,61 @@ def build_bplay_request(
     }
 
 
-def build_betano_request(slip_state: dict[str, Any], stake_ars: float) -> dict[str, Any]:
-    """Betano `/api/betslip/v3/place`. `slip_state` is the betslip object from a
-    prior `getbetslip` (carries hash/slipData/legs/betslipTrackId); this fills
-    the stake into each bet and returns the place body."""
-    betslip = copy.deepcopy(slip_state)
+def build_betano_plain_leg(selection_id: str, event_id: str) -> dict[str, Any]:
+    """Betano `/api/betslip/v3/plain-leg/` (first slip-build call): adds a
+    selection to an empty slip. The response ``data`` carries the
+    hash/slipData/legs/bets/betslipTrackId the next calls thread forward."""
+    return {
+        "selectionIds": [selection_id],
+        "betslip": {
+            "hash": "",
+            "slipData": "",
+            "legs": [],
+            "bets": [],
+            "betslipTabId": 1,
+            "betslipTrackId": "",
+        },
+        "eventId": event_id,
+        "triggerPoint": {"origin": 6, "parentOrigin": 1},
+    }
+
+
+def betano_slip_from_response(data: dict[str, Any]) -> dict[str, Any]:
+    """Pick the betslip subset the next call needs out of a plain-leg/updatebets
+    ``data`` envelope (drops echo-only fields like errors/taxDetails)."""
+    return {
+        "hash": data.get("hash", ""),
+        "slipData": data.get("slipData", ""),
+        "legs": data.get("legs", []),
+        "bets": data.get("bets", []),
+        "betslipTabId": data.get("betSlipTabId", 1),
+        "betslipTrackId": data.get("betslipTrackId", ""),
+    }
+
+
+def _betano_fill(slip: dict[str, Any], stake_ars: float) -> dict[str, Any]:
+    """Fill the stake (amount + returns) into each bet of a betslip subset."""
+    betslip = copy.deepcopy(slip)
     for bet in betslip.get("bets", []):
         if not isinstance(bet, dict):
             continue
         odds = bet.get("odds") or 0
         bet["amount"] = stake_ars
         bet["returns"] = round(stake_ars * float(odds), 2) if odds else 0
+    return betslip
+
+
+def build_betano_updatebets(slip: dict[str, Any], stake_ars: float) -> dict[str, Any]:
+    """Betano `PATCH /api/betslip/v3/updatebets` — sets the stake; the response
+    returns the refreshed ``hash`` the place call must use."""
+    return {"betslip": _betano_fill(slip, stake_ars)}
+
+
+def build_betano_request(slip_state: dict[str, Any], stake_ars: float) -> dict[str, Any]:
+    """Betano `/api/betslip/v3/place`. `slip_state` is the betslip subset from
+    the *updatebets* response (carries the refreshed hash/slipData/legs/bets/
+    betslipTrackId); this fills the stake into each bet and returns the place body."""
+    betslip = _betano_fill(slip_state, stake_ars)
     betslip["oddschanges"] = "0"
     return {"betslip": betslip}
 

@@ -171,7 +171,7 @@ def test_build_bplay_stake_keyed_by_outcome() -> None:
         date_ms=1780434223302,
     )
     bs = req["data"]["data"]["betslip"]
-    assert bs["stake"] == {"6621121460": 1.0}
+    assert bs["stake"] == {"6621121460": 1000}  # thousandths of ARS (capture: 1.00 ↔ 1000)
     assert bs["nb_bettingslip_totalStake"] == "1.00" and bs["accept"] is True
     assert req["data"]["csrf_token"] == "CSRF"
     assert req["context"]["url_key"] == "/eventos/123-a-b"

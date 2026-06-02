@@ -10,7 +10,12 @@ from __future__ import annotations
 from typing import Any
 
 from src.execution.executor import Leg
-from src.execution.leg_placer import BetssonLegPlacer, BetWarriorLegPlacer
+from src.execution.leg_placer import (
+    BetanoLegPlacer,
+    BetssonLegPlacer,
+    BetWarriorLegPlacer,
+    BplayLegPlacer,
+)
 
 
 class FakeTransport:
@@ -26,10 +31,35 @@ class FakeTransport:
         return self.status, self.body
 
 
+class SeqTransport:
+    """Returns a queued (status, body) per call — for the multi-step stateful flows."""
+
+    def __init__(self, responses: list[tuple[int, dict[str, Any]]]) -> None:
+        self._responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    async def fetch(self, method, url, *, json_body=None, headers=None):  # type: ignore[no-untyped-def]
+        self.calls.append({"method": method, "url": url, "json": json_body, "headers": headers})
+        return self._responses[len(self.calls) - 1]
+
+
 def _leg(platform: str, outcome_id: str, stake: float, odds: float) -> Leg:
     return Leg(
         platform=platform,
         match_id="m1",
+        market="1X2",
+        outcome="home",
+        stake_ars=stake,
+        odds=odds,
+        platform_outcome_id=outcome_id,
+    )
+
+
+def _leg_betano(outcome_id: str, event_id: str, stake: float, odds: float) -> Leg:
+    """Betano maps match_id -> eventId, so set it explicitly."""
+    return Leg(
+        platform="betano-pba",
+        match_id=event_id,
         market="1X2",
         outcome="home",
         stake_ars=stake,
@@ -78,6 +108,65 @@ async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
     assert call["json"]["couponRows"][0]["outcomeId"] == 4206111729
     assert call["json"]["couponRows"][0]["odds"] == 141  # 1.41 ×100
     assert call["json"]["bets"][0]["stake"] == 500000  # 500.0 ×1000
+
+
+async def test_betano_runs_slip_sequence_and_places_with_refreshed_hash() -> None:
+    plain_leg = {
+        "data": {
+            "hash": "H1",
+            "slipData": "H1",
+            "betslipTrackId": "T",
+            "legs": [{"id": "9698869897"}],
+            "bets": [{"id": "1:SGL:9698869897", "odds": 3.65, "amount": 0}],
+        }
+    }
+    updatebets = {
+        "data": {
+            "hash": "H2",
+            "slipData": "H2",
+            "betslipTrackId": "T",
+            "legs": [{"id": "9698869897"}],
+            "bets": [{"id": "1:SGL:9698869897", "odds": 3.65, "amount": 0}],
+        }
+    }
+    place = {
+        "data": {
+            "accepted": True,
+            "receipts": [{"betId": "B9", "totalAmount": 1000, "totalOdds": 3.65}],
+        }
+    }
+    t = SeqTransport([(200, plain_leg), (200, updatebets), (200, place)])
+    res = await BetanoLegPlacer(t).place(_leg_betano("9698869897", "86489358", 1000.0, 3.65))
+    assert res.accepted and res.ref == "B9" and res.stake_filled == 1000
+    methods = [
+        (c["method"], c["url"].rsplit("/", 1)[-1] or c["url"].rsplit("/", 2)[-2]) for c in t.calls
+    ]
+    assert methods == [("POST", "plain-leg"), ("PATCH", "updatebets"), ("POST", "place")]
+    place_body = t.calls[2]["json"]["betslip"]
+    assert place_body["hash"] == "H2"  # the refreshed hash from updatebets, not plain-leg's H1
+    assert place_body["bets"][0]["amount"] == 1000.0
+    assert place_body["bets"][0]["returns"] == 3650.0
+    assert place_body["oddschanges"] == "0"
+
+
+async def test_bplay_threads_rotated_csrf_and_scales_stake() -> None:
+    togglebet = {"header": {"csrf_token": "C1"}, "body": {}, "footer": {}}
+    place = {"return": "OK", "message": {"type": "success", "message": "Apuesta colocada"}}
+    t = SeqTransport([(200, togglebet), (200, place)])
+
+    async def bootstrap() -> str:
+        return "C0"
+
+    res = await BplayLegPlacer(
+        t, event_url_key="/eventos/10595536-francia-senegal", bootstrap_csrf=bootstrap
+    ).place(_leg("bplay-pba", "6621121460", 1.0, 1.5))
+    assert res.accepted
+    toggle_body = t.calls[0]["json"]
+    assert toggle_body["data"] == {"id": 6621121460, "csrf_token": "C0"}  # bootstrap token
+    place_body = t.calls[1]["json"]
+    assert place_body["data"]["csrf_token"] == "C1"  # rotated forward from togglebet response
+    assert place_body["data"]["data"]["betslip"]["stake"] == {"6621121460": 1000}  # ×1000
+    assert place_body["context"]["url_key"] == "/eventos/10595536-francia-senegal"
 
 
 async def test_http_error_is_not_accepted() -> None:
