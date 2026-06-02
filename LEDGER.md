@@ -18,9 +18,13 @@ on stale odds → naked exposure). Determinism + auditability win for real money
 exposure caps, post-Leg-A odds re-verify, naked-exposure logging) and "execution
 never decides profitability." Add per-platform stake limits from the 2026-06-01
 recon (Betsson flat min(20M,100M/odds); Betano dynamic-query; Bplay payout-cap/
-odds; BetWarrior none). **Cold path = human-in-the-loop via Telegram** (abort +
-alert on session expiry/2FA/novel state); openclaw deferred to cold-path
-re-auth only. **Telegram notifications** are a kept feature regardless.
+odds; BetWarrior none).
+
+**Escalation tiers (pluggable `RecoveryHandler`):** deterministic hot path
+(fixed) → **cold-path recovery** (re-auth/2FA/novel state; human-via-Telegram
+now, swappable to a fully agentic openclaw impl later — recovery only, never the
+hot path) → **frozen-path** last resort (halt + persist + human takeover;
+fail-stopped, never fail-open). **Telegram notifications** kept regardless.
 
 **State:** Layer 4 design rewritten. Build is dry-run-first; prerequisite is
 capturing one real placement (recon stopped at the slip — no place/confirm
