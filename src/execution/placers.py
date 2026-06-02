@@ -21,9 +21,102 @@ BetWarrior); otherwise the caller falls back to the requested values.
 
 from __future__ import annotations
 
+import copy
+import uuid
 from typing import Any
 
 from src.execution.executor import PlacementResult
+
+# ---- request builders ----
+# Pure constructors for each platform's place body. Stateless platforms
+# (Betsson, BetWarrior) build from the selection + stake directly; stateful
+# ones (Betano, Bplay) take slip-state tokens (hash / csrf) the transport
+# obtains from a prior slip-build call. Verified against the captured request
+# bodies (2026-06-02); analytics-only sub-objects (Betsson `updateSources`,
+# BetWarrior `trackingData`) are omitted and validated live in the trial.
+
+
+def build_betsson_request(selections: list[tuple[str, str]], stake_ars: float) -> dict[str, Any]:
+    """Betsson OBG `/api/sb/v2/coupons`. `selections` = [(marketSelectionId,
+    odds_str), …] — one entry for a single 1X2 leg."""
+    return {
+        "bets": [
+            {
+                "stake": stake_ars,
+                "stakeForReview": 0,
+                "taxAmount": 0,
+                "taxAmountForReview": 0,
+                "oddsFormat": 1,
+                "hasInconsistentBetSelectionPriceFormats": False,
+                "currencyCode": "ARS",
+                "betSelections": [
+                    {"marketSelectionId": sid, "odds": odds} for sid, odds in selections
+                ],
+            }
+        ],
+        "acceptOddsChanges": True,
+        "betslipOddChangeBehaviour": "CanAcceptOddChanges",
+    }
+
+
+def build_betwarrior_request(
+    *, outcome_id: int, odds_x100: int, stake_thousandths: int, request_id: str | None = None
+) -> dict[str, Any]:
+    """Kambi `/coupon.json`. Odds are ×100, stake ×1000 (Kambi minor units)."""
+    return {
+        "couponRows": [{"index": 0, "odds": odds_x100, "outcomeId": outcome_id, "type": "SIMPLE"}],
+        "allowOddsChange": "NO",
+        "allowOddsChangeLive": "NO",
+        "allowOddsChangePreMatch": "NO",
+        "bets": [{"couponRowIndexes": [0], "eachWay": False, "stake": stake_thousandths}],
+        "requestId": request_id or str(uuid.uuid4()),
+        "channel": "WEB",
+    }
+
+
+def build_bplay_request(
+    *, url_key: str, outcome_id: int, stake_ars: float, csrf_token: str, date_ms: int
+) -> dict[str, Any]:
+    """Bplay SportNCO `/bettingslip`. `csrf_token` comes from a prior slip call."""
+    return {
+        "context": {
+            "url_key": url_key,
+            "version": "1.0.1",
+            "device": "web_vuejs_desktop",
+            "lang": "ag",
+            "timezone": "America/Buenos_Aires",
+            "url_params": {},
+        },
+        "data": {
+            "data": {
+                "date": date_ms,
+                "betslip": {
+                    "nb_bettingslip_totalStake": f"{stake_ars:.2f}",
+                    "freebet": None,
+                    "formule": "single",
+                    "combiboost_id": None,
+                    "accept": True,
+                    "stake": {str(outcome_id): stake_ars},
+                },
+            },
+            "csrf_token": csrf_token,
+        },
+    }
+
+
+def build_betano_request(slip_state: dict[str, Any], stake_ars: float) -> dict[str, Any]:
+    """Betano `/api/betslip/v3/place`. `slip_state` is the betslip object from a
+    prior `getbetslip` (carries hash/slipData/legs/betslipTrackId); this fills
+    the stake into each bet and returns the place body."""
+    betslip = copy.deepcopy(slip_state)
+    for bet in betslip.get("bets", []):
+        if not isinstance(bet, dict):
+            continue
+        odds = bet.get("odds") or 0
+        bet["amount"] = stake_ars
+        bet["returns"] = round(stake_ars * float(odds), 2) if odds else 0
+    betslip["oddschanges"] = "0"
+    return {"betslip": betslip}
 
 
 def _f(value: Any) -> float:

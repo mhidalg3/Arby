@@ -7,7 +7,13 @@ depends on it being right and fail-closed.
 
 from __future__ import annotations
 
+import uuid
+
 from src.execution.placers import (
+    build_betano_request,
+    build_betsson_request,
+    build_betwarrior_request,
+    build_bplay_request,
     parse_betano,
     parse_betsson,
     parse_betwarrior,
@@ -120,3 +126,71 @@ def test_dispatcher_matches_suffixed_platform() -> None:
 
 def test_dispatcher_unknown_platform_fails_closed() -> None:
     assert not parse_confirmation("mystery", {"anything": True}).accepted
+
+
+# ---- request builders (verified against captured place bodies) ----
+
+
+def test_build_betsson_single_leg() -> None:
+    req = build_betsson_request([("s-m-f-EVT-MW3W-home", "1.41")], 500.0)
+    bet = req["bets"][0]
+    assert bet["stake"] == 500.0 and bet["currencyCode"] == "ARS" and bet["oddsFormat"] == 1
+    assert bet["betSelections"] == [{"marketSelectionId": "s-m-f-EVT-MW3W-home", "odds": "1.41"}]
+    assert req["acceptOddsChanges"] is True
+
+
+def test_build_betwarrior_units_and_generated_request_id() -> None:
+    req = build_betwarrior_request(
+        outcome_id=4206111729, odds_x100=1400, stake_thousandths=1_000_000
+    )
+    assert req["couponRows"][0] == {
+        "index": 0,
+        "odds": 1400,
+        "outcomeId": 4206111729,
+        "type": "SIMPLE",
+    }
+    assert req["bets"][0]["stake"] == 1_000_000 and req["channel"] == "WEB"
+    uuid.UUID(req["requestId"])  # a valid uuid was generated
+
+
+def test_build_betwarrior_explicit_request_id() -> None:
+    assert (
+        build_betwarrior_request(
+            outcome_id=1, odds_x100=200, stake_thousandths=1000, request_id="fixed"
+        )["requestId"]
+        == "fixed"
+    )
+
+
+def test_build_bplay_stake_keyed_by_outcome() -> None:
+    req = build_bplay_request(
+        url_key="/eventos/123-a-b",
+        outcome_id=6621121460,
+        stake_ars=1.0,
+        csrf_token="CSRF",
+        date_ms=1780434223302,
+    )
+    bs = req["data"]["data"]["betslip"]
+    assert bs["stake"] == {"6621121460": 1.0}
+    assert bs["nb_bettingslip_totalStake"] == "1.00" and bs["accept"] is True
+    assert req["data"]["csrf_token"] == "CSRF"
+    assert req["context"]["url_key"] == "/eventos/123-a-b"
+
+
+def test_build_betano_fills_stake_and_returns_preserving_slip_state() -> None:
+    slip = {
+        "hash": "H==.1|#x",
+        "slipData": "H==.1|#x",
+        "betslipTrackId": "track-1",
+        "legs": [{"eventId": "86489358", "tag": "9698869897", "odds": 3.65}],
+        "bets": [
+            {"id": "1:SGL:9698869897", "tag": "9698869897", "odds": 3.65, "amount": 0, "returns": 0}
+        ],
+    }
+    req = build_betano_request(slip, 1000.0)
+    bet = req["betslip"]["bets"][0]
+    assert bet["amount"] == 1000.0 and bet["returns"] == 3650.0
+    assert req["betslip"]["oddschanges"] == "0"
+    assert req["betslip"]["hash"] == "H==.1|#x"  # slip state preserved
+    # input slip not mutated (deep-copied)
+    assert slip["bets"][0]["amount"] == 0
