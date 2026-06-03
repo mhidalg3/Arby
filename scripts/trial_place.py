@@ -179,33 +179,44 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
             "accept-encoding",
         }
 
-        # Wait (up to ~3 min) for the app's OWN user-context call to report logged
-        # in. If not yet, the operator logs in in the window; reload each cycle so
-        # the app re-issues user-context with the current session.
-        if not state.get("logged_in"):
+        # Logged in iff the app's user-context says so OR a ctx- request was seen
+        # (the authenticated context only exists for a logged-in session). Keying
+        # on the captured ctx- is more robust — the user-context call itself can
+        # 502. Reload gently (every ~12s) so the operator can log in without
+        # hammering the backend.
+        def authed() -> bool:
+            return bool(state.get("logged_in")) or "headers" in captured
+
+        if not authed():
             print(
                 "  NOT logged in — complete LOG IN in the browser window (stay on PBA); "
-                "waiting up to 180s…"
+                "waiting up to ~3 min…"
             )
-        for _ in range(18):
-            if state.get("logged_in"):
+        for _ in range(15):
+            if authed():
                 break
-            await asyncio.sleep(10)
+            await asyncio.sleep(12)
             await page.goto(url, wait_until="networkidle", timeout=60000)
-        if not state.get("logged_in"):
+        if not authed():
             print(
                 "\n=== RESULT ===\naccepted=False  detail: not logged in "
                 "(login not completed in the window)"
             )
             return
 
-        # Logged in — the app already uses the authenticated ctx- on navigation;
-        # the last reload's requests carry it. Wait for the captured header set.
+        # Authenticated — ensure the ctx- header set is captured; a quiet reload
+        # nudges the app to emit a ctx- request if we haven't seen one yet.
         print("  logged in ✓ — capturing authenticated context…")
-        for _ in range(25):
+        for _ in range(20):
             if "headers" in captured:
                 break
             await asyncio.sleep(1)
+        if "headers" not in captured:
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            for _ in range(20):
+                if "headers" in captured:
+                    break
+                await asyncio.sleep(1)
         if "headers" not in captured:
             print(
                 "\n=== RESULT ===\naccepted=False  detail: ctx- not resolved despite "
