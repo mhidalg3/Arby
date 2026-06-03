@@ -27,7 +27,6 @@ import asyncio
 import contextlib
 import json
 import sys
-import uuid
 from collections import defaultdict
 from pathlib import Path
 
@@ -245,27 +244,8 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
             }
         )
         print(f"  authenticated context: {headers['x-sb-user-context-id'][:28]}…")
+        # build_betsson_request now includes the validated updateSources.
         body = placers.build_betsson_request([(args.selection, f"{args.odds:.2f}")], args.stake)
-        # `updateSources` pins the coupon to a price/status feed version (its
-        # absence/wrong-shape → E_BETTING_COUPON_GENERAL). Structure matches the
-        # captured working coupon EXACTLY: odds{selections,latestRt:"rt:<uuid>"} +
-        # statuses{selections,markets:"api:<uuid>"}. The uuids are the live feed
-        # versions; here we send fabricated ones — a decisive test of whether
-        # acceptOddsChanges:true makes the server tolerate any token (→ trivial
-        # determinism) or whether it validates the real rtf-feed value.
-        market_id = args.selection[2:].rsplit("-", 1)[0]
-        rt_tag = f"rt: {uuid.uuid4()}"
-        api_tag = f"api: {uuid.uuid4()}"
-        body["updateSources"] = {
-            "odds": {
-                "selections": {args.selection: rt_tag},
-                "latestRt": {args.selection: rt_tag},
-            },
-            "statuses": {
-                "selections": {args.selection: api_tag},
-                "markets": {market_id: api_tag},
-            },
-        }
         raw = await page.evaluate(
             """async ({url, body, headers}) => {
                 const r = await fetch(url, {method:'POST', headers,

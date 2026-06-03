@@ -38,7 +38,26 @@ from src.execution.executor import PlacementResult
 
 def build_betsson_request(selections: list[tuple[str, str]], stake_ars: float) -> dict[str, Any]:
     """Betsson OBG `/api/sb/v2/coupons`. `selections` = [(marketSelectionId,
-    odds_str), …] — one entry for a single 1X2 leg."""
+    odds_str), …] — one entry for a single 1X2 leg.
+
+    `updateSources` pins the coupon to a price/status feed version; its absence
+    (or wrong shape) → `E_BETTING_COUPON_GENERAL`. Validated live 2026-06-03:
+    with `acceptOddsChanges: true` the server accepts FABRICATED `rt:`/`api:`
+    uuids as long as the structure matches, so we generate them (no need to lift
+    the real values off the rtf feed). The market id is the selection id minus
+    the `s-` prefix and the outcome suffix; one `api:` uuid is shared across the
+    batch, one `rt:` uuid per selection."""
+    odds_selections: dict[str, str] = {}
+    latest_rt: dict[str, str] = {}
+    status_selections: dict[str, str] = {}
+    status_markets: dict[str, str] = {}
+    api_tag = f"api: {uuid.uuid4()}"
+    for sid, _odds in selections:
+        rt_tag = f"rt: {uuid.uuid4()}"
+        odds_selections[sid] = rt_tag
+        latest_rt[sid] = rt_tag
+        status_selections[sid] = api_tag
+        status_markets[sid[2:].rsplit("-", 1)[0]] = api_tag
     return {
         "bets": [
             {
@@ -55,6 +74,10 @@ def build_betsson_request(selections: list[tuple[str, str]], stake_ars: float) -
             }
         ],
         "acceptOddsChanges": True,
+        "updateSources": {
+            "odds": {"selections": odds_selections, "latestRt": latest_rt},
+            "statuses": {"selections": status_selections, "markets": status_markets},
+        },
         "betslipOddChangeBehaviour": "CanAcceptOddChanges",
     }
 

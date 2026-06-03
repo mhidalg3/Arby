@@ -1,5 +1,31 @@
 # Project Ledger
 
+## 2026-06-03 — MILESTONE: first fully-autonomous deterministic bet placed (Betsson)
+
+**Context:** Our OWN deterministic placer built + sent the coupon (not the app UI)
+and it placed: `HTTP 200, accepted=True, couponId 179366484738617344, Success, no
+errors` — 50 ARS on Los Andes draw. The Betsson deterministic path is DONE.
+
+**Decisive finding:** the fabricated `rt:`/`api:` uuids in `updateSources` were
+ACCEPTED. So with `acceptOddsChanges: true` + `"CanAcceptOddChanges"`, the server
+only needs the correct `updateSources` *structure*, not the real feed-version
+values — **no need to decode the `rtf.bpsgameserver.com` real-time feed.** Best case.
+
+**What made it work (both fixes in `_arm_betsson`, now also in the shared builder):**
+- After a settled login + ENTER, `page.reload()` up to 3× until a `ctx-` request
+  appears (betting context lags login; refresh syncs it).
+- `build_betsson_request` now emits the validated `updateSources`
+  (`odds{selections,latestRt:"rt:<uuid>"}` + `statuses{selections,markets:"api:<uuid>"}`,
+  generated uuids). 551 tests green, mypy/ruff clean.
+
+**State:** Betsson placement proven deterministic + autonomous; the recipe is in the
+trial runner and the shared request builder is correct. NOT yet refactored into the
+production `BetssonLegPlacer`/`InSessionTransport` (they don't yet do the ctx-
+capture + refresh-sync the trial script does) — that's the remaining productionization
+so the `Executor` can drive Betsson. Two real open bets exist (20 ARS Italy UI,
+50 ARS Los Andes deterministic). See [[betsson-auth-session-model]]. **Next options:**
+productionize Betsson into the LegPlacer, or pivot to Betano for a 2nd platform.
+
 ## 2026-06-03 — MILESTONE: first real bet placed (Betsson, 20 ARS) + the last two unknowns
 
 **Context:** After many armed attempts, placed the first real money bet on
