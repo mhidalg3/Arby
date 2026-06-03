@@ -31,7 +31,6 @@ from src.execution.session import Transport, TransportError
 
 log = structlog.get_logger(__name__)
 
-_BETSSON_EVENT_URL = "https://pba.betsson.bet.ar/apuestas-deportivas/{slug}"
 _BETSSON_PLACE_URL = "https://pba.betsson.bet.ar/api/sb/v2/coupons"
 _BETWARRIOR_PLACE_URL = "https://cf-al-auth-api.kambicdn.com/player/api/v2019/bwargbap/coupon.json"
 _BETANO_BASE = "https://www.betano.bet.ar/api/betslip/v3"
@@ -40,9 +39,9 @@ _BPLAY_BASE = "https://ws-deportespba.bplay.bet.ar"
 
 class BetssonTransport(Protocol):
     """What BetssonLegPlacer needs: the generic fetch + the authenticated-context
-    bootstrap (`InSessionTransport.prepare_betsson_context`)."""
+    read (`InSessionTransport.prepare_betsson_context`)."""
 
-    async def prepare_betsson_context(self, event_url: str) -> dict[str, str] | None: ...
+    async def prepare_betsson_context(self) -> dict[str, str] | None: ...
     async def fetch(
         self,
         method: str,
@@ -57,11 +56,12 @@ class BetssonLegPlacer:
     """Betsson OBG — POST to ``/api/sb/v2/coupons``.
 
     Placement needs the *authenticated* session context (sessiontoken + the
-    ``ctx-`` user-context + x-sb-* headers) which the app only exposes for a
-    logged-in session and only after a post-login refresh. So we don't
-    reconstruct headers: the transport navigates the event page, refresh-syncs,
-    and hands back the live authenticated header set; we add the coupon-submit
-    headers and POST. `leg.platform_event_ref` is the event-page slug.
+    ``ctx-`` user-context + x-sb-* headers). That context lives in the SPA's
+    in-memory state and is established by client-side in-app navigation after
+    login (a hard reload destroys it), so the transport does NOT navigate — the
+    live session must already be in the placeable state (operator-driven for now,
+    automated in-app nav later). We read the live header set the app is using,
+    add the coupon-submit headers, and POST the `updateSources`-carrying body.
     """
 
     platform = "betsson-pba"
@@ -71,17 +71,15 @@ class BetssonLegPlacer:
         self._log = log.bind(component="leg_placer", platform=self.platform)
 
     async def place(self, leg: Leg) -> PlacementResult:
-        if not leg.platform_event_ref:
-            return PlacementResult(accepted=False, detail="betsson: missing event slug")
-        event_url = _BETSSON_EVENT_URL.format(slug=leg.platform_event_ref)
         try:
-            ctx_headers = await self._t.prepare_betsson_context(event_url)
+            ctx_headers = await self._t.prepare_betsson_context()
         except TransportError as exc:
             self._log.warning("leg_placer.transport_error", error=str(exc))
             return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
         if not ctx_headers:
             return PlacementResult(
-                accepted=False, detail="betsson: authenticated context not resolved (re-login?)"
+                accepted=False,
+                detail="betsson: authenticated context not resolved (login + in-app nav?)",
             )
         headers = {
             **ctx_headers,

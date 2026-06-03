@@ -35,10 +35,10 @@ class FakeTransport:
         self.body = body or {}
         self.ctx_headers = ctx_headers
         self.calls: list[dict[str, Any]] = []
-        self.prepared: list[str] = []
+        self.prepared = 0
 
-    async def prepare_betsson_context(self, event_url: str) -> dict[str, str] | None:
-        self.prepared.append(event_url)
+    async def prepare_betsson_context(self) -> dict[str, str] | None:
+        self.prepared += 1
         return self.ctx_headers
 
     async def fetch(self, method, url, *, json_body=None, headers=None):  # type: ignore[no-untyped-def]
@@ -99,7 +99,7 @@ async def test_betsson_placer_builds_request_and_parses_success() -> None:
     )
     res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-home", 500.0, 1.41))
     assert res.accepted and res.ref == "C1"
-    assert t.prepared and t.prepared[0].endswith("futbol/x-vs-y")  # navigated the event page
+    assert t.prepared == 1  # resolved the authenticated context (no navigation/reload)
     call = t.calls[0]
     assert call["url"].endswith("/api/sb/v2/coupons")
     # the live authenticated context headers are replayed onto the place call
@@ -121,13 +121,6 @@ async def test_betsson_fails_closed_when_context_not_resolved() -> None:
     res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-x", 50.0, 2.62))
     assert not res.accepted and "context not resolved" in res.detail
     assert not t.calls  # never POSTed
-
-
-async def test_betsson_fails_closed_without_event_slug() -> None:
-    res = await BetssonLegPlacer(FakeTransport()).place(
-        _leg("betsson-pba", "s-x", 50.0, 2.62, event_ref="")
-    )
-    assert not res.accepted and "event slug" in res.detail
 
 
 async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
@@ -228,7 +221,7 @@ async def test_rejection_confirmation_is_not_accepted() -> None:
 
 async def test_transport_error_returns_not_accepted_not_raise() -> None:
     class BoomTransport:
-        async def prepare_betsson_context(self, event_url: str) -> dict[str, str] | None:
+        async def prepare_betsson_context(self) -> dict[str, str] | None:
             return _FAKE_CTX
 
         async def fetch(self, *a: Any, **k: Any) -> tuple[int, dict[str, Any]]:

@@ -365,8 +365,11 @@ async def _revalidate_betsson(args: argparse.Namespace) -> None:
         await loop.run_in_executor(
             None,
             input,
-            "\n  ▶ LOG IN in the window (stay on PBA). When logged in, press ENTER — the "
-            "production placer will then navigate, refresh-sync ctx-, and place… ",
+            "\n  ▶ In the window: LOG IN (stay on PBA), then drive the SPA into the placeable "
+            "state — click your profile/balance → My Account (this in-app nav establishes the "
+            "betting context). Do NOT refresh (a reload destroys it). When the betslip would let "
+            "you place (green button), press ENTER — the production placer reads the live ctx- "
+            "and posts (no navigation/reload)… ",
         )
         res = await BetssonLegPlacer(transport).place(leg)
     print(

@@ -154,29 +154,27 @@ class InSessionTransport:
             return None
         return await self._page.evaluate(expression)
 
-    async def prepare_betsson_context(self, event_url: str) -> dict[str, str] | None:
-        """Navigate to the event page and refresh until the app issues an
-        authenticated (``ctx-``) request; return that request's header set
-        (sessiontoken + ctx- + x-sb-* context), cleaned for replay.
+    async def prepare_betsson_context(self, timeout_s: int = 30) -> dict[str, str] | None:
+        """Return the live authenticated header set (sessiontoken + ``ctx-`` +
+        x-sb-* context) the app is currently using, captured passively.
 
-        Returns ``None`` if the authenticated context never resolves — i.e. the
-        session isn't logged in. The betting context lags login (the app shows
-        logged-in before the betslip layer syncs), so we refresh up to 3×; this
-        is the operational replacement for the trial's manual ENTER + refresh."""
+        CRITICAL: we do NOT navigate or reload here. Betsson's betting context
+        lives in the SPA's in-memory state and is established by *client-side*
+        in-app navigation after login (e.g. visiting My Account → routes to the
+        sportsbook home). A hard load/reload cold-boots the SPA and DESTROYS that
+        context ("login before placing"), so reloading is exactly wrong. The
+        caller must drive the SPA into the placeable state first (operator click
+        now; automated in-app nav later); we just read the ctx- the app emits.
+
+        Returns ``None`` if no ctx- appears within ``timeout_s`` (context not
+        established → not logged in / not navigated)."""
         if self._dry_run:
-            self._log.info("transport.dry_run_prepare", url=event_url)
+            self._log.info("transport.dry_run_prepare")
             return None
-        self._captured_ctx = None
-        await self._page.goto(event_url, wait_until="networkidle", timeout=60000)
-        for attempt in range(3):
-            for _ in range(10):
-                if self._captured_ctx is not None:
-                    break
-                await asyncio.sleep(1)
+        for _ in range(timeout_s):
             if self._captured_ctx is not None:
                 break
-            self._log.info("transport.betsson_ctx_unsynced", attempt=attempt + 1)
-            await self._page.reload(wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(1)
         if self._captured_ctx is None:
             return None
         return {k: v for k, v in self._captured_ctx.items() if k not in _HEADER_DROP}

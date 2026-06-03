@@ -1,5 +1,26 @@
 # Project Ledger
 
+## 2026-06-03 — Betsson betting-context model corrected: in-app nav establishes it, reload destroys it
+
+**Context:** The production re-validate (`--via-placer`) failed with "ctx- not
+resolved" where the trial had worked. New operator observation reconciled it: after
+login the betslip says "login before placing"; a **refresh does NOT fix it** (it
+persists); navigating **in-app to My Account** (client-side route to
+`/apuestas-deportivas/`) makes the green place button appear; **refreshing from that
+working state re-breaks it**.
+
+**Holistic model:** Betsson's authenticated betting context (`ctx-`) lives in the
+SPA's in-memory state, established by **client-side in-app navigation after login**.
+A **hard load/reload cold-boots the SPA and fails to re-establish it** (app quirk).
+This overturns the earlier "refresh fixes it" note (that was the misleading case).
+
+**Fix:** `InSessionTransport.prepare_betsson_context()` no longer navigates/reloads
+(those were destroying the context — the root cause of `--via-placer` failing); it
+passively reads the live `ctx-` the app emits once the SPA is in the placeable state.
+`BetssonLegPlacer` no longer navigates or requires a slug. The caller drives the SPA
+in-app (operator click now; automated in-app nav later). 550 tests green, mypy/ruff
+clean. See [[betsson-auth-session-model]].
+
 ## 2026-06-03 — MILESTONE: first fully-autonomous deterministic bet placed (Betsson)
 
 **Context:** Our OWN deterministic placer built + sent the coupon (not the app UI)
