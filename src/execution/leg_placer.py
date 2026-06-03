@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any, Protocol
 
 import structlog
 
@@ -30,51 +31,66 @@ from src.execution.session import Transport, TransportError
 
 log = structlog.get_logger(__name__)
 
+_BETSSON_EVENT_URL = "https://pba.betsson.bet.ar/apuestas-deportivas/{slug}"
 _BETSSON_PLACE_URL = "https://pba.betsson.bet.ar/api/sb/v2/coupons"
 _BETWARRIOR_PLACE_URL = "https://cf-al-auth-api.kambicdn.com/player/api/v2019/bwargbap/coupon.json"
 _BETANO_BASE = "https://www.betano.bet.ar/api/betslip/v3"
 _BPLAY_BASE = "https://ws-deportespba.bplay.bet.ar"
 
-# Betsson OBG headers required on every sportsbook call (from recon).
-_BETSSON_HEADERS = {
-    "content-type": "application/json",
-    "brandid": "238cb63a-3dcc-4fdf-b241-23a12cb71aa7",
-    "marketcode": "ag",
-    "x-sb-type": "b2b",
-    "x-sb-jurisdiction": "Iplyc",
-}
+
+class BetssonTransport(Protocol):
+    """What BetssonLegPlacer needs: the generic fetch + the authenticated-context
+    bootstrap (`InSessionTransport.prepare_betsson_context`)."""
+
+    async def prepare_betsson_context(self, event_url: str) -> dict[str, str] | None: ...
+    async def fetch(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, Any]]: ...
 
 
 class BetssonLegPlacer:
-    """Betsson OBG — single POST to ``/api/sb/v2/coupons``.
+    """Betsson OBG — POST to ``/api/sb/v2/coupons``.
 
-    Auth is a short-lived ``sessiontoken`` JWT (header, NOT a cookie; ~11-min
-    TTL) the app keeps in ``localStorage.session.token``. ``session_token`` is
-    the async seam that reads the *current* token off the live page at place
-    time; without it (or an expired one) the call 401s.
+    Placement needs the *authenticated* session context (sessiontoken + the
+    ``ctx-`` user-context + x-sb-* headers) which the app only exposes for a
+    logged-in session and only after a post-login refresh. So we don't
+    reconstruct headers: the transport navigates the event page, refresh-syncs,
+    and hands back the live authenticated header set; we add the coupon-submit
+    headers and POST. `leg.platform_event_ref` is the event-page slug.
     """
 
     platform = "betsson-pba"
 
-    def __init__(
-        self,
-        transport: Transport,
-        session_token: Callable[[], Awaitable[str]] | None = None,
-    ) -> None:
+    def __init__(self, transport: BetssonTransport) -> None:
         self._t = transport
-        self._session_token = session_token
         self._log = log.bind(component="leg_placer", platform=self.platform)
 
     async def place(self, leg: Leg) -> PlacementResult:
+        if not leg.platform_event_ref:
+            return PlacementResult(accepted=False, detail="betsson: missing event slug")
+        event_url = _BETSSON_EVENT_URL.format(slug=leg.platform_event_ref)
+        try:
+            ctx_headers = await self._t.prepare_betsson_context(event_url)
+        except TransportError as exc:
+            self._log.warning("leg_placer.transport_error", error=str(exc))
+            return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
+        if not ctx_headers:
+            return PlacementResult(
+                accepted=False, detail="betsson: authenticated context not resolved (re-login?)"
+            )
+        headers = {
+            **ctx_headers,
+            "content-type": "application/json",
+            "x-sb-identifier": "BETSLIP_SUBMIT_COUPONS_REQUEST",
+        }
         request = placers.build_betsson_request(
             [(leg.platform_outcome_id, f"{leg.odds:.2f}")], leg.stake_ars
         )
-        headers = dict(_BETSSON_HEADERS)
-        if self._session_token is not None:
-            token = await self._session_token()
-            if not token:
-                return PlacementResult(accepted=False, detail="no betsson session token (re-login)")
-            headers["sessiontoken"] = token
         try:
             status, resp = await self._t.fetch(
                 "POST", _BETSSON_PLACE_URL, json_body=request, headers=headers

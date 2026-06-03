@@ -15,6 +15,7 @@ live tiny bet in the Phase-1 trial, not unit tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, Protocol
@@ -25,6 +26,11 @@ log = structlog.get_logger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _PROFILE_ROOT = REPO_ROOT / "recon" / "profile"
+
+# Pseudo / hop-by-hop headers to strip before replaying a captured header set.
+_HEADER_DROP = frozenset(
+    {":authority", ":method", ":path", ":scheme", "host", "content-length", "accept-encoding"}
+)
 
 
 class Transport(Protocol):
@@ -69,6 +75,7 @@ class InSessionTransport:
         self._context: Any = None  # playwright BrowserContext, set in __aenter__
         self._page: Any = None
         self._pw: Any = None
+        self._captured_ctx: dict[str, str] | None = None  # Betsson authenticated header set
         self._log = log.bind(component="in_session_transport", platform=platform, dry_run=dry_run)
 
     def arm(self) -> None:
@@ -105,11 +112,18 @@ class InSessionTransport:
             geolocation={"latitude": -34.9215, "longitude": -57.9545},
         )
         await apply_stealth(self._context)
+        # Capture the authenticated context header set (Betsson `ctx-`); harmless
+        # for platforms that never send it.
+        self._context.on("request", self._on_request)
         await _restore_session(self._context, self._platform)
         self._page = (
             self._context.pages[0] if self._context.pages else await self._context.new_page()
         )
         return self
+
+    def _on_request(self, req: Any) -> None:
+        if req.headers.get("x-sb-user-context-id", "").startswith("ctx-"):
+            self._captured_ctx = dict(req.headers)
 
     async def __aexit__(self, *exc: object) -> None:
         if self._context is not None:
@@ -131,6 +145,33 @@ class InSessionTransport:
             self._log.info("transport.dry_run_eval")
             return None
         return await self._page.evaluate(expression)
+
+    async def prepare_betsson_context(self, event_url: str) -> dict[str, str] | None:
+        """Navigate to the event page and refresh until the app issues an
+        authenticated (``ctx-``) request; return that request's header set
+        (sessiontoken + ctx- + x-sb-* context), cleaned for replay.
+
+        Returns ``None`` if the authenticated context never resolves — i.e. the
+        session isn't logged in. The betting context lags login (the app shows
+        logged-in before the betslip layer syncs), so we refresh up to 3×; this
+        is the operational replacement for the trial's manual ENTER + refresh."""
+        if self._dry_run:
+            self._log.info("transport.dry_run_prepare", url=event_url)
+            return None
+        self._captured_ctx = None
+        await self._page.goto(event_url, wait_until="networkidle", timeout=60000)
+        for attempt in range(3):
+            for _ in range(10):
+                if self._captured_ctx is not None:
+                    break
+                await asyncio.sleep(1)
+            if self._captured_ctx is not None:
+                break
+            self._log.info("transport.betsson_ctx_unsynced", attempt=attempt + 1)
+            await self._page.reload(wait_until="networkidle", timeout=60000)
+        if self._captured_ctx is None:
+            return None
+        return {k: v for k, v in self._captured_ctx.items() if k not in _HEADER_DROP}
 
     async def fetch(
         self,

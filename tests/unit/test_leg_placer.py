@@ -17,14 +17,29 @@ from src.execution.leg_placer import (
     BplayLegPlacer,
 )
 
+_FAKE_CTX = {"x-sb-user-context-id": "ctx-1", "sessiontoken": "JWT", "brandid": "B"}
+
 
 class FakeTransport:
-    """Records the request it's handed and returns a canned (status, body)."""
+    """Records the request it's handed and returns a canned (status, body).
+    For Betsson, `ctx_headers` is what prepare_betsson_context returns (None to
+    simulate a not-logged-in / unresolved context)."""
 
-    def __init__(self, status: int = 200, body: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        status: int = 200,
+        body: dict[str, Any] | None = None,
+        ctx_headers: dict[str, str] | None = _FAKE_CTX,
+    ) -> None:
         self.status = status
         self.body = body or {}
+        self.ctx_headers = ctx_headers
         self.calls: list[dict[str, Any]] = []
+        self.prepared: list[str] = []
+
+    async def prepare_betsson_context(self, event_url: str) -> dict[str, str] | None:
+        self.prepared.append(event_url)
+        return self.ctx_headers
 
     async def fetch(self, method, url, *, json_body=None, headers=None):  # type: ignore[no-untyped-def]
         self.calls.append({"method": method, "url": url, "json": json_body, "headers": headers})
@@ -43,7 +58,9 @@ class SeqTransport:
         return self._responses[len(self.calls) - 1]
 
 
-def _leg(platform: str, outcome_id: str, stake: float, odds: float) -> Leg:
+def _leg(
+    platform: str, outcome_id: str, stake: float, odds: float, event_ref: str = "futbol/x-vs-y"
+) -> Leg:
     return Leg(
         platform=platform,
         match_id="m1",
@@ -52,6 +69,7 @@ def _leg(platform: str, outcome_id: str, stake: float, odds: float) -> Leg:
         stake_ars=stake,
         odds=odds,
         platform_outcome_id=outcome_id,
+        platform_event_ref=event_ref,
     )
 
 
@@ -81,44 +99,35 @@ async def test_betsson_placer_builds_request_and_parses_success() -> None:
     )
     res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-home", 500.0, 1.41))
     assert res.accepted and res.ref == "C1"
+    assert t.prepared and t.prepared[0].endswith("futbol/x-vs-y")  # navigated the event page
     call = t.calls[0]
     assert call["url"].endswith("/api/sb/v2/coupons")
-    assert call["headers"]["brandid"] and call["headers"]["x-sb-type"] == "b2b"
+    # the live authenticated context headers are replayed onto the place call
+    assert call["headers"]["x-sb-user-context-id"] == "ctx-1"
+    assert call["headers"]["sessiontoken"] == "JWT"
+    assert call["headers"]["x-sb-identifier"] == "BETSLIP_SUBMIT_COUPONS_REQUEST"
     sel = call["json"]["bets"][0]["betSelections"][0]
     assert sel == {"marketSelectionId": "s-m-f-EVT-MW3W-home", "odds": "1.41"}
     assert call["json"]["bets"][0]["stake"] == 500.0
+    # updateSources is present and correctly shaped (the E_BETTING_COUPON_GENERAL fix)
+    us = call["json"]["updateSources"]
+    assert "s-m-f-EVT-MW3W-home" in us["odds"]["selections"]
+    assert "m-f-EVT-MW3W" in us["statuses"]["markets"]
 
 
-async def test_betsson_sends_session_token_header_when_provided() -> None:
-    t = FakeTransport(
-        200,
-        {
-            "couponStatus": {
-                "couponStatusPollingResult": "Success",
-                "couponId": "C1",
-                "couponPlacementErrors": [],
-            }
-        },
+async def test_betsson_fails_closed_when_context_not_resolved() -> None:
+    # prepare_betsson_context returns None → not logged in → no place attempt.
+    t = FakeTransport(ctx_headers=None)
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-x", 50.0, 2.62))
+    assert not res.accepted and "context not resolved" in res.detail
+    assert not t.calls  # never POSTed
+
+
+async def test_betsson_fails_closed_without_event_slug() -> None:
+    res = await BetssonLegPlacer(FakeTransport()).place(
+        _leg("betsson-pba", "s-x", 50.0, 2.62, event_ref="")
     )
-
-    async def token() -> str:
-        return "JWT123"
-
-    res = await BetssonLegPlacer(t, session_token=token).place(
-        _leg("betsson-pba", "s-x", 50.0, 2.62)
-    )
-    assert res.accepted
-    assert t.calls[0]["headers"]["sessiontoken"] == "JWT123"
-
-
-async def test_betsson_fails_closed_when_session_token_empty() -> None:
-    async def token() -> str:
-        return ""
-
-    res = await BetssonLegPlacer(FakeTransport(), session_token=token).place(
-        _leg("betsson-pba", "s-x", 50.0, 2.62)
-    )
-    assert not res.accepted and "session token" in res.detail
+    assert not res.accepted and "event slug" in res.detail
 
 
 async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
@@ -219,6 +228,9 @@ async def test_rejection_confirmation_is_not_accepted() -> None:
 
 async def test_transport_error_returns_not_accepted_not_raise() -> None:
     class BoomTransport:
+        async def prepare_betsson_context(self, event_url: str) -> dict[str, str] | None:
+            return _FAKE_CTX
+
         async def fetch(self, *a: Any, **k: Any) -> tuple[int, dict[str, Any]]:
             from src.execution.session import TransportError
 
