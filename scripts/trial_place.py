@@ -131,11 +131,15 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
     captured: dict[str, dict[str, str]] = {}
 
     state: dict[str, bool] = {}  # login flag, read from the app's own user-context call
+    diag: dict[str, list] = {"uc": [], "ctx": []}  # observability for the fail states
 
     def on_request(req: Request) -> None:
         # Capture the authenticated (ctx-) header set the app uses once logged in.
-        if req.headers.get("x-sb-user-context-id", "").startswith("ctx-"):
+        uctx = req.headers.get("x-sb-user-context-id", "")
+        if uctx.startswith("ctx-"):
             captured["headers"] = dict(req.headers)
+            if uctx not in diag["ctx"]:
+                diag["ctx"].append(uctx)
 
     async def on_response(resp: object) -> None:
         # Source of truth for login: the app's OWN user-context response. (A
@@ -143,11 +147,16 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
         # header.)
         r = resp  # playwright Response
         if "/sb/fe-api/v1/user-context" in r.url:  # type: ignore[attr-defined]
+            status = r.status  # type: ignore[attr-defined]
+            li: object = "?"
             try:
                 j = await r.json()  # type: ignore[attr-defined]
-                state["logged_in"] = bool(j.get("userContext", {}).get("isLoggedIn"))
-            except Exception:  # noqa: BLE001 — non-JSON/aborted responses are ignorable
-                pass
+                li = j.get("userContext", {}).get("isLoggedIn")
+                if li:
+                    state["logged_in"] = True
+            except Exception as exc:  # noqa: BLE001
+                li = f"err:{type(exc).__name__}"
+            diag["uc"].append((status, li))
 
     pw = await async_playwright().start()
     ctx = await pw.chromium.launch_persistent_context(
@@ -180,33 +189,44 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
         }
 
         # Logged in iff the app's user-context says so OR a ctx- request was seen
-        # (the authenticated context only exists for a logged-in session). Keying
-        # on the captured ctx- is more robust — the user-context call itself can
-        # 502. Reload gently (every ~12s) so the operator can log in without
-        # hammering the backend.
+        # (the authenticated context only exists for a logged-in session). We
+        # LISTEN passively — no timed reloads, which were disrupting the login
+        # form mid-entry. When the operator logs in, the SPA emits user-context +
+        # ctx- on its own; we do at most one gentle reload as a late nudge.
         def authed() -> bool:
             return bool(state.get("logged_in")) or "headers" in captured
 
         if not authed():
             print(
                 "  NOT logged in — complete LOG IN in the browser window (stay on PBA); "
-                "waiting up to ~3 min…"
+                "listening up to ~3 min (no reloads — finish the login at your pace)…"
             )
-        for _ in range(15):
+        for tick in range(90):  # ~180s, polled every 2s
             if authed():
                 break
-            await asyncio.sleep(12)
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            if tick == 60 and not authed():  # one late nudge if nothing seen by ~2min
+                print("  …no auth signal yet — one reload nudge…")
+                await page.goto(url, wait_until="networkidle", timeout=60000)
+            if tick % 15 == 14:
+                print(
+                    f"    [waiting] user-context responses={diag['uc'][-3:]} "
+                    f"ctx-seen={len(diag['ctx'])}"
+                )
+            await asyncio.sleep(2)
         if not authed():
             print(
-                "\n=== RESULT ===\naccepted=False  detail: not logged in "
-                "(login not completed in the window)"
+                "\n=== RESULT ===\naccepted=False  detail: not logged in\n"
+                f"  DIAG: user-context responses (status,isLoggedIn) = {diag['uc']}\n"
+                f"  DIAG: distinct ctx- contexts seen = {diag['ctx']}\n"
+                "  (no isLoggedIn:true and no ctx- request → either login didn't land "
+                "in this profile, or the app never re-queried user-context)"
             )
             return
 
-        # Authenticated — ensure the ctx- header set is captured; a quiet reload
-        # nudges the app to emit a ctx- request if we haven't seen one yet.
-        print("  logged in ✓ — capturing authenticated context…")
+        print(
+            f"  logged in ✓ (uc={diag['uc'][-2:]}, ctx-seen={len(diag['ctx'])}) — "
+            "capturing authenticated context…"
+        )
         for _ in range(20):
             if "headers" in captured:
                 break
