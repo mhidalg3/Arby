@@ -115,14 +115,13 @@ def _preview(args: argparse.Namespace) -> None:
 
 async def _arm_betsson(args: argparse.Namespace) -> None:
     """Betsson place. The coupons POST needs the *authenticated* session context
-    (`x-sb-user-context-id: ctx-…`), which the app resolves via
-    `/sb/fe-api/v1/user-context` ONLY with a valid (short-lived ~11-min) token —
-    and which is NOT derivable offline. So: open the logged-in profile, land on
-    the event page, wait for the app to start using the `ctx-` context, capture
-    that live header set, and fire the deterministic coupons POST with it. If the
-    context never resolves, the session is stale → re-login."""
-    import time  # noqa: PLC0415
-
+    (`x-sb-user-context-id: ctx-…`), which the app resolves only for a genuinely
+    logged-in session (NOT derivable offline). A fresh token expiry is NOT enough
+    — an anonymous post-logout session also has one — so we gate on
+    `/sb/fe-api/v1/user-context` reporting `isLoggedIn: true`. Flow: open the
+    profile, land on the event page, wait (up to 180s) for the operator to be
+    logged in, reload so the app starts using `ctx-`, capture that live header
+    set, and fire the deterministic coupons POST."""
     from playwright.async_api import Request, async_playwright  # noqa: PLC0415
 
     from scripts.recon.stealth import apply_stealth  # noqa: PLC0415
@@ -132,10 +131,13 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
     captured: dict[str, dict[str, str]] = {}
 
     def on_request(req: Request) -> None:
-        # Betsson resolves the authenticated context (ctx-) onto BOTH /sb/fe-api/
-        # and /api/sb/ once the token is live; capture the freshest such header set.
-        if req.headers.get("x-sb-user-context-id", "").startswith("ctx-"):
-            captured["headers"] = dict(req.headers)
+        # Capture the authenticated (ctx-) header set when it appears; meanwhile
+        # keep the anonymous (stc-) set, which we use to query login state.
+        h = req.headers
+        if h.get("x-sb-user-context-id", "").startswith("ctx-"):
+            captured["headers"] = dict(h)
+        elif h.get("x-sb-static-context-id"):
+            captured["stc"] = dict(h)
 
     pw = await async_playwright().start()
     ctx = await pw.chromium.launch_persistent_context(
@@ -155,40 +157,6 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
         page.on("request", on_request)
         await page.goto(url, wait_until="networkidle", timeout=60000)
 
-        # The API sessiontoken is short-lived (~11 min) and a stale persistent
-        # login does NOT auto-mint a fresh one. Wait (up to ~3 min) for a token
-        # whose expiry is in the future — i.e. for the operator to (re)log-in in
-        # the open window if needed — so we place inside the live session.
-        async def token_fresh() -> bool:
-            exp = await page.evaluate("localStorage.getItem('session-token-expiration')")
-            return bool(exp) and float(exp) > time.time() * 1000 + 30_000
-
-        if not await token_fresh():
-            print(
-                "  token stale — LOG IN (or log out & back in) in the browser window; "
-                "waiting up to 180s for a fresh token…"
-            )
-        for _ in range(180):
-            if await token_fresh():
-                break
-            await asyncio.sleep(1)
-        if not await token_fresh():
-            print("\n=== RESULT ===\naccepted=False  detail: no fresh token (login not completed)")
-            return
-
-        # Fresh token in hand — reload so the app resolves the authenticated
-        # user-context, then wait for a ctx- request to capture its headers.
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        for _ in range(25):
-            if "headers" in captured:
-                break
-            await asyncio.sleep(1)
-        if "headers" not in captured:
-            print(
-                "\n=== RESULT ===\naccepted=False  detail: authenticated context (ctx-) "
-                "never resolved despite a fresh token"
-            )
-            return
         drop = {
             ":authority",
             ":method",
@@ -198,6 +166,60 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
             "content-length",
             "accept-encoding",
         }
+
+        # We need the anonymous stc- header set to query login state.
+        for _ in range(15):
+            if "stc" in captured:
+                break
+            await asyncio.sleep(1)
+
+        async def logged_in() -> bool:
+            """True only when the SERVER says the session is authenticated — a
+            fresh anonymous (post-logout) token reports isLoggedIn:false."""
+            if "stc" not in captured:
+                return False
+            hdrs = {k: v for k, v in captured["stc"].items() if k not in drop}
+            return bool(
+                await page.evaluate(
+                    """async (h) => { try {
+                        const x = await fetch('/sb/fe-api/v1/user-context',
+                            {credentials:'include', headers:h});
+                        const j = await x.json();
+                        return !!(j.userContext && j.userContext.isLoggedIn);
+                    } catch (e) { return false; } }""",
+                    hdrs,
+                )
+            )
+
+        if not await logged_in():
+            print(
+                "  NOT logged in — complete LOG IN in the browser window (stay on PBA); "
+                "waiting up to 180s…"
+            )
+        for _ in range(180):
+            if await logged_in():
+                break
+            await asyncio.sleep(1)
+        if not await logged_in():
+            print(
+                "\n=== RESULT ===\naccepted=False  detail: not logged in "
+                "(login not completed in the window)"
+            )
+            return
+
+        # Logged in — reload so the app resolves + uses the authenticated ctx- context.
+        print("  logged in ✓ — resolving authenticated context…")
+        await page.goto(url, wait_until="networkidle", timeout=60000)
+        for _ in range(25):
+            if "headers" in captured:
+                break
+            await asyncio.sleep(1)
+        if "headers" not in captured:
+            print(
+                "\n=== RESULT ===\naccepted=False  detail: ctx- not resolved despite "
+                "being logged in (may need a betslip interaction trigger)"
+            )
+            return
         headers = {k: v for k, v in captured["headers"].items() if k not in drop}
         headers.update(
             {
