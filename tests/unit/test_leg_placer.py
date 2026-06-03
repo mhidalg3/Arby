@@ -89,6 +89,38 @@ async def test_betsson_placer_builds_request_and_parses_success() -> None:
     assert call["json"]["bets"][0]["stake"] == 500.0
 
 
+async def test_betsson_sends_session_token_header_when_provided() -> None:
+    t = FakeTransport(
+        200,
+        {
+            "couponStatus": {
+                "couponStatusPollingResult": "Success",
+                "couponId": "C1",
+                "couponPlacementErrors": [],
+            }
+        },
+    )
+
+    async def token() -> str:
+        return "JWT123"
+
+    res = await BetssonLegPlacer(t, session_token=token).place(
+        _leg("betsson-pba", "s-x", 50.0, 2.62)
+    )
+    assert res.accepted
+    assert t.calls[0]["headers"]["sessiontoken"] == "JWT123"
+
+
+async def test_betsson_fails_closed_when_session_token_empty() -> None:
+    async def token() -> str:
+        return ""
+
+    res = await BetssonLegPlacer(FakeTransport(), session_token=token).place(
+        _leg("betsson-pba", "s-x", 50.0, 2.62)
+    )
+    assert not res.accepted and "session token" in res.detail
+
+
 async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
     t = FakeTransport(
         200,

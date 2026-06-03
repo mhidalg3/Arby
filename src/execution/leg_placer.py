@@ -46,21 +46,38 @@ _BETSSON_HEADERS = {
 
 
 class BetssonLegPlacer:
-    """Betsson OBG — stateless single POST to ``/api/sb/v2/coupons``."""
+    """Betsson OBG — single POST to ``/api/sb/v2/coupons``.
+
+    Auth is a short-lived ``sessiontoken`` JWT (header, NOT a cookie; ~11-min
+    TTL) the app keeps in ``localStorage.session.token``. ``session_token`` is
+    the async seam that reads the *current* token off the live page at place
+    time; without it (or an expired one) the call 401s.
+    """
 
     platform = "betsson-pba"
 
-    def __init__(self, transport: Transport) -> None:
+    def __init__(
+        self,
+        transport: Transport,
+        session_token: Callable[[], Awaitable[str]] | None = None,
+    ) -> None:
         self._t = transport
+        self._session_token = session_token
         self._log = log.bind(component="leg_placer", platform=self.platform)
 
     async def place(self, leg: Leg) -> PlacementResult:
         request = placers.build_betsson_request(
             [(leg.platform_outcome_id, f"{leg.odds:.2f}")], leg.stake_ars
         )
+        headers = dict(_BETSSON_HEADERS)
+        if self._session_token is not None:
+            token = await self._session_token()
+            if not token:
+                return PlacementResult(accepted=False, detail="no betsson session token (re-login)")
+            headers["sessiontoken"] = token
         try:
             status, resp = await self._t.fetch(
-                "POST", _BETSSON_PLACE_URL, json_body=request, headers=_BETSSON_HEADERS
+                "POST", _BETSSON_PLACE_URL, json_body=request, headers=headers
             )
         except TransportError as exc:
             self._log.warning("leg_placer.transport_error", error=str(exc))

@@ -1,5 +1,33 @@
 # Project Ledger
 
+## 2026-06-03 — Phase-1 trial attempt #1: Betsson 401, two root causes found
+
+**Context:** First armed real-money send. Built `scripts/trial_place.py` (the
+only script that sends real money: preview-by-default, read-only `--discover`,
+`--arm` gated behind `--yes-real-money` + a 300-ARS hard cap, visible browser).
+Discovery confirmed Betsson + Betano are live and yield real current selection
+IDs. Armed a 50-ARS Betsson bet → **HTTP 401, no money moved.**
+
+**Root causes (both real):**
+1. **Placer bug:** Betsson authenticates the place call with a `sessiontoken`
+   **header** (a short-lived JWT from `localStorage.session.token`, ~11-min
+   TTL), NOT cookies. The placer never sent it. FIXED: `BetssonLegPlacer` gains
+   a `session_token` async seam that reads the live token via `eval_js` at place
+   time; fails closed if empty. (Context IDs `ctx-`/`stc-`/segment aren't in
+   storage — server-side; deferred until a fresh session shows if they're
+   required.)
+2. **Expired session:** the stored token expired ~17h ago (yesterday's login);
+   the app *cleared* the session on load (no valid refresh token). All four
+   stored sessions are ~17h old → all presumed dead.
+
+**State:** Fix landed + unit-tested (11 placer tests green, 551 total, mypy/ruff
+clean). Trial is **blocked on re-auth** — the cold-path (human `--login`).
+Implication confirmed: live execution needs a *freshly authenticated, kept-warm*
+session; stored sessions are short-lived. **Next:** operator re-logs in, retry
+Betsson immediately (within the ~11-min token window), then Betano. BetWarrior
+(Kambi bearer) + Bplay (bootstrap csrf) still need their token source located
+before they can place.
+
 ## 2026-06-02 — All four LegPlacers built (stateless + stateful slip sequences)
 
 **Context:** Completed the build+send half of the LegPlacer for all four
