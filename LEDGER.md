@@ -22,11 +22,46 @@ IDs. Armed a 50-ARS Betsson bet → **HTTP 401, no money moved.**
 
 **State:** Fix landed + unit-tested (11 placer tests green, 551 total, mypy/ruff
 clean). Trial is **blocked on re-auth** — the cold-path (human `--login`).
-Implication confirmed: live execution needs a *freshly authenticated, kept-warm*
-session; stored sessions are short-lived. **Next:** operator re-logs in, retry
-Betsson immediately (within the ~11-min token window), then Betano. BetWarrior
-(Kambi bearer) + Bplay (bootstrap csrf) still need their token source located
-before they can place.
+
+## 2026-06-03 — Betsson placement mechanism fully reverse-engineered (auth model)
+
+**Context:** Several armed attempts, all rejected with no money moved — used the
+401/403 error codes to map Betsson's (OBG) full auth model. Now understood
+end-to-end:
+
+**Betsson coupons POST (`/api/sb/v2/coupons`) needs, together:**
+1. `sessiontoken` JWT header — from `localStorage.session.token`; **~11-min TTL**.
+   Carries `{userId, loginSessionId, jurisdiction, createdAt}`.
+2. `x-sb-user-context-id: ctx-…` — the **authenticated** context. NOT derivable
+   (tried `"ctx-"+loginSessionId` → 401), NOT in storage/response bodies/headers
+   at rest. The app resolves it via `GET /sb/fe-api/v1/user-context` **only when
+   the token is live**, then uses `ctx-` on all subsequent calls.
+3. Stable per-user context headers `x-sb-static-context-id` (`stc-…`),
+   `x-sb-segment-id`, `x-sb-content-id` (=brandid) — capturable from any live
+   authed request.
+
+Wrong/missing context → `403 E_SPORTSBOOK_UNAUTHORIZEDACCESS`; wrong token (or
+mismatched ctx-) → `401 E_INVALIDSESSIONTOKEN`.
+
+**Working recipe (built into `scripts/trial_place.py` `_arm_betsson`):** open the
+logged-in profile → land on the event page (slug from the scraper) → wait for a
+**fresh** token → let the app resolve `ctx-` → capture that live header set →
+fire the deterministic coupons POST. So placement IS deterministic; only the
+*context bootstrap* must be lifted off a live session (no UI clicking needed).
+
+**Hard operational constraint (the real blocker):** the persistent profile's
+token expires in ~11 min and a stale persistent login does **not** auto-mint a
+fresh one — opening the app shows "logged in" but the API token stays dead. A
+fresh token requires an actual **log-out/log-in** in the live window. Trial
+attempts kept racing an expired token. Implication for production: execution
+must keep a **continuously live, active** logged-in session (the app refreshes
+the token while open) and place within it — not launch-restore-place from a cold
+stored session. See [[betsson-auth-session-model]].
+
+**State:** Betsson placer logic is correct + the runner waits up to 180s for a
+fresh token. **Next:** operator runs the armed command directly and does a
+log-out/log-in so a live token exists at placement; that should complete the
+first real bet. Then Betano (cookie-based, likely simpler), then BetWarrior/Bplay.
 
 ## 2026-06-02 — All four LegPlacers built (stateless + stateful slip sequences)
 
