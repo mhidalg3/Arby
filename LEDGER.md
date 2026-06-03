@@ -21,6 +21,14 @@ passively reads the live `ctx-` the app emits once the SPA is in the placeable s
 in-app (operator click now; automated in-app nav later). 550 tests green, mypy/ruff
 clean. See [[betsson-auth-session-model]].
 
+**VALIDATED (same day):** `--via-placer` placed live through the production
+`BetssonLegPlacer` + `InSessionTransport` — `accepted=True, couponId
+179370824992876544`. **Betsson execution is DONE** (executor-drivable end-to-end).
+Only remaining Betsson nicety for full hands-off autonomy: automate the one in-app
+nav click that establishes the betting context (operator does it now). Test commands
+hardcoded one early-discovered slug for debugging continuity; real use always pulls a
+current event from `--discover`.
+
 ## 2026-06-03 — MILESTONE: first fully-autonomous deterministic bet placed (Betsson)
 
 **Context:** Our OWN deterministic placer built + sent the coupon (not the app UI)
