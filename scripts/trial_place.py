@@ -175,10 +175,17 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
 
         async def logged_in() -> bool:
             """True only when the SERVER says the session is authenticated — a
-            fresh anonymous (post-logout) token reports isLoggedIn:false."""
+            fresh anonymous (post-logout) token reports isLoggedIn:false. Use the
+            CURRENT localStorage token (login mints a new one; the captured stc-
+            set carries the stale pre-login token)."""
             if "stc" not in captured:
                 return False
             hdrs = {k: v for k, v in captured["stc"].items() if k not in drop}
+            tok = await page.evaluate(
+                "JSON.parse(localStorage.getItem('session')||'{}').token || ''"
+            )
+            if tok:
+                hdrs["sessiontoken"] = tok
             return bool(
                 await page.evaluate(
                     """async (h) => { try {
