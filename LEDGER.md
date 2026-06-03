@@ -1,5 +1,37 @@
 # Project Ledger
 
+## 2026-06-03 — MILESTONE: first real bet placed (Betsson, 20 ARS) + the last two unknowns
+
+**Context:** After many armed attempts, placed the first real money bet on
+Betsson — 20 ARS on Italy (Italy v Luxembourg) — via a new `--capture-ui` mode in
+`scripts/trial_place.py`: operator places through the app's own UI, the script
+intercepts the exact coupon request+response (saved, sessiontoken redacted, to the
+gitignored `recon/artifacts/`). Two behaviors this finally explained:
+
+1. **Betting context lags login (refresh fixes it).** The UI showed logged in
+   (balance + username) but the betslip refused ("login before placing") and
+   `user-context` returned `(200, isLoggedIn:false)`; a **browser refresh** synced
+   the authenticated `ctx-` into the betting layer and the bet placed — no
+   re-login. THIS is the cause of all our intermittent `(200,False)` / "ctx- not
+   resolved" failures: we needed a refresh *after the login settled*, and our
+   timing kept missing it.
+2. **`updateSources` is feed-derived, not guessable.** The real coupon's
+   `updateSources` = `{odds:{selections,latestRt: "rt:<uuid>"}, statuses:{selections,
+   markets: "api:<uuid>"}}`. The `rt:` token is the **live odds-push version** the
+   client last received; the server rejects (`E_BETTING_COUPON_GENERAL`) any coupon
+   not pinned to the current `rt:`. My fabricated `updateSources` was both the wrong
+   shape and a made-up token → that was the betting-rule rejection.
+
+**State:** Full Betsson placement model now known end-to-end (auth: sessiontoken +
+refresh-synced `ctx-`; body: bets + feed-pinned `updateSources`). Placement PROVEN
+(UI path). The deterministic path's remaining work: (a) refresh after a settled
+login before reading `ctx-`, and (b) capture the live `rt:`/`api:` tokens per
+selection off the odds feed at place time. Both buildable with the interception
+patterns already in the runner — but the `rt:` token is volatile, which adds
+fragility. **Decision pending:** finish deterministic (capture feed tokens) vs adopt
+UI-driven placement (Playwright drives betslip + Apostar — just proven to work).
+See [[betsson-auth-session-model]].
+
 ## 2026-06-03 — OBSERVATION: geolocation pin controls Betsson jurisdiction (cross-region arb lead)
 
 **Context:** Hit a bug where the trial routed to the CABA jurisdiction despite the
