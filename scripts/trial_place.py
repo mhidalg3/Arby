@@ -172,9 +172,11 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
     )
     try:
         await apply_stealth(ctx)
+        # Listen at the CONTEXT level so a login popup / new tab can't hide the
+        # auth requests from us.
+        ctx.on("request", on_request)
+        ctx.on("response", on_response)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        page.on("request", on_request)
-        page.on("response", on_response)
         await page.goto(url, wait_until="networkidle", timeout=60000)
         await asyncio.sleep(3)
 
@@ -188,61 +190,43 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
             "accept-encoding",
         }
 
-        # Logged in iff the app's user-context says so OR a ctx- request was seen
-        # (the authenticated context only exists for a logged-in session). We
-        # LISTEN passively — no timed reloads, which were disrupting the login
-        # form mid-entry. When the operator logs in, the SPA emits user-context +
-        # ctx- on its own; we do at most one gentle reload as a late nudge.
         def authed() -> bool:
+            # The authenticated ctx- only exists for a logged-in session; the
+            # app's user-context isLoggedIn:true is the other proof.
             return bool(state.get("logged_in")) or "headers" in captured
 
+        # Operator-gated, not auto-detected: log in by hand, then press ENTER.
+        # Auto-detecting "done logging in" proved racy (the SPA doesn't re-query
+        # user-context on its own), so we just ask — the operator runs this in a
+        # real terminal, so input() blocks for the keypress.
         if not authed():
-            print(
-                "  NOT logged in — complete LOG IN in the browser window (stay on PBA); "
-                "listening up to ~3 min (no reloads — finish the login at your pace)…"
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                input,
+                "\n  ▶ LOG IN in the browser window (stay on PBA / Iplyc). When you see your "
+                "balance and you're logged in, press ENTER here to place… ",
             )
-        for tick in range(90):  # ~180s, polled every 2s
-            if authed():
-                break
-            if tick == 60 and not authed():  # one late nudge if nothing seen by ~2min
-                print("  …no auth signal yet — one reload nudge…")
-                await page.goto(url, wait_until="networkidle", timeout=60000)
-            if tick % 15 == 14:
-                print(
-                    f"    [waiting] user-context responses={diag['uc'][-3:]} "
-                    f"ctx-seen={len(diag['ctx'])}"
-                )
-            await asyncio.sleep(2)
-        if not authed():
-            print(
-                "\n=== RESULT ===\naccepted=False  detail: not logged in\n"
-                f"  DIAG: user-context responses (status,isLoggedIn) = {diag['uc']}\n"
-                f"  DIAG: distinct ctx- contexts seen = {diag['ctx']}\n"
-                "  (no isLoggedIn:true and no ctx- request → either login didn't land "
-                "in this profile, or the app never re-queried user-context)"
-            )
-            return
 
-        print(
-            f"  logged in ✓ (uc={diag['uc'][-2:]}, ctx-seen={len(diag['ctx'])}) — "
-            "capturing authenticated context…"
-        )
-        for _ in range(20):
+        # Reload now that you're authenticated so the app issues the ctx- requests
+        # we capture (and re-checks user-context).
+        await page.goto(url, wait_until="networkidle", timeout=60000)
+        for _ in range(25):
             if "headers" in captured:
                 break
             await asyncio.sleep(1)
         if "headers" not in captured:
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            for _ in range(20):
-                if "headers" in captured:
-                    break
-                await asyncio.sleep(1)
-        if "headers" not in captured:
             print(
-                "\n=== RESULT ===\naccepted=False  detail: ctx- not resolved despite "
-                "being logged in (may need a betslip interaction trigger)"
+                "\n=== RESULT ===\naccepted=False  detail: authenticated context (ctx-) "
+                "not seen after login\n"
+                f"  DIAG: user-context responses (status,isLoggedIn) = {diag['uc']}\n"
+                f"  DIAG: distinct ctx- contexts seen = {diag['ctx']}\n"
+                "  (if user-context is still (200,False) you're not logged in on this "
+                "profile/region; if it's 502 the backend is flaking)"
             )
             return
+
+        print(f"  ctx- captured ({diag['ctx'][-1][:26]}…) — placing…")
         headers = {k: v for k, v in captured["headers"].items() if k not in drop}
         headers.update(
             {
