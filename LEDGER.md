@@ -18,13 +18,16 @@ values — **no need to decode the `rtf.bpsgameserver.com` real-time feed.** Bes
   (`odds{selections,latestRt:"rt:<uuid>"}` + `statuses{selections,markets:"api:<uuid>"}`,
   generated uuids). 551 tests green, mypy/ruff clean.
 
-**State:** Betsson placement proven deterministic + autonomous; the recipe is in the
-trial runner and the shared request builder is correct. NOT yet refactored into the
-production `BetssonLegPlacer`/`InSessionTransport` (they don't yet do the ctx-
-capture + refresh-sync the trial script does) — that's the remaining productionization
-so the `Executor` can drive Betsson. Two real open bets exist (20 ARS Italy UI,
-50 ARS Los Andes deterministic). See [[betsson-auth-session-model]]. **Next options:**
-productionize Betsson into the LegPlacer, or pivot to Betano for a 2nd platform.
+**State:** Betsson placement proven deterministic + autonomous. **Productionized**
+(commit 9469bed): `InSessionTransport.prepare_betsson_context()` does the navigate +
+refresh-sync + ctx-/header capture; `BetssonLegPlacer` resolves the context and POSTs
+the `updateSources`-carrying body via `transport.fetch`, failing closed if unresolved.
+`Leg` gained `platform_event_ref` (slug). 551 tests green. The production path mirrors
+the live-proven trial recipe but is **not yet re-validated live end-to-end through the
+`Executor`** (the trial script proved the recipe with raw Playwright). Two real open
+bets exist (20 ARS Italy UI, 50 ARS Los Andes deterministic).
+See [[betsson-auth-session-model]]. **Next:** live re-validate Betsson through the
+Executor's LegPlacer, or pivot to Betano for a 2nd platform.
 
 ## 2026-06-03 — MILESTONE: first real bet placed (Betsson, 20 ARS) + the last two unknowns
 
