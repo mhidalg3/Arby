@@ -1,5 +1,217 @@
 # Project Ledger
 
+## 2026-06-03 — Betsson betting-context model corrected: in-app nav establishes it, reload destroys it
+
+**Context:** The production re-validate (`--via-placer`) failed with "ctx- not
+resolved" where the trial had worked. New operator observation reconciled it: after
+login the betslip says "login before placing"; a **refresh does NOT fix it** (it
+persists); navigating **in-app to My Account** (client-side route to
+`/apuestas-deportivas/`) makes the green place button appear; **refreshing from that
+working state re-breaks it**.
+
+**Holistic model:** Betsson's authenticated betting context (`ctx-`) lives in the
+SPA's in-memory state, established by **client-side in-app navigation after login**.
+A **hard load/reload cold-boots the SPA and fails to re-establish it** (app quirk).
+This overturns the earlier "refresh fixes it" note (that was the misleading case).
+
+**Fix:** `InSessionTransport.prepare_betsson_context()` no longer navigates/reloads
+(those were destroying the context — the root cause of `--via-placer` failing); it
+passively reads the live `ctx-` the app emits once the SPA is in the placeable state.
+`BetssonLegPlacer` no longer navigates or requires a slug. The caller drives the SPA
+in-app (operator click now; automated in-app nav later). 550 tests green, mypy/ruff
+clean. See [[betsson-auth-session-model]].
+
+**VALIDATED (same day):** `--via-placer` placed live through the production
+`BetssonLegPlacer` + `InSessionTransport` — `accepted=True, couponId
+179370824992876544`. **Betsson execution is DONE** (executor-drivable end-to-end).
+Only remaining Betsson nicety for full hands-off autonomy: automate the one in-app
+nav click that establishes the betting context (operator does it now). Test commands
+hardcoded one early-discovered slug for debugging continuity; real use always pulls a
+current event from `--discover`.
+
+## 2026-06-03 — MILESTONE: first fully-autonomous deterministic bet placed (Betsson)
+
+**Context:** Our OWN deterministic placer built + sent the coupon (not the app UI)
+and it placed: `HTTP 200, accepted=True, couponId 179366484738617344, Success, no
+errors` — 50 ARS on Los Andes draw. The Betsson deterministic path is DONE.
+
+**Decisive finding:** the fabricated `rt:`/`api:` uuids in `updateSources` were
+ACCEPTED. So with `acceptOddsChanges: true` + `"CanAcceptOddChanges"`, the server
+only needs the correct `updateSources` *structure*, not the real feed-version
+values — **no need to decode the `rtf.bpsgameserver.com` real-time feed.** Best case.
+
+**What made it work (both fixes in `_arm_betsson`, now also in the shared builder):**
+- After a settled login + ENTER, `page.reload()` up to 3× until a `ctx-` request
+  appears (betting context lags login; refresh syncs it).
+- `build_betsson_request` now emits the validated `updateSources`
+  (`odds{selections,latestRt:"rt:<uuid>"}` + `statuses{selections,markets:"api:<uuid>"}`,
+  generated uuids). 551 tests green, mypy/ruff clean.
+
+**State:** Betsson placement proven deterministic + autonomous. **Productionized**
+(commit 9469bed): `InSessionTransport.prepare_betsson_context()` does the navigate +
+refresh-sync + ctx-/header capture; `BetssonLegPlacer` resolves the context and POSTs
+the `updateSources`-carrying body via `transport.fetch`, failing closed if unresolved.
+`Leg` gained `platform_event_ref` (slug). 551 tests green. The production path mirrors
+the live-proven trial recipe but is **not yet re-validated live end-to-end through the
+`Executor`** (the trial script proved the recipe with raw Playwright). Two real open
+bets exist (20 ARS Italy UI, 50 ARS Los Andes deterministic).
+See [[betsson-auth-session-model]]. **Next:** live re-validate Betsson through the
+Executor's LegPlacer, or pivot to Betano for a 2nd platform.
+
+## 2026-06-03 — MILESTONE: first real bet placed (Betsson, 20 ARS) + the last two unknowns
+
+**Context:** After many armed attempts, placed the first real money bet on
+Betsson — 20 ARS on Italy (Italy v Luxembourg) — via a new `--capture-ui` mode in
+`scripts/trial_place.py`: operator places through the app's own UI, the script
+intercepts the exact coupon request+response (saved, sessiontoken redacted, to the
+gitignored `recon/artifacts/`). Two behaviors this finally explained:
+
+1. **Betting context lags login (refresh fixes it).** The UI showed logged in
+   (balance + username) but the betslip refused ("login before placing") and
+   `user-context` returned `(200, isLoggedIn:false)`; a **browser refresh** synced
+   the authenticated `ctx-` into the betting layer and the bet placed — no
+   re-login. THIS is the cause of all our intermittent `(200,False)` / "ctx- not
+   resolved" failures: we needed a refresh *after the login settled*, and our
+   timing kept missing it.
+2. **`updateSources` is feed-derived, not guessable.** The real coupon's
+   `updateSources` = `{odds:{selections,latestRt: "rt:<uuid>"}, statuses:{selections,
+   markets: "api:<uuid>"}}`. The `rt:` token is the **live odds-push version** the
+   client last received; the server rejects (`E_BETTING_COUPON_GENERAL`) any coupon
+   not pinned to the current `rt:`. My fabricated `updateSources` was both the wrong
+   shape and a made-up token → that was the betting-rule rejection.
+
+**State:** Full Betsson placement model now known end-to-end (auth: sessiontoken +
+refresh-synced `ctx-`; body: bets + feed-pinned `updateSources`). Placement PROVEN
+(UI path). The deterministic path's remaining work: (a) refresh after a settled
+login before reading `ctx-`, and (b) capture the live `rt:`/`api:` tokens per
+selection off the odds feed at place time. Both buildable with the interception
+patterns already in the runner — but the `rt:` token is volatile, which adds
+fragility. **Decision pending:** finish deterministic (capture feed tokens) vs adopt
+UI-driven placement (Playwright drives betslip + Apostar — just proven to work).
+See [[betsson-auth-session-model]].
+
+## 2026-06-03 — OBSERVATION: geolocation pin controls Betsson jurisdiction (cross-region arb lead)
+
+**Context:** Hit a bug where the trial routed to the CABA jurisdiction despite the
+operator being in PBA. Root cause: the Playwright `geolocation` pin **overrides the
+real device GPS**, and Betsson (OBG) selects the jurisdiction/offering from that
+coordinate — CABA city-center coords → CABA site; La Plata coords → PBA (Iplyc,
+`pba.betsson.bet.ar`). Fixed the pin to La Plata.
+
+**Opportunity (unvalidated):** because we *control* the reported location, one
+machine can present as any Argentine jurisdiction (PBA, CABA, and presumably
+Córdoba/Mendoza/etc. — each has its own OBG subdomain + `x-sb-jurisdiction`).
+Different jurisdictions can run **different odds/lines and promos** on the same
+match → a potential **intra-Betsson cross-region arbitrage** surface, in addition
+to the cross-bookmaker arbs we already target. The scraper already parameterizes
+`subdomain`/jurisdiction, so multi-region odds capture is cheap to try.
+
+**Hard constraint:** **accounts appear region-bound** — an account registered in
+one jurisdiction seems tied to it (a CABA-routed session on a PBA account caused
+auth/jurisdiction mismatch, not a clean cross-region bet). So realizing cross-region
+arb would require a **separate funded account per jurisdiction**, each with its own
+kept-live session + geolocation pin. Verify the account↔jurisdiction binding before
+investing. See [[betsson-geolocation-check]], [[betsson-auth-session-model]].
+
+**State:** Idea logged, not pursued. Current goal remains the single-region Phase-1
+trial (PBA). Revisit cross-region after we can place reliably in one region.
+
+## 2026-06-03 — Phase-1 trial attempt #1: Betsson 401, two root causes found
+
+**Context:** First armed real-money send. Built `scripts/trial_place.py` (the
+only script that sends real money: preview-by-default, read-only `--discover`,
+`--arm` gated behind `--yes-real-money` + a 300-ARS hard cap, visible browser).
+Discovery confirmed Betsson + Betano are live and yield real current selection
+IDs. Armed a 50-ARS Betsson bet → **HTTP 401, no money moved.**
+
+**Root causes (both real):**
+1. **Placer bug:** Betsson authenticates the place call with a `sessiontoken`
+   **header** (a short-lived JWT from `localStorage.session.token`, ~11-min
+   TTL), NOT cookies. The placer never sent it. FIXED: `BetssonLegPlacer` gains
+   a `session_token` async seam that reads the live token via `eval_js` at place
+   time; fails closed if empty. (Context IDs `ctx-`/`stc-`/segment aren't in
+   storage — server-side; deferred until a fresh session shows if they're
+   required.)
+2. **Expired session:** the stored token expired ~17h ago (yesterday's login);
+   the app *cleared* the session on load (no valid refresh token). All four
+   stored sessions are ~17h old → all presumed dead.
+
+**State:** Fix landed + unit-tested (11 placer tests green, 551 total, mypy/ruff
+clean). Trial is **blocked on re-auth** — the cold-path (human `--login`).
+
+## 2026-06-03 — Betsson placement mechanism fully reverse-engineered (auth model)
+
+**Context:** Several armed attempts, all rejected with no money moved — used the
+401/403 error codes to map Betsson's (OBG) full auth model. Now understood
+end-to-end:
+
+**Betsson coupons POST (`/api/sb/v2/coupons`) needs, together:**
+1. `sessiontoken` JWT header — from `localStorage.session.token`; **~11-min TTL**.
+   Carries `{userId, loginSessionId, jurisdiction, createdAt}`.
+2. `x-sb-user-context-id: ctx-…` — the **authenticated** context. NOT derivable
+   (tried `"ctx-"+loginSessionId` → 401), NOT in storage/response bodies/headers
+   at rest. The app resolves it via `GET /sb/fe-api/v1/user-context` **only when
+   the token is live**, then uses `ctx-` on all subsequent calls.
+3. Stable per-user context headers `x-sb-static-context-id` (`stc-…`),
+   `x-sb-segment-id`, `x-sb-content-id` (=brandid) — capturable from any live
+   authed request.
+
+Wrong/missing context → `403 E_SPORTSBOOK_UNAUTHORIZEDACCESS`; wrong token (or
+mismatched ctx-) → `401 E_INVALIDSESSIONTOKEN`.
+
+**Working recipe (built into `scripts/trial_place.py` `_arm_betsson`):** open the
+logged-in profile → land on the event page (slug from the scraper) → wait for a
+**fresh** token → let the app resolve `ctx-` → capture that live header set →
+fire the deterministic coupons POST. So placement IS deterministic; only the
+*context bootstrap* must be lifted off a live session (no UI clicking needed).
+
+**Hard operational constraint (the real blocker):** the persistent profile's
+token expires in ~11 min and a stale persistent login does **not** auto-mint a
+fresh one — opening the app shows "logged in" but the API token stays dead. A
+fresh token requires an actual **log-out/log-in** in the live window. Trial
+attempts kept racing an expired token. Implication for production: execution
+must keep a **continuously live, active** logged-in session (the app refreshes
+the token while open) and place within it — not launch-restore-place from a cold
+stored session. See [[betsson-auth-session-model]].
+
+**State:** Betsson placer logic is correct + the runner waits up to 180s for a
+fresh token. **Next:** operator runs the armed command directly and does a
+log-out/log-in so a live token exists at placement; that should complete the
+first real bet. Then Betano (cookie-based, likely simpler), then BetWarrior/Bplay.
+
+## 2026-06-02 — All four LegPlacers built (stateless + stateful slip sequences)
+
+**Context:** Completed the build+send half of the LegPlacer for all four
+platforms ahead of the Phase-1 trial. PR #7 covered Betsson/BetWarrior
+(stateless single POSTs) + the in-session transport; this adds the stateful two.
+
+**Decisions:**
+- **Betano** — stateful, fully reconstructable from the capture, no token
+  mystery (cookie auth): `plain-leg` (add selection → slip w/ hash) → `updatebets`
+  PATCH (set stake → **refreshed hash**) → `place` with that hash. The slip is
+  rebuilt from each response (`betano_slip_from_response`) before the next call;
+  `match_id`→eventId, `platform_outcome_id`→selectionId.
+- **Bplay** — stateful: `togglebet` → `place`, threading the rotated
+  `header.csrf_token` every SportNCO response returns. The first (bootstrap)
+  csrf lives in page JS state, NOT in the slip flow → injected via a
+  `bootstrap_csrf` async seam (reads it off the live page; the one piece
+  confirmed in the trial). Place is keyed to the match `event_url_key`.
+- **Betsson geolocation** — observed Betsson is the only platform that prompts
+  for browser geolocation (region/jurisdiction validation). `InSessionTransport`
+  now grants `geolocation` permission + pins a Buenos Aires coordinate on context
+  launch, so the session reads as in-jurisdiction instead of hanging on a prompt.
+
+**Errors/bugs fixed:** Bplay per-outcome `stake` map is **thousandths of ARS**
+(capture: total `"1.00"` ↔ map `1000`); the earlier builder put raw pesos — a
+1000× under-stake. Fixed + flagged as a MUST-verify-before-arming item.
+
+**State:** All four placers + transport are built, ruff/mypy clean, 549 tests
+pass (build→send→parse wiring tested via fake/sequence transports). Unvalidated
+live: the real in-session send, the Bplay bootstrap-csrf JS expression, whether
+Betano tolerates the trimmed slip subset / needs updatebets, and the Bplay
+stake unit. **Next:** Phase-1 real-money trial — one tiny bet through the
+executor with an armed transport, on explicit operator go.
+
 ## 2026-06-02 — DECISION: execution is deterministic (in-session API), NOT an LLM agent
 
 **Context:** Moving to Layer 4 (bet execution). Re-evaluated the documented

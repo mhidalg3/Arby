@@ -47,6 +47,8 @@ class Leg:
     outcome: str
     stake_ars: float
     odds: float  # the decimal odds we intend to bet at
+    platform_outcome_id: str = ""  # the platform's selection ref, for placement
+    platform_event_ref: str = ""  # event nav ref (Betsson slug / Bplay url_key)
     live_max_stake_ars: float | None = None  # live cap for dynamic platforms (Betano)
 
 
