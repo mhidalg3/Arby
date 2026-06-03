@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
 from collections import defaultdict
 
 import httpx
@@ -236,6 +237,20 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
         )
         print(f"  authenticated context: {headers['x-sb-user-context-id'][:28]}…")
         body = placers.build_betsson_request([(args.selection, f"{args.odds:.2f}")], args.stake)
+        # The real coupon carries `updateSources` (price/status provenance the app
+        # generates client-side). Its absence is the only structural diff from a
+        # working coupon and the likely cause of E_BETTING_COUPON_GENERAL. The
+        # market id is the selection id minus the "s-" prefix and outcome suffix;
+        # the status token is a client-generated "api: <uuid>" (one uuid for all).
+        market_id = args.selection[2:].rsplit("-", 1)[0]
+        feed_tag = f"api: {uuid.uuid4()}"
+        body["updateSources"] = {
+            "prices": {args.selection: ""},
+            "statuses": {
+                "selections": {args.selection: feed_tag},
+                "markets": {market_id: feed_tag},
+            },
+        }
         raw = await page.evaluate(
             """async ({url, body, headers}) => {
                 const r = await fetch(url, {method:'POST', headers,
