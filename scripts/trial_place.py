@@ -213,12 +213,18 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
             )
 
         # Reload now that you're authenticated so the app issues the ctx- requests
-        # we capture (and re-checks user-context).
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        for _ in range(25):
+        # we capture. The betting context lags login — a REFRESH syncs ctx- into
+        # the betting layer (operator-confirmed). Refresh up to 3x until a ctx-
+        # request appears.
+        for attempt in range(3):
+            await page.reload(wait_until="networkidle", timeout=60000)
+            for _ in range(10):
+                if "headers" in captured:
+                    break
+                await asyncio.sleep(1)
             if "headers" in captured:
                 break
-            await asyncio.sleep(1)
+            print(f"  ctx- not synced yet (refresh {attempt + 1}/3) — refreshing again…")
         if "headers" not in captured:
             print(
                 "\n=== RESULT ===\naccepted=False  detail: authenticated context (ctx-) "
@@ -240,18 +246,24 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
         )
         print(f"  authenticated context: {headers['x-sb-user-context-id'][:28]}…")
         body = placers.build_betsson_request([(args.selection, f"{args.odds:.2f}")], args.stake)
-        # The real coupon carries `updateSources` (price/status provenance the app
-        # generates client-side). Its absence is the only structural diff from a
-        # working coupon and the likely cause of E_BETTING_COUPON_GENERAL. The
-        # market id is the selection id minus the "s-" prefix and outcome suffix;
-        # the status token is a client-generated "api: <uuid>" (one uuid for all).
+        # `updateSources` pins the coupon to a price/status feed version (its
+        # absence/wrong-shape → E_BETTING_COUPON_GENERAL). Structure matches the
+        # captured working coupon EXACTLY: odds{selections,latestRt:"rt:<uuid>"} +
+        # statuses{selections,markets:"api:<uuid>"}. The uuids are the live feed
+        # versions; here we send fabricated ones — a decisive test of whether
+        # acceptOddsChanges:true makes the server tolerate any token (→ trivial
+        # determinism) or whether it validates the real rtf-feed value.
         market_id = args.selection[2:].rsplit("-", 1)[0]
-        feed_tag = f"api: {uuid.uuid4()}"
+        rt_tag = f"rt: {uuid.uuid4()}"
+        api_tag = f"api: {uuid.uuid4()}"
         body["updateSources"] = {
-            "prices": {args.selection: ""},
+            "odds": {
+                "selections": {args.selection: rt_tag},
+                "latestRt": {args.selection: rt_tag},
+            },
             "statuses": {
-                "selections": {args.selection: feed_tag},
-                "markets": {market_id: feed_tag},
+                "selections": {args.selection: api_tag},
+                "markets": {market_id: api_tag},
             },
         }
         raw = await page.evaluate(
