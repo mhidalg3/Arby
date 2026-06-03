@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sys
 import uuid
 from collections import defaultdict
+from pathlib import Path
 
 import httpx
 
@@ -39,6 +41,7 @@ from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
 
 TRIAL_HARD_CAP_ARS = 300.0  # a bug cannot bet more than this in trial mode
+REPO_ROOT_ARTIFACTS = Path(__file__).resolve().parent.parent / "recon" / "artifacts"
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -271,9 +274,87 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
         await pw.stop()
 
 
+async def _capture_betsson_ui(args: argparse.Namespace) -> None:
+    """Operator places ONE bet through the app's own UI; we intercept the exact
+    coupon request + response. Sidesteps all our auth/ctx-/updateSources detection
+    (the app builds a perfect request), gets the first real bet down, and captures
+    the working request as a template for the deterministic path. The captured
+    body is saved with the sessiontoken redacted."""
+    import time as _time  # noqa: PLC0415
+
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from scripts.recon.stealth import apply_stealth  # noqa: PLC0415
+
+    url = f"https://pba.betsson.bet.ar/apuestas-deportivas/{args.slug}"
+    print(f"⚠️  CAPTURE MODE on betsson — you place via the app; I record it.\n  event: {url}")
+    cap: dict[str, object] = {}
+
+    def on_request(req: object) -> None:
+        r = req
+        if r.method == "POST" and "/api/sb/v2/coupons" in r.url:  # type: ignore[attr-defined]
+            cap["req_headers"] = dict(r.headers)  # type: ignore[attr-defined]
+            cap["req_body"] = r.post_data  # type: ignore[attr-defined]
+
+    async def on_response(resp: object) -> None:
+        r = resp
+        if "/api/sb/v2/coupons" in r.url and r.request.method == "POST":  # type: ignore[attr-defined]
+            with contextlib.suppress(Exception):
+                cap["resp"] = (r.status, await r.text())  # type: ignore[attr-defined]
+
+    pw = await async_playwright().start()
+    ctx = await pw.chromium.launch_persistent_context(
+        user_data_dir="recon/profile/betsson",
+        headless=False,
+        channel="chrome",
+        locale="es-AR",
+        timezone_id="America/Argentina/Buenos_Aires",
+        permissions=["geolocation"],
+        geolocation={"latitude": -34.9215, "longitude": -57.9545},
+    )
+    try:
+        await apply_stealth(ctx)
+        ctx.on("request", on_request)
+        ctx.on("response", on_response)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=60000)
+        print(
+            "\n  ▶ In the app: log in (stay on PBA), add a selection to the betslip, "
+            "enter your stake, and click APOSTAR.\n  Waiting up to 5 min for your bet…"
+        )
+        for _ in range(150):
+            if "resp" in cap:
+                break
+            await asyncio.sleep(2)
+        if "resp" not in cap:
+            print("\n=== RESULT ===\nno coupon POST observed (no bet placed in the window)")
+            return
+        status, text = cap["resp"]  # type: ignore[misc]
+        parsed = json.loads(text) if text else {}
+        res = placers.parse_betsson(parsed if isinstance(parsed, dict) else {})
+        print(
+            f"\n=== RESULT (placed via app UI) ===\nHTTP {status}  "
+            f"accepted={res.accepted}  ref={res.ref!r}\ndetail: {res.detail or text[:300]}"
+        )
+        # Save the exact working request as a template (redact the sessiontoken).
+        hdrs = dict(cap.get("req_headers", {}))  # type: ignore[arg-type]
+        if "sessiontoken" in hdrs:
+            hdrs["sessiontoken"] = "[REDACTED]"
+        out = REPO_ROOT_ARTIFACTS / f"betsson_coupon_capture_{int(_time.time())}.json"
+        out.write_text(json.dumps({"headers": hdrs, "body": cap.get("req_body")}, indent=2))
+        print(f"\n  captured the app's exact coupon request → {out}")
+        print("  (compare its `updateSources` + headers to our builder to finalize determinism)")
+    finally:
+        await ctx.close()
+        await pw.stop()
+
+
 async def _arm_and_send(args: argparse.Namespace) -> None:
     if args.stake > TRIAL_HARD_CAP_ARS:
         sys.exit(f"REFUSED: stake {args.stake} > trial hard cap {TRIAL_HARD_CAP_ARS} ARS")
+    if args.capture_ui and args.platform == "betsson":
+        await _capture_betsson_ui(args)
+        return
     if args.platform == "betsson":
         await _arm_betsson(args)
         return
@@ -308,6 +389,11 @@ def main() -> None:
     p.add_argument("--stake", type=float, default=50.0)
     p.add_argument("--arm", action="store_true", help="actually send (real money)")
     p.add_argument("--yes-real-money", action="store_true", help="required alongside --arm")
+    p.add_argument(
+        "--capture-ui",
+        action="store_true",
+        help="betsson: operator places via the app UI; intercept the exact request",
+    )
     args = p.parse_args()
 
     if args.discover:
@@ -315,12 +401,16 @@ def main() -> None:
     elif args.arm:
         if not args.yes_real_money:
             sys.exit("REFUSED: --arm requires --yes-real-money")
-        if not args.selection or not args.odds:
-            sys.exit("REFUSED: --arm needs --selection and --odds")
-        if args.platform == "betsson" and not args.slug:
-            sys.exit("REFUSED: betsson --arm needs --slug (from --discover)")
-        if args.platform == "betano" and not args.event_id:
-            sys.exit("REFUSED: betano --arm needs --event-id (from --discover)")
+        if args.capture_ui:
+            if args.platform != "betsson" or not args.slug:
+                sys.exit("REFUSED: --capture-ui is betsson-only and needs --slug")
+        else:
+            if not args.selection or not args.odds:
+                sys.exit("REFUSED: --arm needs --selection and --odds")
+            if args.platform == "betsson" and not args.slug:
+                sys.exit("REFUSED: betsson --arm needs --slug (from --discover)")
+            if args.platform == "betano" and not args.event_id:
+                sys.exit("REFUSED: betano --arm needs --event-id (from --discover)")
         asyncio.run(_arm_and_send(args))
     else:
         if not args.selection or not args.odds:
