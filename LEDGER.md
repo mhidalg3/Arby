@@ -1,5 +1,31 @@
 # Project Ledger
 
+## 2026-06-03 — OBSERVATION: geolocation pin controls Betsson jurisdiction (cross-region arb lead)
+
+**Context:** Hit a bug where the trial routed to the CABA jurisdiction despite the
+operator being in PBA. Root cause: the Playwright `geolocation` pin **overrides the
+real device GPS**, and Betsson (OBG) selects the jurisdiction/offering from that
+coordinate — CABA city-center coords → CABA site; La Plata coords → PBA (Iplyc,
+`pba.betsson.bet.ar`). Fixed the pin to La Plata.
+
+**Opportunity (unvalidated):** because we *control* the reported location, one
+machine can present as any Argentine jurisdiction (PBA, CABA, and presumably
+Córdoba/Mendoza/etc. — each has its own OBG subdomain + `x-sb-jurisdiction`).
+Different jurisdictions can run **different odds/lines and promos** on the same
+match → a potential **intra-Betsson cross-region arbitrage** surface, in addition
+to the cross-bookmaker arbs we already target. The scraper already parameterizes
+`subdomain`/jurisdiction, so multi-region odds capture is cheap to try.
+
+**Hard constraint:** **accounts appear region-bound** — an account registered in
+one jurisdiction seems tied to it (a CABA-routed session on a PBA account caused
+auth/jurisdiction mismatch, not a clean cross-region bet). So realizing cross-region
+arb would require a **separate funded account per jurisdiction**, each with its own
+kept-live session + geolocation pin. Verify the account↔jurisdiction binding before
+investing. See [[betsson-geolocation-check]], [[betsson-auth-session-model]].
+
+**State:** Idea logged, not pursued. Current goal remains the single-region Phase-1
+trial (PBA). Revisit cross-region after we can place reliably in one region.
+
 ## 2026-06-03 — Phase-1 trial attempt #1: Betsson 401, two root causes found
 
 **Context:** First armed real-money send. Built `scripts/trial_place.py` (the
