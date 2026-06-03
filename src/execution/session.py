@@ -67,10 +67,16 @@ class InSessionTransport:
         *,
         dry_run: bool = True,
         channel: str | None = "chrome",
+        restore_session: bool = False,
     ) -> None:
         self._platform = platform
         self._dry_run = dry_run
         self._channel = channel
+        # Re-injecting saved session-only cookies (a recon-era hack) CONTAMINATES a
+        # live operator login — stale cookies make the app read as not-logged-in so
+        # the authenticated ctx- never resolves. The proven Betsson path uses the
+        # profile's own live session, so default OFF.
+        self._restore_session = restore_session
         self._armed = False
         self._context: Any = None  # playwright BrowserContext, set in __aenter__
         self._page: Any = None
@@ -90,10 +96,9 @@ class InSessionTransport:
     async def __aenter__(self) -> InSessionTransport:
         if self._dry_run:
             return self
-        # Live: launch the logged-in persistent profile + restore the session.
+        # Live: launch the logged-in persistent profile.
         from playwright.async_api import async_playwright
 
-        from scripts.recon.recon import _restore_session  # session-cookie re-inject
         from scripts.recon.stealth import apply_stealth
 
         self._pw = await async_playwright().start()
@@ -115,7 +120,10 @@ class InSessionTransport:
         # Capture the authenticated context header set (Betsson `ctx-`); harmless
         # for platforms that never send it.
         self._context.on("request", self._on_request)
-        await _restore_session(self._context, self._platform)
+        if self._restore_session:
+            from scripts.recon.recon import _restore_session  # session-cookie re-inject
+
+            await _restore_session(self._context, self._platform)
         self._page = (
             self._context.pages[0] if self._context.pages else await self._context.new_page()
         )
