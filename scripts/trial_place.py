@@ -34,7 +34,7 @@ import httpx
 
 from src.execution import placers
 from src.execution.executor import Leg
-from src.execution.leg_placer import BetanoLegPlacer
+from src.execution.leg_placer import BetanoLegPlacer, BetssonLegPlacer
 from src.execution.session import InSessionTransport
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
@@ -341,11 +341,48 @@ async def _capture_betsson_ui(args: argparse.Namespace) -> None:
         await pw.stop()
 
 
+async def _revalidate_betsson(args: argparse.Namespace) -> None:
+    """Live re-validate the PRODUCTION path: `InSessionTransport` +
+    `BetssonLegPlacer` (which calls `prepare_betsson_context`), not the trial's
+    inline recipe. Operator logs in in the window, presses ENTER, then the
+    production placer navigates/refresh-syncs/captures/posts on its own."""
+    leg = Leg(
+        platform="betsson-pba",
+        match_id="trial",
+        market="1X2",
+        outcome=args.outcome,
+        stake_ars=args.stake,
+        odds=args.odds,
+        platform_outcome_id=args.selection,
+        platform_event_ref=args.slug,
+    )
+    print(f"⚠️  LIVE (via production BetssonLegPlacer): real {args.stake} ARS — watch the browser.")
+    transport = InSessionTransport("betsson", dry_run=False)
+    async with transport:
+        transport.arm()
+        await transport.goto("https://pba.betsson.bet.ar/apuestas-deportivas")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            input,
+            "\n  ▶ LOG IN in the window (stay on PBA). When logged in, press ENTER — the "
+            "production placer will then navigate, refresh-sync ctx-, and place… ",
+        )
+        res = await BetssonLegPlacer(transport).place(leg)
+    print(
+        f"\n=== RESULT (production path) ===\naccepted={res.accepted}  ref={res.ref!r}\n"
+        f"detail: {res.detail}"
+    )
+
+
 async def _arm_and_send(args: argparse.Namespace) -> None:
     if args.stake > TRIAL_HARD_CAP_ARS:
         sys.exit(f"REFUSED: stake {args.stake} > trial hard cap {TRIAL_HARD_CAP_ARS} ARS")
     if args.capture_ui and args.platform == "betsson":
         await _capture_betsson_ui(args)
+        return
+    if args.via_placer and args.platform == "betsson":
+        await _revalidate_betsson(args)
         return
     if args.platform == "betsson":
         await _arm_betsson(args)
@@ -385,6 +422,11 @@ def main() -> None:
         "--capture-ui",
         action="store_true",
         help="betsson: operator places via the app UI; intercept the exact request",
+    )
+    p.add_argument(
+        "--via-placer",
+        action="store_true",
+        help="betsson: place through the production BetssonLegPlacer + transport",
     )
     args = p.parse_args()
 
