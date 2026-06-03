@@ -130,14 +130,24 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
     print(f"⚠️  LIVE: real {args.stake} ARS on betsson — watch the browser.\n  event: {url}")
     captured: dict[str, dict[str, str]] = {}
 
+    state: dict[str, bool] = {}  # login flag, read from the app's own user-context call
+
     def on_request(req: Request) -> None:
-        # Capture the authenticated (ctx-) header set when it appears; meanwhile
-        # keep the anonymous (stc-) set, which we use to query login state.
-        h = req.headers
-        if h.get("x-sb-user-context-id", "").startswith("ctx-"):
-            captured["headers"] = dict(h)
-        elif h.get("x-sb-static-context-id"):
-            captured["stc"] = dict(h)
+        # Capture the authenticated (ctx-) header set the app uses once logged in.
+        if req.headers.get("x-sb-user-context-id", "").startswith("ctx-"):
+            captured["headers"] = dict(req.headers)
+
+    async def on_response(resp: object) -> None:
+        # Source of truth for login: the app's OWN user-context response. (A
+        # reconstructed call is unreliable — these auth via cookie, not the token
+        # header.)
+        r = resp  # playwright Response
+        if "/sb/fe-api/v1/user-context" in r.url:  # type: ignore[attr-defined]
+            try:
+                j = await r.json()  # type: ignore[attr-defined]
+                state["logged_in"] = bool(j.get("userContext", {}).get("isLoggedIn"))
+            except Exception:  # noqa: BLE001 — non-JSON/aborted responses are ignorable
+                pass
 
     pw = await async_playwright().start()
     ctx = await pw.chromium.launch_persistent_context(
@@ -155,7 +165,9 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
         await apply_stealth(ctx)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         page.on("request", on_request)
+        page.on("response", on_response)
         await page.goto(url, wait_until="networkidle", timeout=60000)
+        await asyncio.sleep(3)
 
         drop = {
             ":authority",
@@ -167,56 +179,29 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
             "accept-encoding",
         }
 
-        # We need the anonymous stc- header set to query login state.
-        for _ in range(15):
-            if "stc" in captured:
-                break
-            await asyncio.sleep(1)
-
-        async def logged_in() -> bool:
-            """True only when the SERVER says the session is authenticated — a
-            fresh anonymous (post-logout) token reports isLoggedIn:false. Use the
-            CURRENT localStorage token (login mints a new one; the captured stc-
-            set carries the stale pre-login token)."""
-            if "stc" not in captured:
-                return False
-            hdrs = {k: v for k, v in captured["stc"].items() if k not in drop}
-            tok = await page.evaluate(
-                "JSON.parse(localStorage.getItem('session')||'{}').token || ''"
-            )
-            if tok:
-                hdrs["sessiontoken"] = tok
-            return bool(
-                await page.evaluate(
-                    """async (h) => { try {
-                        const x = await fetch('/sb/fe-api/v1/user-context',
-                            {credentials:'include', headers:h});
-                        const j = await x.json();
-                        return !!(j.userContext && j.userContext.isLoggedIn);
-                    } catch (e) { return false; } }""",
-                    hdrs,
-                )
-            )
-
-        if not await logged_in():
+        # Wait (up to ~3 min) for the app's OWN user-context call to report logged
+        # in. If not yet, the operator logs in in the window; reload each cycle so
+        # the app re-issues user-context with the current session.
+        if not state.get("logged_in"):
             print(
                 "  NOT logged in — complete LOG IN in the browser window (stay on PBA); "
                 "waiting up to 180s…"
             )
-        for _ in range(180):
-            if await logged_in():
+        for _ in range(18):
+            if state.get("logged_in"):
                 break
-            await asyncio.sleep(1)
-        if not await logged_in():
+            await asyncio.sleep(10)
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+        if not state.get("logged_in"):
             print(
                 "\n=== RESULT ===\naccepted=False  detail: not logged in "
                 "(login not completed in the window)"
             )
             return
 
-        # Logged in — reload so the app resolves + uses the authenticated ctx- context.
-        print("  logged in ✓ — resolving authenticated context…")
-        await page.goto(url, wait_until="networkidle", timeout=60000)
+        # Logged in — the app already uses the authenticated ctx- on navigation;
+        # the last reload's requests carry it. Wait for the captured header set.
+        print("  logged in ✓ — capturing authenticated context…")
         for _ in range(25):
             if "headers" in captured:
                 break
