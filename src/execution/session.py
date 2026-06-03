@@ -97,10 +97,12 @@ class InSessionTransport:
             locale="es-AR",
             timezone_id="America/Argentina/Buenos_Aires",
             # Betsson (and possibly others) validate region via the browser
-            # geolocation prompt. Grant it + pin a Buenos Aires coordinate so the
-            # session reads as in-jurisdiction rather than hanging on a prompt.
+            # geolocation prompt. Grant it + pin a coordinate INSIDE Provincia de
+            # Buenos Aires — La Plata, the provincial capital — so it routes to
+            # the PBA (Iplyc) jurisdiction. NOTE: CABA city-center coords
+            # (-34.60, -58.38) route to the CABA jurisdiction instead; PBA ≠ the city.
             permissions=["geolocation"],
-            geolocation={"latitude": -34.6037, "longitude": -58.3816},
+            geolocation={"latitude": -34.9215, "longitude": -57.9545},
         )
         await apply_stealth(self._context)
         await _restore_session(self._context, self._platform)

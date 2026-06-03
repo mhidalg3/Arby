@@ -145,7 +145,9 @@ async def _arm_betsson(args: argparse.Namespace) -> None:
         locale="es-AR",
         timezone_id="America/Argentina/Buenos_Aires",
         permissions=["geolocation"],
-        geolocation={"latitude": -34.6037, "longitude": -58.3816},
+        # La Plata (PBA provincial capital) → routes to the PBA/Iplyc jurisdiction.
+        # CABA city-center coords would route to the CABA jurisdiction instead.
+        geolocation={"latitude": -34.9215, "longitude": -57.9545},
     )
     try:
         await apply_stealth(ctx)
