@@ -191,9 +191,20 @@ def _betano_fill(slip: dict[str, Any], stake_ars: float) -> dict[str, Any]:
 
 
 def build_betano_updatebets(slip: dict[str, Any], stake_ars: float) -> dict[str, Any]:
-    """Betano `PATCH /api/betslip/v3/updatebets` — sets the stake; the response
-    returns the refreshed ``hash`` the place call must use."""
-    return {"betslip": _betano_fill(slip, stake_ars)}
+    """Betano `PATCH /api/betslip/v3/updatebets`. The body carries a TOP-LEVEL
+    ``bets`` array — the bets with the desired ``amount`` set and ``returns`` left
+    0 (the server computes it) — ALONGSIDE the current (unfilled, amount=0)
+    ``betslip``. The response returns the refreshed ``hash`` + the filled,
+    limit-checked slip the place call uses. (Sending only ``betslip`` → 400.)"""
+    top_bets: list[dict[str, Any]] = []
+    for bet in slip.get("bets", []):
+        if not isinstance(bet, dict):
+            continue
+        b = copy.deepcopy(bet)
+        b["amount"] = stake_ars
+        b["returns"] = 0
+        top_bets.append(b)
+    return {"bets": top_bets, "betslip": copy.deepcopy(slip)}
 
 
 def build_betano_request(slip_state: dict[str, Any], stake_ars: float) -> dict[str, Any]:
@@ -226,7 +237,14 @@ def parse_betano(resp: dict[str, Any]) -> PlacementResult:
     """``{"data":{"accepted":true,"receipts":[{"betId","totalAmount","totalOdds"}]}}``"""
     data = _d(resp.get("data"))
     if data.get("accepted") is not True:
-        return PlacementResult(accepted=False, detail="betano: not accepted")
+        # Surface WHY: Betano puts rejection reasons in data.errors (and the place
+        # body sends oddschanges:"0", so odds drift is a common cause).
+        errors = data.get("errors") or resp.get("errors") or data.get("errorMessages")
+        return PlacementResult(
+            accepted=False,
+            detail=f"betano: not accepted (errors={errors!r}; "
+            f"data_keys={sorted(data.keys())}; top_keys={sorted(resp.keys())})",
+        )
     receipt = _first(data.get("receipts"))
     return PlacementResult(
         accepted=True,

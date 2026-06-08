@@ -1,0 +1,66 @@
+"""Bridge: a detected (and risk-approved) arbitrage opportunity → the Executor.
+
+The detector (`src/arbitrage`) emits an `ArbitrageOpportunity` carrying the legs
+(`OddsQuote`s) and their sized `stakes`; the risk layer (`src/risk`) approves it.
+This module maps each quote to an execution `Leg` and drives
+`Executor.execute_two_leg`. It does NOT decide profitability or sizing — that's
+already done; it only translates and sequences.
+
+Field mapping (`OddsQuote` → `Leg`):
+- ``platform``             → ``platform``       (routing key for the placers map)
+- ``market_id``            → ``market`` and the canonical ``match_id`` (shared by
+                             both legs, so per-match exposure counts them together)
+- ``outcome``              → ``outcome``
+- ``decimal_odds``         → ``odds``
+- (opportunity ``stakes``) → ``stake_ars``
+- ``platform_outcome_id``  → ``platform_outcome_id``  (the selection ref)
+- ``platform_event_id``    → ``platform_event_ref``   (Betano's eventId; Betsson ignores it)
+- ``max_stake``            → ``live_max_stake_ars``    (resolves the dynamic-cap guard)
+"""
+
+from __future__ import annotations
+
+from src.arbitrage.dutch_book import ArbitrageOpportunity
+from src.arbitrage.quotes import OddsQuote
+from src.execution.executor import ExecutionResult, Executor, Leg
+
+
+def leg_from_quote(quote: OddsQuote, stake_ars: float, *, match_id: str) -> Leg:
+    """Translate one sized `OddsQuote` into an execution `Leg`."""
+    return Leg(
+        platform=quote.platform,
+        match_id=match_id,
+        market=quote.market_id,
+        outcome=quote.outcome,
+        stake_ars=stake_ars,
+        odds=quote.decimal_odds,
+        platform_outcome_id=quote.platform_outcome_id or "",
+        platform_event_ref=quote.platform_event_id or "",
+        live_max_stake_ars=quote.max_stake,
+    )
+
+
+def legs_from_opportunity(opp: ArbitrageOpportunity) -> list[Leg]:
+    """Map an opportunity's quotes+stakes to legs, sharing a canonical match_id
+    (the common ``market_id``) so the guardrails track both against one match."""
+    if len(opp.legs) != len(opp.stakes):
+        raise ValueError(f"legs/stakes length mismatch: {len(opp.legs)} vs {len(opp.stakes)}")
+    match_id = opp.legs[0].market_id if opp.legs else ""
+    return [
+        leg_from_quote(q, s, match_id=match_id)
+        for q, s in zip(opp.legs, opp.stakes, strict=True)
+    ]
+
+
+async def execute_opportunity(
+    executor: Executor, opp: ArbitrageOpportunity, *, opp_id: str
+) -> ExecutionResult:
+    """Execute a two-leg approved opportunity through the Executor. The risk
+    layer must have APPROVED it already; this only places.
+
+    Raises ValueError for non-two-leg opportunities (the Executor's state machine
+    is two-leg; N-way arbs are a future extension)."""
+    legs = legs_from_opportunity(opp)
+    if len(legs) != 2:
+        raise ValueError(f"execute_opportunity handles two-leg arbs only; got {len(legs)}")
+    return await executor.execute_two_leg(opp_id, legs[0], legs[1])

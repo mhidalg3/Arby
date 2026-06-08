@@ -130,7 +130,10 @@ class InSessionTransport:
         return self
 
     def _on_request(self, req: Any) -> None:
-        if req.headers.get("x-sb-user-context-id", "").startswith("ctx-"):
+        # Capture ONLY from /api/sb/ requests: those carry the full coupons-compatible
+        # header set (brandid/marketcode/x-sb-type). /sb/fe-api/ requests also bear a
+        # ctx- but lack those → replaying them 400s (E_VALIDATION_INVALIDHEADER).
+        if "/api/sb/" in req.url and req.headers.get("x-sb-user-context-id", "").startswith("ctx-"):
             self._captured_ctx = dict(req.headers)
 
     async def __aexit__(self, *exc: object) -> None:
@@ -191,6 +194,12 @@ class InSessionTransport:
             raise TransportError(
                 f"transport not armed for live send (dry_run={self._dry_run}, armed={self._armed})"
             )
+        # A browser fetch with a body but no content-type defaults to text/plain →
+        # JSON APIs answer 415. Default to application/json for JSON bodies (callers
+        # can override).
+        final_headers = dict(headers or {})
+        if json_body is not None and not any(k.lower() == "content-type" for k in final_headers):
+            final_headers["content-type"] = "application/json"
         # Execute the request inside the page context — inherits cookies/fingerprint.
         result = await self._page.evaluate(
             """async ({method, url, body, headers}) => {
@@ -201,7 +210,7 @@ class InSessionTransport:
                 });
                 return {status: resp.status, text: await resp.text()};
             }""",
-            {"method": method, "url": url, "body": json_body, "headers": headers or {}},
+            {"method": method, "url": url, "body": json_body, "headers": final_headers},
         )
         status = int(result["status"])
         try:

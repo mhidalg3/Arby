@@ -187,3 +187,33 @@ async def test_kill_switch_blocks_execution() -> None:
     )
     assert res.outcome is ExecutionOutcome.ABORTED
     assert placer.calls == 0
+
+
+async def test_routes_each_leg_to_its_platform_placer() -> None:
+    # Cross-platform arb: each leg must go to its own platform's placer.
+    g, n = _guard(), _FakeNotifier()
+    pa, pb = _CountingPlacer(), _CountingPlacer()
+    leg_a, leg_b = _legs()  # betsson, betwarrior
+    res = await Executor(
+        guardrails=g,
+        notifier=n,
+        recovery=_FakeRecovery(),
+        placers={"betsson": pa, "betwarrior": pb},
+    ).execute_two_leg("opp", leg_a, leg_b)
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert pa.calls == 1 and pb.calls == 1  # each placer handled exactly its own leg
+
+
+async def test_aborts_when_a_platform_has_no_placer() -> None:
+    # Missing placer for one leg → abort before placing anything (no naked leg).
+    g, n = _guard(), _FakeNotifier()
+    pa = _CountingPlacer()
+    leg_a, leg_b = _legs()  # betsson, betwarrior
+    res = await Executor(
+        guardrails=g,
+        notifier=n,
+        recovery=_FakeRecovery(),
+        placers={"betsson": pa},  # no betwarrior placer
+    ).execute_two_leg("opp", leg_a, leg_b)
+    assert res.outcome is ExecutionOutcome.ABORTED and "no placer" in res.reason
+    assert pa.calls == 0  # nothing placed

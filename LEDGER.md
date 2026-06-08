@@ -1,5 +1,88 @@
 # Project Ledger
 
+## 2026-06-08 — Detector→executor bridge + full-chain two-leg robustness test
+
+**Context:** Started #2 (connect detection to execution) and hardened the two-leg
+system beyond the single live win.
+
+**Robustness:** added `tests/unit/test_two_leg_integration.py` — the real `Executor`
+wired to the real `BetssonLegPlacer`/`BetanoLegPlacer` over fake transports, pinning
+COMPLETED, NAKED_EXPOSURE (Betano rejected after Betsson fills → operator alerted,
+Leg-A-only exposure), and ABORTED (Betsson rejected → Betano untouched). This covers
+the executor↔placer SEAM the unit tests tested only separately (and would catch the
+Betsson stake_filled=0 exposure bug).
+
+**Bridge (`src/execution/arb_executor.py`):** maps a risk-APPROVED
+`ArbitrageOpportunity` (legs=`OddsQuote`s + sized `stakes`) to execution `Leg`s and
+drives `Executor.execute_two_leg`. Key mappings: `OddsQuote.max_stake` →
+`live_max_stake_ars` (auto-resolves Betano's dynamic-cap guard — no more hand-feeding
+`--betano-max-stake`); `platform_event_id` → `platform_event_ref` (Betano eventId);
+shared `market_id` → a canonical `match_id` both legs share (per-match exposure counts
+them together). `BetanoLegPlacer` now reads eventId from `platform_event_ref` (falling
+back to `match_id`), freeing `match_id` for the canonical id. Two-leg only for now.
+
+**State:** detection (`detect_arbitrage`) + risk eval + sizing already existed; the
+bridge connects an approved opportunity to live placement. 561 tests, mypy/ruff clean.
+**Next:** the live wiring — quote stream → detect → risk → bridge → Executor with the
+two live transports (the orchestration loop), plus pulling Betano `max_stake` into the
+quotes so the cap resolves end-to-end.
+
+
+## 2026-06-08 — MILESTONE: live cross-platform TWO-LEG execution completed
+
+**Context:** `scripts/trial_place.py --two-leg` drove the production `Executor`
+across two concurrent live transports and **placed both legs** — Betsson Leg A
+(couponId 179820354251051008) + Betano Leg B (betId 20017235233, 50 @ 1.30),
+`outcome=COMPLETED`. The two-leg arb execution path works end-to-end: per-platform
+placer routing, sequential place-A → re-verify-B → place-B, exposure recording.
+(Mechanics test, not a verified arb.)
+
+**Safety paths validated live along the way (each aborted cleanly, zero/!naked):**
+- Guardrail fail-closed on Betano's unresolved dynamic stake cap → ABORTED, nothing
+  placed.
+- Leg A (Betsson) rejected → ABORTED before Leg B (no naked exposure).
+
+**Bugs fixed during two-leg bring-up:**
+- **Betsson HTTP 400 (E_VALIDATION_INVALIDHEADER)** — `prepare_betsson_context`
+  captured the live header set off whatever `ctx-` request fired last; `/sb/fe-api/`
+  requests bear a `ctx-` but lack `brandid`/`marketcode`/`x-sb-type` → coupons 400.
+  Fixed: capture only from `/api/sb/` requests AND merge the known-required constant
+  headers under the captured context. (Single-leg "worked" by luck of capture timing.)
+- **Betsson exposure under-count** — its coupon response echoes no stake/odds, so
+  `stake_filled=0` → the executor recorded 0 exposure. Fixed: fall back to the
+  requested stake/odds when the book doesn't echo them.
+
+**State:** Betsson + Betano place individually AND as a routed two-leg through the
+`Executor` with guardrails. 553 tests green. Remaining toward a *real* arb: query
+Betano's live `/api/betslipcombo/limits` (the dynamic cap, hand-fed in the test);
+connect detector→sizer→executor; automate Betsson's one in-app nav click. See
+[[betsson-auth-session-model]].
+
+## 2026-06-03 — MILESTONE: Betano placement live-validated (2nd platform)
+
+**Context:** Betano placed live through the production `BetanoLegPlacer` +
+`InSessionTransport` — `accepted=True, betId 20016279833, stake 100 @ 1.29`
+(Panamá). Two platforms now place autonomously (Betsson + Betano) → the basis for a
+real two-leg arb. Betano is cookie-authed (no Betsson-style `ctx-`/SPA dance); an
+operator login pause covers the stale session.
+
+**Bugs found + fixed during the live bring-up:**
+- **HTTP 415 on plain-leg** — the in-page fetch sent the JSON body with no
+  content-type (browser default text/plain). Fixed at the transport: default
+  `content-type: application/json` for JSON bodies.
+- **`updatebets` 400 → empty slip → place `bets=[]` → E0066** — the misleading
+  `MaxNetProfitOverOneCentValidator` error was actually a *naked slip*. Root cause:
+  `updatebets` needs a **top-level `bets` array** (bet with `amount` set,
+  `returns:0`) ALONGSIDE the unfilled `betslip`; we sent only `betslip`.
+  `build_betano_updatebets` now emits both. Added guards: fail clearly if plain-leg
+  adds no bet or updatebets returns no slip (never place a naked slip).
+- Odds drifted 1.30→1.29 and Betano accepted it (the updatebets slip carried the
+  live price), despite `oddschanges:"0"` — placing at current price is fine.
+
+**State:** Betsson + Betano placement both production-validated. **Next:** wire the
+two-leg arb — adapt the `Executor` to route each leg to its platform's placer (it
+currently takes a single placer), and drive two concurrent transports.
+
 ## 2026-06-03 — Betsson betting-context model corrected: in-app nav establishes it, reload destroys it
 
 **Context:** The production re-validate (`--via-placer`) failed with "ctx- not

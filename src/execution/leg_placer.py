@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any, Protocol
 
 import structlog
@@ -32,6 +33,14 @@ from src.execution.session import Transport, TransportError
 log = structlog.get_logger(__name__)
 
 _BETSSON_PLACE_URL = "https://pba.betsson.bet.ar/api/sb/v2/coupons"
+# Headers the coupons POST always needs; merged UNDER the captured live context so
+# the placer never depends on which request we captured the context from.
+_BETSSON_REQUIRED_HEADERS = {
+    "brandid": "238cb63a-3dcc-4fdf-b241-23a12cb71aa7",
+    "marketcode": "ag",
+    "x-sb-type": "b2b",
+    "x-sb-jurisdiction": "Iplyc",
+}
 _BETWARRIOR_PLACE_URL = "https://cf-al-auth-api.kambicdn.com/player/api/v2019/bwargbap/coupon.json"
 _BETANO_BASE = "https://www.betano.bet.ar/api/betslip/v3"
 _BPLAY_BASE = "https://ws-deportespba.bplay.bet.ar"
@@ -82,6 +91,7 @@ class BetssonLegPlacer:
                 detail="betsson: authenticated context not resolved (login + in-app nav?)",
             )
         headers = {
+            **_BETSSON_REQUIRED_HEADERS,
             **ctx_headers,
             "content-type": "application/json",
             "x-sb-identifier": "BETSLIP_SUBMIT_COUPONS_REQUEST",
@@ -97,8 +107,13 @@ class BetssonLegPlacer:
             self._log.warning("leg_placer.transport_error", error=str(exc))
             return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
         if status >= 400:
-            return PlacementResult(accepted=False, detail=f"HTTP {status}")
-        return placers.parse_betsson(resp)
+            return PlacementResult(accepted=False, detail=f"HTTP {status}: {str(resp)[:200]}")
+        result = placers.parse_betsson(resp)
+        if result.accepted and result.stake_filled == 0.0:
+            # Betsson's coupon response doesn't echo stake/odds — fall back to the
+            # requested values so the executor records exposure correctly.
+            return replace(result, stake_filled=leg.stake_ars, odds_filled=leg.odds)
+        return result
 
 
 class BetWarriorLegPlacer:
@@ -140,9 +155,10 @@ def _data_envelope(resp: dict[str, object]) -> dict[str, object]:
 class BetanoLegPlacer:
     """Betano (Kaizen) — stateful: plain-leg → updatebets → place.
 
-    Maps ``leg.match_id`` → eventId and ``leg.platform_outcome_id`` →
-    selectionId. updatebets refreshes the ``hash`` that the place call must use,
-    so the slip is rebuilt from each response before the next call.
+    eventId = ``leg.platform_event_ref`` (falling back to ``leg.match_id`` so
+    `match_id` can carry a canonical cross-platform id for exposure tracking);
+    selectionId = ``leg.platform_outcome_id``. updatebets refreshes the ``hash``
+    the place call must use, so the slip is rebuilt from each response.
     """
 
     platform = "betano-pba"
@@ -152,15 +168,18 @@ class BetanoLegPlacer:
         self._log = log.bind(component="leg_placer", platform=self.platform)
 
     async def place(self, leg: Leg) -> PlacementResult:
+        event_id = leg.platform_event_ref or leg.match_id
         try:
             status, resp = await self._t.fetch(
                 "POST",
                 f"{_BETANO_BASE}/plain-leg/",
-                json_body=placers.build_betano_plain_leg(leg.platform_outcome_id, leg.match_id),
+                json_body=placers.build_betano_plain_leg(leg.platform_outcome_id, event_id),
             )
             if status >= 400:
                 return PlacementResult(accepted=False, detail=f"HTTP {status} (plain-leg)")
             slip = placers.betano_slip_from_response(_data_envelope(resp))
+            if not slip.get("bets"):
+                return PlacementResult(accepted=False, detail="betano: plain-leg added no bet")
 
             status, resp = await self._t.fetch(
                 "PATCH",
@@ -170,7 +189,14 @@ class BetanoLegPlacer:
             if status >= 400:
                 return PlacementResult(accepted=False, detail=f"HTTP {status} (updatebets)")
             slip = placers.betano_slip_from_response(_data_envelope(resp))
-
+            if not slip.get("bets"):
+                # updatebets rejected the body (e.g. 400 → empty data); don't place a naked slip.
+                return PlacementResult(
+                    accepted=False,
+                    detail=f"betano: updatebets returned no slip "
+                    f"(errorCode={resp.get('errorCode')}, errors={resp.get('errors')})",
+                )
+            self._log.info("betano.placing", stake=leg.stake_ars, odds=leg.odds)
             status, resp = await self._t.fetch(
                 "POST",
                 f"{_BETANO_BASE}/place",

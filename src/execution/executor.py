@@ -23,7 +23,7 @@ placer slots in once the placement contract is captured.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -119,18 +119,28 @@ class Executor:
         guardrails: Guardrails,
         notifier: Notifier,
         recovery: RecoveryHandler,
-        placer: LegPlacer,
+        placer: LegPlacer | None = None,
+        placers: Mapping[str, LegPlacer] | None = None,
         reverify: Callable[[Leg], Awaitable[float]] = _no_reverify,
         dry_run: bool = True,
     ) -> None:
+        # A cross-platform arb routes each leg to its platform's placer (`placers`
+        # keyed by leg.platform); `placer` is the single-placer fallback (used for
+        # both legs when no per-platform mapping matches).
+        if placer is None and not placers:
+            raise ValueError("Executor needs placer= or placers=")
         self._guardrails = guardrails
         self._notifier = notifier
         self._recovery = recovery
         self._placer = placer
+        self._placers = dict(placers or {})
         self._reverify = reverify
         self._dry_run = dry_run
         self._tag = "[DRY-RUN] " if dry_run else ""
         self._log = log.bind(component="executor", dry_run=dry_run)
+
+    def _placer_for(self, leg: Leg) -> LegPlacer | None:
+        return self._placers.get(leg.platform) or self._placer
 
     async def execute_two_leg(self, opp_id: str, leg_a: Leg, leg_b: Leg) -> ExecutionResult:
         try:
@@ -143,6 +153,14 @@ class Executor:
     async def _run(self, opp_id: str, leg_a: Leg, leg_b: Leg) -> ExecutionResult:
         if self._guardrails.kill_switch_tripped:
             return await self._abort(opp_id, "kill switch tripped")
+
+        # Resolve a placer for each leg up front — abort before placing if either
+        # platform is unwired (never place one leg of an arb we can't complete).
+        placer_a, placer_b = self._placer_for(leg_a), self._placer_for(leg_b)
+        if placer_a is None:
+            return await self._abort(opp_id, f"no placer for leg A platform {leg_a.platform!r}")
+        if placer_b is None:
+            return await self._abort(opp_id, f"no placer for leg B platform {leg_b.platform!r}")
 
         # 1) Pre-check both legs (guardrails) and re-verify both odds — nothing placed yet.
         for label, leg in (("A", leg_a), ("B", leg_b)):
@@ -165,7 +183,7 @@ class Executor:
         await self._notifier.send(
             f"{self._tag}arb {opp_id}: placing Leg A ({leg_a.platform} {leg_a.outcome})"
         )
-        res_a = await self._placer.place(leg_a)
+        res_a = await placer_a.place(leg_a)
         if not res_a.accepted:
             return await self._abort(opp_id, f"Leg A rejected: {res_a.detail}", leg_a=res_a)
         self._guardrails.record_exposure(leg_a.match_id, res_a.stake_filled)
@@ -175,7 +193,7 @@ class Executor:
         current_b = await self._reverify(leg_b)
         if not self._guardrails.odds_still_acceptable(leg_b.odds, current_b):
             return await self._naked(opp_id, f"Leg B odds drifted {leg_b.odds}→{current_b}", res_a)
-        res_b = await self._placer.place(leg_b)
+        res_b = await placer_b.place(leg_b)
         if not res_b.accepted:
             return await self._naked(opp_id, f"Leg B rejected: {res_b.detail}", res_a)
         self._guardrails.record_exposure(leg_b.match_id, res_b.stake_filled)

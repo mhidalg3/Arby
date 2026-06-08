@@ -378,6 +378,116 @@ async def _revalidate_betsson(args: argparse.Namespace) -> None:
     )
 
 
+async def _arm_betano(args: argparse.Namespace) -> None:
+    """Betano (Kaizen) place via the production BetanoLegPlacer + transport.
+    Cookie-authenticated (no Betsson-style ctx-/SPA-context dance expected), but
+    the stored session goes stale, so we pause for an operator login first. The
+    placer runs plain-leg → updatebets → place over the in-session fetch."""
+    leg = _build_leg(args)  # match_id=event_id, platform_outcome_id=selection
+    print(f"⚠️  LIVE (Betano, production placer): real {args.stake} ARS — watch the browser.")
+    transport = InSessionTransport("betano", dry_run=False)
+    async with transport:
+        transport.arm()
+        await transport.goto(_BASE_URL["betano"])  # same-origin so the fetch carries cookies
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            input,
+            "\n  ▶ LOG IN to Betano in the window (complete any anti-bot challenge). When you "
+            "see your balance / logged-in state, press ENTER to place… ",
+        )
+        res = await BetanoLegPlacer(transport).place(leg)
+    print(
+        f"\n=== RESULT (betano) ===\naccepted={res.accepted}  ref={res.ref!r}  "
+        f"stake_filled={res.stake_filled}  odds_filled={res.odds_filled}\ndetail: {res.detail}"
+    )
+
+
+class _PrintNotifier:
+    """Prints the executor's play-by-play to the console (trial visibility)."""
+
+    async def send(self, text: str) -> bool:
+        print(f"  [notify] {text}")
+        return True
+
+
+async def _two_leg(args: argparse.Namespace) -> None:
+    """Live two-leg execution mechanics test: Betsson + Betano on tiny stakes via
+    the production Executor (per-platform placer routing, naked-exposure guards).
+    NOT a verified arb — a small loss is expected; this proves the machinery.
+    Betsson is Leg A (fragile context) so its failure aborts before the Betano leg."""
+    from src.execution.executor import Executor  # noqa: PLC0415
+    from src.execution.guardrails import Guardrails  # noqa: PLC0415
+    from src.execution.recovery import HumanRecoveryHandler  # noqa: PLC0415
+
+    leg_a = Leg(
+        platform="betsson-pba",
+        match_id="2leg-betsson",
+        market="1X2",
+        outcome=args.betsson_outcome,
+        stake_ars=args.stake,
+        odds=args.betsson_odds,
+        platform_outcome_id=args.betsson_selection,
+        platform_event_ref=args.betsson_slug,
+    )
+    leg_b = Leg(
+        platform="betano-pba",
+        match_id=args.betano_event_id,
+        market="1X2",
+        outcome=args.betano_outcome,
+        stake_ars=args.stake,
+        odds=args.betano_odds,
+        platform_outcome_id=args.betano_selection,
+        # Betano's max stake is dynamic; the guardrail fail-closes without a live
+        # limit. Operator-provided stand-in here (real exec queries the limits API).
+        live_max_stake_ars=args.betano_max_stake or None,
+    )
+    print(
+        f"⚠️  LIVE TWO-LEG (mechanics test, NOT a verified arb): real {args.stake} ARS ×2 — "
+        f"Betsson {args.betsson_outcome} @ {args.betsson_odds} + Betano {args.betano_outcome} "
+        f"@ {args.betano_odds}. A small loss is expected."
+    )
+    betsson_t = InSessionTransport("betsson", dry_run=False)
+    betano_t = InSessionTransport("betano", dry_run=False)
+    async with betsson_t, betano_t:
+        betsson_t.arm()
+        betano_t.arm()
+        await betsson_t.goto("https://pba.betsson.bet.ar/apuestas-deportivas")
+        await betano_t.goto(_BASE_URL["betano"])
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            input,
+            "\n  ▶ Ready BOTH windows, then press ENTER:\n"
+            "     • Betano: log in (complete any challenge).\n"
+            "     • Betsson: log in, then click profile → My Account so the betslip is "
+            "placeable — do NOT refresh.\n  ENTER to run the two-leg execution… ",
+        )
+        cap = max(args.stake * 5, 1000.0)
+        guard = Guardrails(
+            max_position_per_match_ars=cap,
+            max_total_exposure_ars=cap,
+            max_daily_loss_ars=cap,
+            odds_tolerance_pct=100.0,  # mechanics test: don't abort on odds drift
+        )
+        notifier = _PrintNotifier()
+        executor = Executor(
+            guardrails=guard,
+            notifier=notifier,
+            recovery=HumanRecoveryHandler(notifier),
+            placers={
+                "betsson-pba": BetssonLegPlacer(betsson_t),
+                "betano-pba": BetanoLegPlacer(betano_t),
+            },
+            dry_run=False,
+        )
+        result = await executor.execute_two_leg("trial-2leg", leg_a, leg_b)
+    print(
+        f"\n=== TWO-LEG RESULT ===\noutcome={result.outcome}\nreason={result.reason!r}\n"
+        f"leg_a (betsson): {result.leg_a}\nleg_b (betano):  {result.leg_b}"
+    )
+
+
 async def _arm_and_send(args: argparse.Namespace) -> None:
     if args.stake > TRIAL_HARD_CAP_ARS:
         sys.exit(f"REFUSED: stake {args.stake} > trial hard cap {TRIAL_HARD_CAP_ARS} ARS")
@@ -390,28 +500,15 @@ async def _arm_and_send(args: argparse.Namespace) -> None:
     if args.platform == "betsson":
         await _arm_betsson(args)
         return
-    leg = _build_leg(args)
-    base = _BASE_URL[args.platform]
-    print(f"⚠️  LIVE: sending real {args.stake} ARS on {args.platform} — watch the browser.")
-    transport = InSessionTransport(args.platform, dry_run=False)
-    async with transport:
-        await transport.goto(base)  # same-origin so the in-page fetch carries cookies
-        transport.arm()
-        if args.platform == "betano":
-            res = await BetanoLegPlacer(transport).place(leg)
-        else:
-            sys.exit(f"arm not wired for {args.platform}")
-    print("\n=== RESULT ===")
-    print(
-        f"accepted={res.accepted}  ref={res.ref!r}  "
-        f"stake_filled={res.stake_filled}  odds_filled={res.odds_filled}"
-    )
-    print(f"detail: {res.detail}")
+    if args.platform == "betano":
+        await _arm_betano(args)
+        return
+    sys.exit(f"arm not wired for {args.platform}")
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--platform", required=True, choices=["betsson", "betano"])
+    p.add_argument("--platform", choices=["betsson", "betano"])
     p.add_argument("--discover", action="store_true")
     p.add_argument("--selection", default="", help="platform_outcome_id from --discover")
     p.add_argument("--event-id", default="", help="Betano eventId (from --discover)")
@@ -431,8 +528,47 @@ def main() -> None:
         action="store_true",
         help="betsson: place through the production BetssonLegPlacer + transport",
     )
+    # Two-leg mechanics test (Betsson Leg A + Betano Leg B, both live).
+    p.add_argument("--two-leg", action="store_true", help="run a live two-leg execution test")
+    p.add_argument("--betsson-slug", default="")
+    p.add_argument("--betsson-selection", default="")
+    p.add_argument("--betsson-odds", type=float, default=0.0)
+    p.add_argument("--betsson-outcome", default="home")
+    p.add_argument("--betano-event-id", default="")
+    p.add_argument("--betano-selection", default="")
+    p.add_argument("--betano-odds", type=float, default=0.0)
+    p.add_argument("--betano-outcome", default="away")
+    p.add_argument(
+        "--betano-max-stake",
+        type=float,
+        default=0.0,
+        help="two-leg: live max-stake for the Betano leg (its cap is dynamic; guard fails closed without it)",
+    )
     args = p.parse_args()
 
+    if args.two_leg:
+        if not args.yes_real_money:
+            sys.exit("REFUSED: --two-leg places real money; pass --yes-real-money")
+        if args.stake > TRIAL_HARD_CAP_ARS:
+            sys.exit(f"REFUSED: stake {args.stake} > trial hard cap {TRIAL_HARD_CAP_ARS} ARS")
+        missing = [
+            f
+            for f in (
+                "betsson_slug",
+                "betsson_selection",
+                "betsson_odds",
+                "betano_event_id",
+                "betano_selection",
+                "betano_odds",
+            )
+            if not getattr(args, f)
+        ]
+        if missing:
+            sys.exit(f"REFUSED: --two-leg needs {missing}")
+        asyncio.run(_two_leg(args))
+        return
+    if not args.platform:
+        sys.exit("--platform is required (or use --two-leg)")
     if args.discover:
         asyncio.run(_discover(args.platform))
     elif args.arm:

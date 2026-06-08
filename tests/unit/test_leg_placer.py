@@ -115,6 +115,17 @@ async def test_betsson_placer_builds_request_and_parses_success() -> None:
     assert "m-f-EVT-MW3W" in us["statuses"]["markets"]
 
 
+async def test_betsson_fills_exposure_from_requested_when_not_echoed() -> None:
+    # Betsson's response echoes no stake/odds → fall back to requested (for exposure).
+    t = FakeTransport(
+        200,
+        {"couponStatus": {"couponStatusPollingResult": "Success", "couponId": "C1",
+                          "couponPlacementErrors": []}},
+    )
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-x", 50.0, 2.62))
+    assert res.accepted and res.stake_filled == 50.0 and res.odds_filled == 2.62
+
+
 async def test_betsson_fails_closed_when_context_not_resolved() -> None:
     # prepare_betsson_context returns None → not logged in → no place attempt.
     t = FakeTransport(ctx_headers=None)
@@ -176,6 +187,10 @@ async def test_betano_runs_slip_sequence_and_places_with_refreshed_hash() -> Non
         (c["method"], c["url"].rsplit("/", 1)[-1] or c["url"].rsplit("/", 2)[-2]) for c in t.calls
     ]
     assert methods == [("POST", "plain-leg"), ("PATCH", "updatebets"), ("POST", "place")]
+    # updatebets carries a TOP-LEVEL bets array with the amount set (else 400)
+    ub_body = t.calls[1]["json"]
+    assert ub_body["bets"][0]["amount"] == 1000.0 and ub_body["bets"][0]["returns"] == 0
+    assert "betslip" in ub_body
     place_body = t.calls[2]["json"]["betslip"]
     assert place_body["hash"] == "H2"  # the refreshed hash from updatebets, not plain-leg's H1
     assert place_body["bets"][0]["amount"] == 1000.0
