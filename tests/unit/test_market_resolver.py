@@ -27,6 +27,8 @@ class TestH2H3Way:
             ("bplay-pba", "1-x-2"),
             ("betwarrior-pba", "Resultado Final"),
             ("betwarrior-pba", "resultado final"),
+            ("betano", "Resultado del partido"),
+            ("betano", "resultado del partido"),
         ],
     )
     def test_known_h2h_3way_resolves(self, platform: str, raw_market_name: str) -> None:

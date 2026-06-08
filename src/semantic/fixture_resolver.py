@@ -70,6 +70,7 @@ ANCHOR_MATCH_THRESHOLD: Final[float] = 0.85
 _ANCHOR_SEPARATORS: Final[dict[str, str]] = {
     "betwarrior-pba": " - ",
     "bplay-pba": " vs ",
+    "betano": " vs ",  # scraper emits raw_event_name = "{home} vs {away}"
 }
 
 

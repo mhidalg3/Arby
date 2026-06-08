@@ -289,3 +289,25 @@ class TestLLMFallback:
         result = await r.resolve(snap)
         assert result is not None
         assert result.fixture_id == "fx-pick"
+
+
+class TestBetanoAnchor:
+    """Betano is an anchor (its raw_event_name is '{home} vs {away}'); Betsson
+    (non-anchor) links to a Betano-registered fixture by outcome-team label."""
+
+    async def test_betano_event_creates_fixture(self) -> None:
+        r = FixtureResolver()
+        fixture = await r.resolve(_snap("betano", "86490800", "Panama vs Dominicana"))
+        assert fixture is not None
+        assert fixture.home_team == "panama" and fixture.away_team == "dominicana"
+
+    async def test_betano_anchor_then_betsson_links_same_fixture(self) -> None:
+        r = FixtureResolver()
+        ban = await r.resolve(
+            _snap("betano", "86490800", "Gimnasia Jujuy vs Belgrano", timestamp=1000.0)
+        )
+        bet = await r.resolve(
+            _snap("betsson-pba", "f-bet", "gimnasia jujuy belgrano", "Belgrano", timestamp=1002.0)
+        )
+        assert ban is not None and bet is not None
+        assert ban.fixture_id == bet.fixture_id  # Betsson leg aligns to the Betano fixture

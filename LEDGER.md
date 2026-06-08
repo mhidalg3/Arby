@@ -1,5 +1,37 @@
 # Project Ledger
 
+## 2026-06-08 — #1 live QuoteSource VALIDATED on live data (canonicalization aligns the books)
+
+**Context:** Built and live-validated the orchestrator's `QuoteSource`
+(`CanonicalizingQuoteSource`): scrape Betsson + Betano -> canonicalize via the
+semantic layer -> assemble COMPLETE partitions (best odds per cell; drop partial/stale).
+`scripts/run_arb_loop.py` is a dry-run diagnostic (no bets) over the real pipeline.
+
+**Enablers found + fixed (Betano was wired for execution but never for detection):**
+- `fixture_resolver`: made `betano` an ANCHOR ("{home} vs {away}"). Both Betsson and
+  Betano were non-anchor, so a Betsson+Betano loop registered ZERO fixtures.
+- `market_resolver`: added `betano` 1X2 ("resultado del partido"). `canonicalize()`
+  calls `resolve_market` first, so without it every Betano snapshot dropped pre-anchor.
+  (Outcome resolver already handled Betano via the team-name path: Empate->DRAW.)
+
+**Live result:** a full fetch produced **55 complete partitions, 4 cross-platform**
+(Betano + Betsson aligned to the same canonical fixture — canonicalization works). No
+arb in the snapshot (overround > 1; efficient markets — arbs are fleeting/rare).
+
+**Architectural finding:** the synchronous poll-scrape is SLOW (~105s; Betsson's
+per-event accordion fetch dominates), so a single fetch's quotes span a wide window and
+the 30s staleness default drops the earlier ones (cause of the first 0-partition runs).
+The poll model is too slow to catch fleeting arbs — this is why the streaming ingestion
+daemon (odds:raw -> ArbDetector) exists. `run_arb_loop.py` staleness is env-tunable
+(default 180s) for the dry-run; real-time detection should consume the stream.
+
+**State:** detect->risk->execute pipeline complete + validated (orchestrator,
+arb_executor, quote_source). The full chain runs on live data and aligns the two books.
+571 -> 579 tests, mypy/ruff clean. **Next:** #2 warm sessions for live execution
+(+ Betsson nav automation), conservative Betano cap; consider moving the loop onto the
+streaming ingestion for latency. See [[betsson-auth-session-model]].
+
+
 ## 2026-06-08 — Detector→executor bridge + full-chain two-leg robustness test
 
 **Context:** Started #2 (connect detection to execution) and hardened the two-leg

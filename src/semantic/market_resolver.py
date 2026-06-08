@@ -52,6 +52,8 @@ _H2H_3WAY_NAMES_BY_PLATFORM: Final[dict[str, frozenset[str]]] = {
     # non-ASCII) to "quien ganara el partido?".
     "bplay-pba": frozenset({"1-x-2", "quien ganara el partido?"}),
     "betwarrior-pba": frozenset({"resultado final"}),
+    # Betano (Kaizen MRES market). Scraper emits "Resultado del partido".
+    "betano": frozenset({"resultado del partido"}),
 }
 
 # --- BTTS ---
