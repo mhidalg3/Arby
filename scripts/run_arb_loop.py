@@ -23,7 +23,7 @@ import httpx
 import structlog
 
 from src.arbitrage.dutch_book import detect_arbitrage
-from src.execution.quote_source import CanonicalizingQuoteSource
+from src.execution.quote_source import OverlapQuoteSource
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
 from src.logging_setup import configure_logging
@@ -52,19 +52,15 @@ async def main() -> int:
         policy=RiskPolicy(platform_reliability={"betano": 1.0, "betsson-pba": 1.0})
     )
     async with httpx.AsyncClient(headers=headers, timeout=25.0) as client:
-        # Order matters: the anchor (Betano) must be scraped before the non-anchor
-        # (Betsson) so fixtures exist for Betsson to link to.
-        # The synchronous full scrape is slow (~100s for Betsson's per-event
-        # accordion fetch), so quotes from one fetch span a wide time window. A
-        # generous staleness keeps them in the partition for this dry-run; real
-        # low-latency detection wants the streaming ingestion daemon, not a poll.
-        source = CanonicalizingQuoteSource(
-            scrapers=[
-                BetanoScraper(http_client=client, mode="prematch"),
-                BetssonScraper(http_client=client),
-            ],
+        # OverlapQuoteSource: Betano (anchor) bulk-fetches all fixtures+odds, then we
+        # fetch Betsson odds ONLY for the handful of fixtures Betano also covers — a
+        # few requests instead of ~200, so the cycle is faster AND far less
+        # bot-detectable (fewer repeated actions) for continuous polling.
+        source = OverlapQuoteSource(
+            anchor=BetanoScraper(http_client=client, mode="prematch"),
+            linker=BetssonScraper(http_client=client),
             canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()),
-            staleness_sec=float(os.environ.get("STALENESS_SEC", "180")),
+            staleness_sec=float(os.environ.get("STALENESS_SEC", "45")),
         )
         for cycle in range(1, cycles + 1):
             partitions = await source.fetch()

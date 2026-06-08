@@ -39,6 +39,7 @@ and downstream code falls back to platform-wide policy defaults.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -89,6 +90,11 @@ MARKET_MW3W = "MW3W"
 MARKET_BTTS = "BTTS"
 MARKET_MTG2W = "MTG2W"
 TARGET_MARKETS: tuple[str, ...] = (MARKET_MW3W, MARKET_BTTS, MARKET_MTG2W)
+
+# Per-event accordion calls (one HTTP round-trip each) dominate the scrape; run
+# them with bounded concurrency to cut wall time. Kept modest so the burst stays
+# under the WAF's radar — the RateLimitGuard circuit-breaker is the backstop.
+DEFAULT_MAX_CONCURRENT_EVENTS = 8
 
 # Slug prefixes consumed from the categories tree. Each entry is a
 # top-level Betsson grouping (`futbol/<group>/`); the scraper picks
@@ -163,6 +169,7 @@ class BetssonScraper(BaseScraper):
         fixture_cache_ttl_sec: float = DEFAULT_FIXTURE_TTL_SEC,
         soccer_slug_prefixes: tuple[str, ...] = DEFAULT_SOCCER_SLUG_PREFIXES,
         guard: RateLimitGuard | None = None,
+        max_concurrent_events: int = DEFAULT_MAX_CONCURRENT_EVENTS,
     ) -> None:
         if subdomain not in VALID_SUBDOMAINS:
             raise ValueError(
@@ -176,6 +183,7 @@ class BetssonScraper(BaseScraper):
         self._client = http_client
         self._fixture_cache_ttl_sec = fixture_cache_ttl_sec
         self._soccer_slug_prefixes = soccer_slug_prefixes
+        self._max_concurrent_events = max(1, max_concurrent_events)
         self._fixtures_cache: list[_Fixture] = []
         self._fixtures_cached_at: float = 0.0
         self._guard = guard or RateLimitGuard(platform=self.platform_name)
@@ -205,6 +213,12 @@ class BetssonScraper(BaseScraper):
             "Referer": f"{self.base_url}/apuestas-deportivas",
         }
 
+    async def list_fixture_refs(self) -> list[tuple[str, str]]:
+        """`(event_id, slug)` for current soccer fixtures — one cheap call, NO
+        per-event odds. Lets a caller pre-select which events to fetch odds for
+        (overlap-only fetching: skip events the other book doesn't cover)."""
+        return [(fx.event_id, fx.slug) for fx in await self._discover_soccer_fixtures()]
+
     async def fetch_event_quotes(self, event_id: str) -> list[RawOddsSnapshot]:
         """Surgical per-event refetch — bypasses discovery + polling.
 
@@ -225,20 +239,25 @@ class BetssonScraper(BaseScraper):
         fixtures = await self._discover_soccer_fixtures()
         self._log.debug("scraper.fixtures", n=len(fixtures))
 
-        for fx in fixtures:
-            try:
-                async for snapshot in self._fetch_event_odds(fx):
-                    yield snapshot
-            except BetssonContractError as exc:
-                # A single bad fixture (e.g. event finished mid-poll, 404)
-                # shouldn't kill the whole cycle. A platform-wide schema
-                # break will recur on every fixture and the operator will
-                # see it in logs.
-                self._log.warning(
-                    "scraper.fixture_skipped",
-                    event_id=fx.event_id,
-                    error=str(exc),
-                )
+        # Run the per-event accordion calls with bounded concurrency: ~Nx faster
+        # wall time than the old sequential loop. A single bad fixture (event
+        # finished mid-poll, 404, or a tripped circuit) is logged and skipped, not
+        # fatal — a platform-wide schema break recurs on every fixture in the logs.
+        semaphore = asyncio.Semaphore(self._max_concurrent_events)
+
+        async def _collect(fx: _Fixture) -> list[RawOddsSnapshot]:
+            async with semaphore:
+                try:
+                    return [snap async for snap in self._fetch_event_odds(fx)]
+                except BetssonContractError as exc:
+                    self._log.warning(
+                        "scraper.fixture_skipped", event_id=fx.event_id, error=str(exc)
+                    )
+                    return []
+
+        for snaps in await asyncio.gather(*(_collect(fx) for fx in fixtures)):
+            for snapshot in snaps:
+                yield snapshot
 
     # ---- internals ----
 

@@ -1,5 +1,53 @@
 # Project Ledger
 
+## 2026-06-08 — LATENCY+ANTI-BOT: overlap-only fetching (Betsson ~208 -> ~8 requests/cycle)
+
+**Context:** After the concurrency fix (90s->13s), the loop still fired ~208 identical
+Betsson accordion calls every cycle. Operator insight: repeated actions, not raw speed,
+are the real anti-bot risk for a CONTINUOUSLY-polling bot. An arb needs BOTH books on
+the same match, so we only need the overlap — typically a handful of fixtures.
+
+**`OverlapQuoteSource`:** the anchor (Betano) bulk-fetches all fixtures+odds in ~1 call
+and registers fixtures; we match Betano's "{home} {away}" against Betsson's cheap
+fixture-LIST slugs (`list_fixture_refs`, no odds) and fetch Betsson odds
+(`fetch_event_quotes`) ONLY for matched events. Canonicalization re-validates every
+quote, so a loose slug match only wastes/drops a fetch (no correctness risk).
+
+**Measured live:** anchor=20 fixtures, overlap=8 events. Betsson requests ~208 -> ~8
+(~26x fewer). Full fetch ~105s (orig) -> ~16s (concurrency) -> **4.4s** (overlap), still
+5-6 cross-platform partitions. The request reduction is the bigger win: it makes
+continuous polling sustainable without tripping reputation-based blocks.
+
+**State:** OverlapQuoteSource + shared `assemble_partitions` helper + `list_fixture_refs`.
+run_arb_loop uses it. CanonicalizingQuoteSource kept (generic N-platform). 574 tests,
+mypy/ruff clean. **Next:** #2 warm sessions for unattended live execution; live in-play
+still wants the push feeds (Diffusion WS / SSE).
+
+
+## 2026-06-08 — LATENCY: parallelize Betsson per-event fetch (~90s -> ~13s, 7x)
+
+**Context:** The #1 finding was that the synchronous poll-scrape (~105s) is too slow
+for fleeting arbs — its 30s staleness dropped quotes from a single slow fetch. Root
+cause: BetssonScraper fetched each of ~390 fixtures' accordion markets SEQUENTIALLY
+(one HTTP round-trip each).
+
+**Fix:** run the per-event accordion calls with bounded concurrency
+(`max_concurrent_events`, default 8) via a semaphore + `asyncio.gather`. A bad
+fixture / tripped circuit is logged and skipped (partial cycle), not fatal. The
+RateLimitGuard circuit-breaker is the anti-bot backstop — if Betsson rate-limits the
+burst it opens and remaining calls skip gracefully. Kept modest (8) to stay under the
+WAF; measured: 1713 snapshots, guard never tripped.
+
+**Measured:** Betsson scrape 90s -> 13.4s; full QuoteSource fetch 105s -> ~16s. A tight
+30s staleness now yields the same 55 complete / 4 cross-platform partitions (was 0 —
+everything had aged out). The poll model is now viable for pre-match; live in-play still
+wants the push feeds (Diffusion WS / SSE).
+
+**State:** 91 Betsson tests + 573 total green, mypy/ruff clean. run_arb_loop staleness
+default lowered 180 -> 45s. **Next:** optional — parallelize the two platforms in the
+QuoteSource (~3s more), or move to #2 (warm sessions) for unattended live execution.
+
+
 ## 2026-06-08 — #1 live QuoteSource VALIDATED on live data (canonicalization aligns the books)
 
 **Context:** Built and live-validated the orchestrator's `QuoteSource`

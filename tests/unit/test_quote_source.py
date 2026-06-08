@@ -146,3 +146,60 @@ async def test_one_scraper_failing_does_not_sink_the_cycle() -> None:
     )
     out = await src.fetch()
     assert set(out.keys()) == {_MKT_ID}  # the good scraper still produced a partition
+
+
+# ---- OverlapQuoteSource: fetch linker odds only for anchor-covered fixtures ----
+
+from src.execution.quote_source import OverlapQuoteSource  # noqa: E402
+
+
+class _FakeLinker:
+    """list_fixture_refs() lists many fixtures; fetch_event_quotes only for those
+    actually requested (records which)."""
+
+    def __init__(self, refs: list[tuple[str, str]], snaps_by_event: dict[str, list[RawOddsSnapshot]]):
+        self._refs = refs
+        self._snaps = snaps_by_event
+        self.fetched: list[str] = []
+
+    async def list_fixture_refs(self) -> list[tuple[str, str]]:
+        return self._refs
+
+    async def fetch_event_quotes(self, event_id: str) -> list[RawOddsSnapshot]:
+        self.fetched.append(event_id)
+        return self._snaps.get(event_id, [])
+
+
+def _bsnap(cell: str, odds: float) -> RawOddsSnapshot:
+    return _snap("betsson-pba", cell, odds)
+
+
+async def test_overlap_source_fetches_only_matched_linker_events() -> None:
+    # Anchor (Betano) covers one match: "Panama vs Dominicana", all 3 cells.
+    def _ev(name: str, cell: str, odds: float) -> RawOddsSnapshot:
+        return RawOddsSnapshot(
+            platform="betano", platform_event_id="b-evt", platform_market_id="b-mkt",
+            platform_outcome_id=f"betano-{cell}", raw_event_name=name, raw_market_name="1X2",
+            raw_outcome_name=cell, decimal_odds=odds, max_stake=5000.0, timestamp=0.0,
+        )
+
+    anchor = _FakeScraper([_ev("Panama vs Dominicana", CELL_HOME, 2.0),
+                           _ev("Panama vs Dominicana", CELL_DRAW, 3.5),
+                           _ev("Panama vs Dominicana", CELL_AWAY, 4.0)])
+    # Linker lists a MATCHING fixture + an unrelated one; only the match's odds exist.
+    linker = _FakeLinker(
+        refs=[("ev-match", "futbol/x/panama-dominicana"),
+              ("ev-other", "futbol/x/some-other-teams")],
+        snaps_by_event={"ev-match": [_bsnap(CELL_HOME, 2.1), _bsnap(CELL_DRAW, 3.4),
+                                     _bsnap(CELL_AWAY, 4.2)]},
+    )
+    src = OverlapQuoteSource(
+        anchor=anchor, linker=linker, canonicalizer=_StubCanonicalizer(), now_fn=lambda: 0.0
+    )
+    out = await src.fetch()
+    assert linker.fetched == ["ev-match"]  # only the anchor-covered fixture was fetched
+    assert set(out.keys()) == {_MKT_ID}
+    # cross-platform partition assembled, best odds per cell
+    legs = {q.outcome: q.platform for q in out[_MKT_ID]}
+    assert legs[CELL_HOME] == "betsson-pba"  # 2.1 > 2.0
+    assert legs[CELL_DRAW] == "betano"  # 3.5 > 3.4
