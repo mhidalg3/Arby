@@ -128,3 +128,17 @@ async def test_execute_opportunity_rejects_non_two_leg() -> None:
     ex = Executor(guardrails=_guard(), notifier=_Notifier(), recovery=_Recovery(), placer=_Placer())
     with pytest.raises(ValueError, match="two-leg"):
         await execute_opportunity(ex, opp, opp_id="opp-3")
+
+
+def test_dynamic_cap_applied_to_betano_when_quote_has_no_max_stake() -> None:
+    # Betano (dynamic) quote with no max_stake → the conservative cap is applied;
+    # Betsson (non-dynamic) is untouched.
+    q_betano = _quote("betano", "away", 1.95, max_stake=None)
+    leg = leg_from_quote(q_betano, 50.0, match_id="MKT-1", dynamic_stake_cap_ars=500.0)
+    assert leg.live_max_stake_ars == 500.0
+    q_betsson = _quote("betsson", "home", 2.1, max_stake=None)
+    leg2 = leg_from_quote(q_betsson, 50.0, match_id="MKT-1", dynamic_stake_cap_ars=500.0)
+    assert leg2.live_max_stake_ars is None  # non-dynamic: no fallback cap
+    # a quote that already carries a cap keeps it
+    q_capped = _quote("betano", "away", 1.95, max_stake=1234.0)
+    assert leg_from_quote(q_capped, 50.0, match_id="M", dynamic_stake_cap_ars=500.0).live_max_stake_ars == 1234.0

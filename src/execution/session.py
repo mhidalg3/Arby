@@ -31,6 +31,7 @@ _PROFILE_ROOT = REPO_ROOT / "recon" / "profile"
 _HEADER_DROP = frozenset(
     {":authority", ":method", ":path", ":scheme", "host", "content-length", "accept-encoding"}
 )
+_BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
 
 
 class Transport(Protocol):
@@ -82,6 +83,9 @@ class InSessionTransport:
         self._page: Any = None
         self._pw: Any = None
         self._captured_ctx: dict[str, str] | None = None  # Betsson authenticated header set
+        # Serializes page-mutating ops (the heartbeat's establish-nav vs a placement
+        # fetch) so a re-navigation can't abort an in-flight in-page fetch.
+        self._page_lock = asyncio.Lock()
         self._log = log.bind(component="in_session_transport", platform=platform, dry_run=dry_run)
 
     def arm(self) -> None:
@@ -182,6 +186,44 @@ class InSessionTransport:
             return None
         return {k: v for k, v in self._captured_ctx.items() if k not in _HEADER_DROP}
 
+    async def establish_betsson_context(self, timeout_s: int = 30) -> bool:
+        """Drive the SPA into the placeable state and confirm the authenticated
+        context resolved (returns True). Betsson's betting context lives in SPA
+        memory and is established by *client-side* in-app navigation after login —
+        a cold load alone leaves the betslip refusing — so we cold-load the app,
+        then perform an in-app navigation (the SPA router runs; a hard reload would
+        cold-boot and drop it), then verify via :meth:`prepare_betsson_context`.
+
+        This is the automation of the operator's manual "My Account" click. The
+        exact in-app nav trigger is operator-validated against the live DOM; the
+        verify (a real ctx- request) is the source of truth either way. Returns
+        False if the context never resolves (session not logged in / nav failed →
+        the caller escalates to recovery)."""
+        if self._dry_run:
+            self._log.info("transport.dry_run_establish")
+            return False
+        self._captured_ctx = None
+        # Hold the page lock only for the navigation (a placement fetch must not run
+        # mid-nav); the passive ctx-poll below doesn't touch the page, so leave it
+        # unlocked to keep the hold short.
+        async with self._page_lock:
+            await self._page.goto(_BETSSON_HOME, wait_until="networkidle", timeout=60000)
+            # In-app (client-side) navigation: clicking an internal account link routes
+            # via the SPA router (Playwright locators pierce shadow DOM). Best-effort —
+            # if no candidate matches, we still verify (the session may already be live).
+            for name in ("Mi cuenta", "My Account", "Mi Cuenta", "Cuenta"):
+                link = self._page.get_by_role("link", name=name)
+                try:
+                    if await link.count():
+                        await link.first.click(timeout=5000)
+                        break
+                except Exception as exc:  # noqa: BLE001 — try the next candidate
+                    self._log.info("transport.betsson_nav_miss", name=name, error=str(exc))
+        headers = await self.prepare_betsson_context(timeout_s)
+        ok = headers is not None
+        self._log.info("transport.betsson_context", established=ok)
+        return ok
+
     async def fetch(
         self,
         method: str,
@@ -201,17 +243,19 @@ class InSessionTransport:
         if json_body is not None and not any(k.lower() == "content-type" for k in final_headers):
             final_headers["content-type"] = "application/json"
         # Execute the request inside the page context — inherits cookies/fingerprint.
-        result = await self._page.evaluate(
-            """async ({method, url, body, headers}) => {
-                const resp = await fetch(url, {
-                    method, headers: headers || {},
-                    body: body !== null ? JSON.stringify(body) : null,
-                    credentials: 'include',
-                });
-                return {status: resp.status, text: await resp.text()};
-            }""",
-            {"method": method, "url": url, "body": json_body, "headers": final_headers},
-        )
+        # The lock keeps a heartbeat re-navigation from aborting this in-flight fetch.
+        async with self._page_lock:
+            result = await self._page.evaluate(
+                """async ({method, url, body, headers}) => {
+                    const resp = await fetch(url, {
+                        method, headers: headers || {},
+                        body: body !== null ? JSON.stringify(body) : null,
+                        credentials: 'include',
+                    });
+                    return {status: resp.status, text: await resp.text()};
+                }""",
+                {"method": method, "url": url, "body": json_body, "headers": final_headers},
+            )
         status = int(result["status"])
         try:
             parsed = json.loads(result["text"]) if result["text"] else {}

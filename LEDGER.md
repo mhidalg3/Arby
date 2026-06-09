@@ -1,5 +1,84 @@
 # Project Ledger
 
+## 2026-06-09 — #2 hot sessions DRY-RUN VALIDATED live (+ fixture-match false-positive found)
+
+**Dry-run hot loop ran ~1h15m live** (run_hot_loop, no bets). Validated end-to-end:
+startup (both sessions open, Betsson context auto-established), continuous ~20s detection
+via OverlapQuoteSource (~10 overlap events/cycle), and heartbeat re-warming (betsson_ok:
+true). **Critically, the fail-safe worked:** when Betsson eventually went cold (~1h in,
+likely the machine sleeping overnight — no heartbeat can run while asleep), the heartbeat
+detected it → kill switch → orchestrator stopped → clean exit. The bot HALTED rather than
+trading through a dead session — the core safety behavior, proven live.
+
+**FOLLOW-UP (pre-armed, important): fixture-matching false positive.** Every cycle showed
+`fx-0bf7c2246b2c|1x2 realized_roi_pct≈72%` — a phantom arb (no book offers 72%). Almost
+certainly the OverlapQuoteSource slug-match (threshold 0.80) pairing Betano's odds for one
+match with Betsson's for a DIFFERENT one. The risk 25%-ceiling REJECTED it (backstop
+worked), BUT a mismatch producing a sub-25% fake arb would pass risk → place two unrelated
+bets → loss. So the ceiling is NOT sufficient alone. **Before any armed trading:** tighten
+fixture matching + add a same-match cross-check on the two legs (e.g. require the linker's
+canonicalized fixture_id to equal the anchor's, not just a slug similarity). Investigate
+why fx-0bf7c2246b2c persistently mis-pairs.
+
+**State:** hot-session code merged + dry-run-validated. 579 tests, mypy/ruff clean.
+**Next (pre-armed): harden fixture matching** (the false-positive above), then an armed
+run on a verified real arb.
+
+
+## 2026-06-09 — #2 hot sessions: Betsson auto-nav VALIDATED + live hot-loop runner
+
+**Betsson nav automation works.** `scripts/probe_betsson_nav.py` (operator login, no
+bets) confirmed `establish_betsson_context()` self-establishes the betting context
+(cold-load → in-app "Mi cuenta" nav → verified ctx-) — `ctx- resolved: True`. The last
+operator-gated unknown for hot sessions is cleared; the manager can warm Betsson
+unattended.
+
+**Wired the full live loop (`scripts/run_hot_loop.py`):** OverlapQuoteSource (fast
+detection) + HotSessionManager (warm sessions, heartbeat) + ArbOrchestrator (detect →
+risk → execute). DRY-RUN by default (opens real sessions + detects live, places via
+DryRunPlacer); `--arm --yes-real-money` places through the warm transports (per-leg
+cap). HotSessionManager gained a `login_gate` seam (operator logs into both once at
+startup; heartbeat keeps them warm). Orchestrator threads `dynamic_stake_cap_ars` to
+execute_opportunity so Betano legs pass the guard.
+
+**State:** the bot is end-to-end runnable. 583 tests, mypy/ruff clean. **Remaining live
+validation:** a dry-run hot-loop run (both sessions open + manager establishes context +
+heartbeat survives + orchestrator detects), then an armed run on a real arb. See
+[[betsson-auth-session-model]].
+
+
+## 2026-06-08 — #2 hot sessions: warm-session lifecycle + conservative Betano cap
+
+**Context:** For unattended live execution, the bot can't launch a browser per bet
+(too slow for arb timing; repeated logins are a bot signal). Built the warm-session
+layer + closed the two execution-side gaps from the #2 plan.
+
+**`HotSessionManager` (`src/execution/hot_session.py`):** owns the live Betano +
+Betsson transports for the bot's lifetime — opens both once, arms them, establishes
+the Betsson betting context, and runs a background **heartbeat** that re-warms the
+sessions (apps refresh tokens while open+active; Betsson's context needs periodic
+re-establishment). If startup context or a heartbeat fails, it **trips the kill
+switch** (halt > trade through a half-dead session). Exposes `.placers()` for the
+Executor. Unit-tested against a fake transport (startup, kill-switch-on-cold,
+heartbeat loop).
+
+**`InSessionTransport.establish_betsson_context()`:** automates the operator's manual
+"My Account" click — cold-load the app, do an in-app (client-side) navigation so the
+SPA establishes the betting context (a hard reload would cold-boot and drop it), then
+verify via prepare_betsson_context. The exact nav trigger is operator-validated against
+the live DOM; the ctx- verify is the source of truth.
+
+**Conservative Betano cap:** `execute_opportunity(..., dynamic_stake_cap_ars=)` applies
+a configured fallback cap to dynamic-limit legs (Betano) whose public feed has no
+max_stake — so the guardrail no longer fail-closes. Under-stake-safe until the live
+limits query is wired.
+
+**State:** hot-session architecture + cap built and unit-tested (583 tests, mypy/ruff
+clean). **Needs live validation (operator):** the Betsson in-app-nav selector in
+establish_betsson_context, and an end-to-end hot-session run (open once, place via the
+warm sessions, heartbeat survives). See [[betsson-auth-session-model]].
+
+
 ## 2026-06-08 — LATENCY+ANTI-BOT: overlap-only fetching (Betsson ~208 -> ~8 requests/cycle)
 
 **Context:** After the concurrency fix (90s->13s), the loop still fired ~208 identical

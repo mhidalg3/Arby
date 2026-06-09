@@ -50,6 +50,7 @@ class ArbOrchestrator:
         guardrails: Guardrails,
         budget_ars: float,
         min_margin_pct: float = 1.0,
+        dynamic_stake_cap_ars: float | None = None,
     ) -> None:
         self._quotes = quote_source
         self._risk = risk_evaluator
@@ -57,6 +58,9 @@ class ArbOrchestrator:
         self._guardrails = guardrails
         self._budget = budget_ars
         self._min_margin_pct = min_margin_pct
+        # Conservative fallback cap for dynamic-limit legs (Betano) whose feed
+        # carries no max_stake — without it their guardrail fail-closes.
+        self._dynamic_cap = dynamic_stake_cap_ars
         self._executed: set[str] = set()  # market_ids already acted on (dedup)
         self._log = log.bind(component="orchestrator")
 
@@ -89,7 +93,9 @@ class ArbOrchestrator:
             self._log.info(
                 "orchestrator.executing", market_id=market_id, roi_pct=opp.realized_roi_pct
             )
-            res = await execute_opportunity(self._executor, opp, opp_id=market_id)
+            res = await execute_opportunity(
+                self._executor, opp, opp_id=market_id, dynamic_stake_cap_ars=self._dynamic_cap
+            )
             self._log.info("orchestrator.executed", market_id=market_id, outcome=res.outcome)
             results.append(res)
         return results
