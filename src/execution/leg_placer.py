@@ -169,7 +169,10 @@ class BetWarriorLegPlacer:
             self._log.warning("leg_placer.transport_error", error=str(exc))
             return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
         if status >= 400:
-            return PlacementResult(accepted=False, detail=f"HTTP {status}")
+            # Surface the Kambi error body — it names the reason (odds change, suspended
+            # outcome, validation) so a rejection is diagnosable, not an opaque 400.
+            self._log.warning("leg_placer.http_error", status=status, body=str(resp)[:300])
+            return PlacementResult(accepted=False, detail=f"HTTP {status}: {str(resp)[:200]}")
         return placers.parse_betwarrior(resp)
 
 
