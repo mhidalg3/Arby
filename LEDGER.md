@@ -1,5 +1,23 @@
 # Project Ledger
 
+## 2026-06-10 — Bplay integration (5th platform): capture-first
+
+**Context:** Bplay is the final platform before real deployment AND the block-prone one
+(429→403 under cumulative scrape + tight SSE retry — memory). Operator chose capture-first +
+careful. Scaffold exists: `BplayLegPlacer` (stateful togglebet→place, rotating csrf),
+builders/parser, `BplayXMLQuoteRefresher`, `BplayPbaScraper`. Gaps: never fired live; the
+bootstrap CSRF source on the page isn't pinned; the exact bettingslip contract unvalidated.
+
+**Decision:** Wired Bplay into the capture tooling (one controlled logged-in session ≠ the
+scraper traffic that caused the block, so low risk): `--platform bplay --capture-ui` records
+the full `/bettingslip` flow (togglebet → place) + the rotating csrf_token; `--capture-session`
+(generic, +bplay base URL) records its readiness calls. Site = `deportespba.bplay.bet.ar`
+(SPA), API = `ws-deportespba.bplay.bet.ar`.
+
+**State:** branch `chore/bplay-capture`. ruff clean. NEXT: operator captures Bplay (one app
+bet + a read-only session pass); then build/validate the placer + bootstrap-CSRF reader, then
+wire detection with conservative rate-limiting + a Stage-2 readiness check.
+
 ## 2026-06-10 — Hourly status heartbeat + disconnect alerts (operator visibility)
 
 **Context:** Operator wants periodic "what's live" Telegram pings + disconnect alerts, so

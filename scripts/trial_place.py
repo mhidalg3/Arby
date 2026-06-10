@@ -55,6 +55,7 @@ _BASE_URL = {
     "betsson": "https://pba.betsson.bet.ar/apuestas-deportivas",
     "betano": "https://www.betano.bet.ar/",
     "betwarrior": "https://pba.betwarrior.bet.ar/",
+    "bplay": "https://deportespba.bplay.bet.ar/",
 }
 
 # URL substrings that mark an authenticated session / readiness call — the API
@@ -426,6 +427,76 @@ async def _arm_betano(args: argparse.Namespace) -> None:
     )
 
 
+async def _capture_bplay_ui(args: argparse.Namespace) -> None:
+    """Operator places ONE bet via the Bplay app; capture the FULL bettingslip flow
+    (togglebet → place) + the rotating ``csrf_token`` — ground truth for the stateful
+    placer + where the bootstrap CSRF comes from. Bodies printed + saved."""
+    import time as _time  # noqa: PLC0415
+
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from scripts.recon.stealth import apply_stealth  # noqa: PLC0415
+
+    print(f"⚠️  CAPTURE MODE on bplay — you place via the app; I record it.\n  {_BASE_URL['bplay']}")
+    calls: list[dict[str, object]] = []
+    resps: dict[str, tuple[int, str]] = {}
+
+    def on_request(req: object) -> None:
+        r = req
+        if r.method == "POST" and "/bettingslip" in r.url:  # type: ignore[attr-defined]
+            calls.append({"url": r.url, "body": r.post_data})  # type: ignore[attr-defined]
+
+    async def on_response(resp: object) -> None:
+        r = resp
+        if "/bettingslip" in r.url and r.request.method == "POST":  # type: ignore[attr-defined]
+            with contextlib.suppress(Exception):
+                resps[r.url] = (r.status, (await r.text())[:500])  # type: ignore[attr-defined]
+
+    pw = await async_playwright().start()
+    ctx = await pw.chromium.launch_persistent_context(
+        user_data_dir="recon/profile/bplay",
+        headless=False,
+        channel="chrome",
+        locale="es-AR",
+        timezone_id="America/Argentina/Buenos_Aires",
+        permissions=["geolocation"],
+        geolocation={"latitude": -34.9215, "longitude": -57.9545},
+    )
+    try:
+        await apply_stealth(ctx)
+        ctx.on("request", on_request)
+        ctx.on("response", on_response)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(_BASE_URL["bplay"], wait_until="networkidle", timeout=60000)
+        print(
+            "\n  ▶ In the app: log in, open a match, add a selection, enter a tiny stake, and "
+            "place the bet.\n  Waiting up to 5 min for your bettingslip POSTs…"
+        )
+        for _ in range(150):
+            if any("/bettingslip" in str(c["url"]) and "togglebet" not in str(c["url"]) for c in calls):
+                break
+            await asyncio.sleep(2)
+        if not calls:
+            print("\n=== RESULT ===\nno bettingslip POST observed (no bet placed in the window)")
+            return
+        print(f"\n=== CAPTURED bettingslip flow on bplay ({len(calls)} calls) ===")
+        for c in calls:
+            print(f"\n  POST {c['url']}")
+            if c["body"]:
+                print(f"     body: {str(c['body'])[:400]}")
+            rp = resps.get(str(c["url"]))
+            if rp:
+                print(f"     -> {rp[0]}  {rp[1]}")
+        out = REPO_ROOT_ARTIFACTS / f"bplay_betslip_capture_{int(_time.time())}.json"
+        out.write_text(json.dumps({"calls": calls, "responses": {k: list(v) for k, v in resps.items()}}, indent=2))
+        print(f"\n  saved → {out}")
+        print("  Paste the bodies (togglebet + place) + the csrf_token values and I'll build")
+        print("  the deterministic placer + bootstrap-CSRF reader against them.")
+    finally:
+        await ctx.close()
+        await pw.stop()
+
+
 async def _capture_session(platform: str) -> None:
     """Read-only: record the authenticated session/readiness API calls the app makes
     (validate.json / balance / account / user-context) so the per-platform "is this
@@ -728,6 +799,9 @@ async def _arm_and_send(args: argparse.Namespace) -> None:
     if args.capture_ui and args.platform == "betwarrior":
         await _capture_betwarrior_ui(args)
         return
+    if args.capture_ui and args.platform == "bplay":
+        await _capture_bplay_ui(args)
+        return
     if args.via_placer and args.platform == "betsson":
         await _revalidate_betsson(args)
         return
@@ -745,7 +819,7 @@ async def _arm_and_send(args: argparse.Namespace) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--platform", choices=["betsson", "betano", "betwarrior"])
+    p.add_argument("--platform", choices=["betsson", "betano", "betwarrior", "bplay"])
     p.add_argument("--discover", action="store_true")
     p.add_argument("--selection", default="", help="platform_outcome_id from --discover")
     p.add_argument("--event-id", default="", help="Betano eventId (from --discover)")
@@ -826,8 +900,8 @@ def main() -> None:
         if not args.yes_real_money:
             sys.exit("REFUSED: --arm requires --yes-real-money")
         if args.capture_ui:
-            if args.platform not in ("betsson", "betwarrior"):
-                sys.exit("REFUSED: --capture-ui supports betsson / betwarrior")
+            if args.platform not in ("betsson", "betwarrior", "bplay"):
+                sys.exit("REFUSED: --capture-ui supports betsson / betwarrior / bplay")
             if args.platform == "betsson" and not args.slug:
                 sys.exit("REFUSED: betsson --capture-ui needs --slug")
         else:
