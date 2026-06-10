@@ -153,12 +153,23 @@ class HotSessionManager:
         context; Betano hits /api/balance; BetWarrior hits checkSessionAlive. Records
         the per-platform result (for the status report) and returns the name of the
         FIRST not-ready platform, or None if all are placeable."""
+        async def _safe(name: str, coro: Awaitable[bool]) -> bool:
+            # A probe that raises (cross-origin fetch, nav fault) means NOT READY —
+            # suspend + alert, never crash startup or the heartbeat loop.
+            try:
+                return await coro
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("hot_sessions.probe_error", platform=name, error=str(exc))
+                return False
+
         states: dict[str, bool] = {
-            "betsson": await self._betsson.establish_betsson_context(),
-            "betano": await self._betano.check_betano_ready(),
+            "betsson": await _safe("betsson", self._betsson.establish_betsson_context()),
+            "betano": await _safe("betano", self._betano.check_betano_ready()),
         }
         if self._betwarrior is not None:
-            states["betwarrior"] = await self._betwarrior.check_betwarrior_ready()
+            states["betwarrior"] = await _safe(
+                "betwarrior", self._betwarrior.check_betwarrior_ready()
+            )
         self._readiness = states
         return next((p for p, ok in states.items() if not ok), None)
 

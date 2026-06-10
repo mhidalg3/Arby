@@ -35,12 +35,8 @@ _BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
 # BetWarrior (Kambi) sends its session bearer on calls to the authenticated player
 # API host; we capture it from those outgoing requests (no nav, no storage probing).
 _KAMBI_PLAYER_API = "kambicdn.com/player/"
-# BetWarrior's Shapegames PAM host carries a `sessionKey` query token on every
-# account call — the input to the `checkSessionAlive` readiness probe.
-_BETWARRIOR_PAM_HOST = "betwarriorpam.com"
-_BETWARRIOR_ALIVE_URL = (
-    "https://ps.bwp.split.betwarriorpam.com/ps/ips/checkSessionAlive?brandId=7&sessionKey={key}"
-)
+# Betano's cookie-auth balance endpoint — same-origin, so the readiness probe's
+# in-page GET works (unlike BetWarrior's cross-origin PAM host).
 _BETANO_BALANCE_URL = "https://www.betano.bet.ar/api/balance"
 
 
@@ -94,7 +90,6 @@ class InSessionTransport:
         self._pw: Any = None
         self._captured_ctx: dict[str, str] | None = None  # Betsson authenticated header set
         self._captured_bearer: str | None = None  # BetWarrior (Kambi) session bearer token
-        self._betwarrior_session_key: str | None = None  # BetWarrior PAM sessionKey
         # Serializes page-mutating ops (the heartbeat's establish-nav vs a placement
         # fetch) so a re-navigation can't abort an in-flight in-page fetch.
         self._page_lock = asyncio.Lock()
@@ -157,9 +152,6 @@ class InSessionTransport:
             auth = req.headers.get("authorization", "")
             if auth.lower().startswith("bearer "):
                 self._captured_bearer = auth.split(" ", 1)[1].strip()
-        # BetWarrior PAM sessionKey (query param) — drives the checkSessionAlive probe.
-        if _BETWARRIOR_PAM_HOST in req.url and "sessionKey=" in req.url:
-            self._betwarrior_session_key = req.url.split("sessionKey=", 1)[1].split("&", 1)[0]
 
     async def __aexit__(self, *exc: object) -> None:
         if self._context is not None:
@@ -228,14 +220,20 @@ class InSessionTransport:
         if no page is open."""
         if self._page is None:
             return 0, {}
-        async with self._page_lock:
-            result = await self._page.evaluate(
-                """async (url) => {
-                    const resp = await fetch(url, {method: 'GET', credentials: 'include'});
-                    return {status: resp.status, text: await resp.text()};
-                }""",
-                url,
-            )
+        try:
+            async with self._page_lock:
+                result = await self._page.evaluate(
+                    """async (url) => {
+                        try {
+                            const resp = await fetch(url, {method: 'GET', credentials: 'include'});
+                            return {status: resp.status, text: await resp.text()};
+                        } catch (e) { return {status: 0, text: ''}; }
+                    }""",
+                    url,
+                )
+        except Exception as exc:  # noqa: BLE001 — a read must never crash readiness/startup
+            self._log.warning("transport.read_json_error", url=url[:80], error=str(exc))
+            return 0, {}
         status = int(result["status"])
         try:
             parsed = json.loads(result["text"]) if result["text"] else {}
@@ -244,21 +242,14 @@ class InSessionTransport:
         return status, parsed if isinstance(parsed, dict) else {}
 
     async def check_betwarrior_ready(self, timeout_s: int = 10) -> bool:
-        """Readiness probe: is the BetWarrior session placeable? Hits the PAM
-        ``checkSessionAlive`` endpoint (``{"alive":"true"}``) using the sessionKey
-        captured from the SPA's account calls. False if no key or not alive."""
+        """Readiness probe: is the BetWarrior session live? PASSIVE — the Kambi session
+        bearer has been captured from the SPA's authenticated calls (the PAM
+        checkSessionAlive endpoint is a different, cross-origin host that the page
+        context can't reliably fetch). If the bearer is present the operator is logged
+        in; the placer fail-closes on a stale bearer at place time."""
         if self._dry_run:
             return False
-        for _ in range(timeout_s):
-            if self._betwarrior_session_key is not None:
-                break
-            await asyncio.sleep(1)
-        if not self._betwarrior_session_key:
-            return False
-        status, resp = await self._read_json(
-            _BETWARRIOR_ALIVE_URL.format(key=self._betwarrior_session_key)
-        )
-        return status == 200 and str(resp.get("alive")).lower() == "true"
+        return await self.prepare_betwarrior_auth(timeout_s) is not None
 
     async def check_betano_ready(self) -> bool:
         """Readiness probe: is the Betano session authorized? Hits the cookie-auth

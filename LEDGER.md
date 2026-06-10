@@ -1,5 +1,24 @@
 # Project Ledger
 
+## 2026-06-10 — Fix armed-deploy crash: readiness probe must fail-safe
+
+**Bug:** The first armed `run_hot_loop` crashed at startup — `check_betwarrior_ready` did an
+in-page fetch to the PAM host `ps.bwp.split.betwarriorpam.com` (checkSessionAlive), which is
+CROSS-ORIGIN from the BetWarrior SPA page → `TypeError: Failed to fetch`, and it PROPAGATED out
+of `__aenter__` → killed the bot.
+
+**Fix:**
+- BetWarrior readiness is now PASSIVE — the captured Kambi bearer (present = logged in); no
+  cross-origin fetch. The placer already fail-closes on a stale bearer at place time. Removed
+  the sessionKey capture + checkSessionAlive URL.
+- `_read_json` swallows page.evaluate / fetch errors → `(0, {})` (a read never crashes startup).
+- `HotSessionManager._probe_readiness` wraps EVERY platform probe: a raise → NOT READY (suspend
+  + alert), never a crash. Betano stays a same-origin `/api/balance` GET (works); Betsson
+  unchanged.
+
+**State:** branch `fix/readiness-crash`. 606 tests, mypy/ruff clean. Re-deploy should start
+clean (a flaky probe degrades to suspend+alert, not a crash).
+
 ## 2026-06-10 — Bplay BLOCKER: odds-feed outcome ids ≠ betslip outcome ids
 
 **Finding:** Bplay's public XML odds feed (the scraper's source) identifies outcomes by
