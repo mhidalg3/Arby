@@ -74,6 +74,7 @@ class HotSessionManager:
         betsson: BetssonWarmTransport,
         guardrails: Guardrails,
         heartbeat_sec: float = 300.0,
+        status_interval_sec: float = 3600.0,
         login_gate: Callable[[], Awaitable[None]] | None = None,
         arm: bool = True,
         notifier: Notifier | None = None,
@@ -86,6 +87,8 @@ class HotSessionManager:
         self._betwarrior = betwarrior
         self._guardrails = guardrails
         self._heartbeat_sec = heartbeat_sec
+        # Cadence of the "I'm alive — here's what's live" Telegram status report.
+        self._status_interval_sec = status_interval_sec
         # When False, the transports are NOT armed — they open + warm but `fetch`
         # refuses (a dry-run can validate the session lifecycle while making a
         # routing-bug placement impossible).
@@ -96,7 +99,9 @@ class HotSessionManager:
         self._login_gate = login_gate
         self._notifier = notifier or NullNotifier()
         self._suspended_for_cold = False  # we tripped the switch for a cold session
+        self._readiness: dict[str, bool] = {}  # last probed per-platform readiness
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._status_task: asyncio.Task[None] | None = None
         self._log = log.bind(component="hot_sessions")
 
     async def __aenter__(self) -> HotSessionManager:
@@ -116,14 +121,17 @@ class HotSessionManager:
         # resumes once the operator finishes logging in. Detection runs regardless.
         await self._apply_health(await self._probe_readiness())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._status_task = asyncio.create_task(self._status_loop())
+        await self._notifier.send(f"🟢 Bot started — {self._status_line()}")
         self._log.info("hot_sessions.started", heartbeat_sec=self._heartbeat_sec)
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._heartbeat_task
+        for task in (self._heartbeat_task, self._status_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         if self._betwarrior is not None:
             await self._betwarrior.__aexit__(*exc)
         await self._betsson.__aexit__(*exc)
@@ -142,15 +150,33 @@ class HotSessionManager:
     async def _probe_readiness(self) -> str | None:
         """Probe every wired platform's session-readiness (the API equivalent of
         "is the place button green"): Betsson re-establishes + verifies its betting
-        context; Betano hits /api/balance; BetWarrior hits checkSessionAlive. Returns
-        the name of the FIRST not-ready platform, or None if all are placeable."""
-        if not await self._betsson.establish_betsson_context():
-            return "betsson"
-        if not await self._betano.check_betano_ready():
-            return "betano"
-        if self._betwarrior is not None and not await self._betwarrior.check_betwarrior_ready():
-            return "betwarrior"
-        return None
+        context; Betano hits /api/balance; BetWarrior hits checkSessionAlive. Records
+        the per-platform result (for the status report) and returns the name of the
+        FIRST not-ready platform, or None if all are placeable."""
+        states: dict[str, bool] = {
+            "betsson": await self._betsson.establish_betsson_context(),
+            "betano": await self._betano.check_betano_ready(),
+        }
+        if self._betwarrior is not None:
+            states["betwarrior"] = await self._betwarrior.check_betwarrior_ready()
+        self._readiness = states
+        return next((p for p, ok in states.items() if not ok), None)
+
+    def _status_line(self) -> str:
+        """One-line live status: per-platform readiness + whether auto-placement is on."""
+        if not self._readiness:
+            return "starting…"
+        parts = " · ".join(f"{p} {'✅' if ok else '❌'}" for p, ok in self._readiness.items())
+        placement = "SUSPENDED" if self._guardrails.kill_switch_tripped else "ON"
+        return f"{parts} | auto-placement: {placement}"
+
+    async def _status_loop(self) -> None:
+        """Periodic 'I'm alive — here's what's live' Telegram report (default hourly).
+        Disconnects are alerted immediately by the readiness heartbeat; this is the
+        steady all-clear so silence never looks like life."""
+        while True:
+            await asyncio.sleep(self._status_interval_sec)
+            await self._notifier.send(f"🟢 Bot alive — {self._status_line()}")
 
     async def heartbeat(self) -> bool:
         """Probe all sessions once. Returns True iff every wired platform is placeable."""

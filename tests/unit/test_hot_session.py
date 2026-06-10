@@ -131,6 +131,25 @@ async def test_cold_session_suspends_then_auto_resumes_on_recovery() -> None:
         assert any("ready again" in s for s in note.sent)
 
 
+async def test_status_heartbeat_reports_what_is_live() -> None:
+    """A 'Bot started' status fires on startup and a periodic 'Bot alive' status names
+    each platform's readiness — so silence never gets mistaken for a live bot."""
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=3600.0,
+        status_interval_sec=0.01,  # fire fast for the test
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        assert any("Bot started" in s for s in note.sent)
+        await asyncio.sleep(0.03)
+        assert any("Bot alive" in s for s in note.sent)
+        assert any("betano ✅" in s and "betsson ✅" in s for s in note.sent)
+
+
 async def test_not_ready_platform_other_than_betsson_suspends_and_is_named() -> None:
     """Readiness now covers Betano + BetWarrior, not just Betsson — a not-ready Betano
     session suspends auto-placement at startup and the alert names the platform."""

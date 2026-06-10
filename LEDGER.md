@@ -1,5 +1,23 @@
 # Project Ledger
 
+## 2026-06-10 — Hourly status heartbeat + disconnect alerts (operator visibility)
+
+**Context:** Operator wants periodic "what's live" Telegram pings + disconnect alerts, so
+silence is never mistaken for a healthy bot.
+
+**Decision:** `HotSessionManager` gains a `status_interval_sec` (default 3600s) + a
+`_status_loop` task that sends `🟢 Bot alive — betano ✅ · betsson ✅ · betwarrior ✅ |
+auto-placement: ON/SUSPENDED` every interval (reads the per-platform readiness tracked by the
+heartbeat — no extra probing). A `🟢 Bot started` status fires on startup. DISCONNECTS already
+alert immediately via the Stage-2 readiness heartbeat (`🔌 {platform} session NOT READY` →
+suspend; `✅ ready again` → resume); the hourly status is the steady all-clear between events.
+`_probe_readiness` now records all per-platform states (for the status line) and still returns
+the first not-ready platform for the suspend logic.
+
+**State:** branch `feat/status-heartbeat`. 606 tests (+1), mypy/ruff clean. NEXT: Bplay as the
+5th platform (final before real deployment) — its scraper + Tier-2 refresher exist; needs the
+execution placer/auth contract (likely a capture) + wiring, like BetWarrior.
+
 ## 2026-06-10 — Stage 2: per-platform session readiness checks (the "green button")
 
 **Context:** Generalize the hot-session readiness model (was Betsson-only) to every platform —
