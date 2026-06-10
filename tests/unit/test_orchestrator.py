@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from src.arbitrage.quotes import OddsQuote
 from src.execution.executor import ExecutionOutcome, Executor, Leg, PlacementResult
 from src.execution.guardrails import Guardrails
@@ -43,7 +45,13 @@ class _Placer:
 
 
 class _Notifier:
+    """Recording notifier — captures every message sent."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
     async def send(self, text: str) -> bool:
+        self.sent.append(text)
         return True
 
 
@@ -75,11 +83,15 @@ def _risk() -> RiskEvaluator:
 
 
 def _orch(
-    source: _FakeQuoteSource, guard: Guardrails, placers: dict[str, _Placer]
+    source: _FakeQuoteSource,
+    guard: Guardrails,
+    placers: dict[str, _Placer],
+    notifier: _Notifier | None = None,
+    empty_alert_after: int = 5,
 ) -> ArbOrchestrator:
     ex = Executor(
         guardrails=guard,
-        notifier=_Notifier(),
+        notifier=notifier or _Notifier(),
         recovery=_Recovery(),
         placers=placers,  # type: ignore[arg-type]
     )
@@ -90,6 +102,8 @@ def _orch(
         guardrails=guard,
         budget_ars=1000.0,
         min_margin_pct=1.0,
+        notifier=notifier,
+        empty_alert_after=empty_alert_after,
     )
 
 
@@ -127,10 +141,53 @@ async def test_market_executed_once_across_polls() -> None:
     assert bp.calls == 1 and ap.calls == 1  # NOT re-placed
 
 
-async def test_kill_switch_stops_execution() -> None:
-    g = _guard()
-    g.trip_kill_switch("manual halt")
+async def test_arb_found_is_alerted() -> None:
+    g, note = _guard(), _Notifier()
     bp, ap = _Placer(), _Placer()
-    orch = _orch(_FakeQuoteSource(_arb_market()), g, {"betsson": bp, "betano": ap})
+    orch = _orch(_FakeQuoteSource(_arb_market()), g, {"betsson": bp, "betano": ap}, notifier=note)
+    await orch.run_once()
+    assert any(m.startswith("🎯 ARB") for m in note.sent)
+
+
+async def test_kill_switch_suspends_autoplacement_but_hands_off_manually() -> None:
+    """A tripped kill switch no longer silently does nothing: the arb is still
+    detected + alerted, and the operator is told to place it manually. No auto-bet."""
+    g, note = _guard(), _Notifier()
+    g.trip_kill_switch("session cold")
+    bp, ap = _Placer(), _Placer()
+    orch = _orch(_FakeQuoteSource(_arb_market()), g, {"betsson": bp, "betano": ap}, notifier=note)
     results = await orch.run_once()
-    assert results == [] and bp.calls == 0
+    assert results == [] and bp.calls == 0 and ap.calls == 0  # nothing auto-placed
+    assert any(m.startswith("🎯 ARB") for m in note.sent)  # still alerted
+    assert any("MANUALLY" in m for m in note.sent)  # handed off
+
+
+async def test_run_forever_keeps_detecting_through_kill_switch() -> None:
+    """Detection never halts on a tripped kill switch — the loop keeps polling
+    until the operator stops it."""
+    g, note = _guard(), _Notifier()
+    g.trip_kill_switch("session cold")
+    src = _FakeQuoteSource(_arb_market())
+    orch = _orch(src, g, {"betsson": _Placer(), "betano": _Placer()}, notifier=note)
+
+    async def _stop_after_a_few() -> None:
+        await asyncio.sleep(0.05)
+        orch.stop()
+
+    await asyncio.gather(orch.run_forever(poll_interval_sec=0.01), _stop_after_a_few())
+    assert src.fetches >= 2  # kept detecting despite the kill switch
+
+
+async def test_ingestion_stall_alerts_once_then_recovers() -> None:
+    g, note = _guard(), _Notifier()
+    empty = _FakeQuoteSource({})
+    orch = _orch(empty, g, {"betsson": _Placer(), "betano": _Placer()}, notifier=note,
+                 empty_alert_after=2)
+    await orch.run_once()  # 1 empty
+    await orch.run_once()  # 2 empty → alert
+    await orch.run_once()  # 3 empty → no repeat alert
+    stalls = [m for m in note.sent if "No market data" in m]
+    assert len(stalls) == 1
+    empty.by_market = _arb_market()
+    await orch.run_once()  # data returns → recovery alert
+    assert any("recovered" in m for m in note.sent)

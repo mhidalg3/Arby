@@ -101,6 +101,19 @@ async def test_happy_path_completes_and_records_exposure() -> None:
     assert any("COMPLETE" in t for t in n.sent)
 
 
+async def test_placed_bet_alert_describes_leg_platform_event_and_bet() -> None:
+    g, n = _guard(), _FakeNotifier()
+    leg_a, leg_b = _legs()
+    await _executor(g, n, _FakeRecovery(), DryRunPlacer()).execute_two_leg("opp1", leg_a, leg_b)
+    placed = [t for t in n.sent if "BET PLACED" in t]
+    assert len(placed) == 2  # one per leg
+    a = next(t for t in placed if "Leg A" in t)
+    assert leg_a.platform in a  # platform
+    assert leg_a.market in a  # event/market
+    assert leg_a.outcome in a  # what bet
+    assert "BET PLACED — Leg B" in "\n".join(placed)  # leg attribution
+
+
 async def test_precheck_failure_places_nothing() -> None:
     g = _guard(max_position_per_match_ars=50.0)  # 100 > 50 → deny Leg A
     placer = _CountingPlacer()

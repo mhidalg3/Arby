@@ -26,7 +26,7 @@ import structlog
 from src.execution.executor import DryRunPlacer, Executor
 from src.execution.guardrails import Guardrails
 from src.execution.hot_session import HotSessionManager
-from src.execution.notify import NullNotifier
+from src.execution.notify import build_notifier
 from src.execution.orchestrator import ArbOrchestrator
 from src.execution.quote_source import OverlapQuoteSource
 from src.execution.recovery import HumanRecoveryHandler
@@ -92,43 +92,49 @@ async def main() -> int:
             "balance, press ENTER… ",
         )
 
-    manager = HotSessionManager(
-        betano=betano_t,
-        betsson=betsson_t,
-        guardrails=guard,
-        login_gate=_operator_login,
-        arm=live,
-    )
-
-    async with httpx.AsyncClient(headers=headers, timeout=25.0) as client, manager:
-        source = OverlapQuoteSource(
-            anchor=BetanoScraper(http_client=client, mode="prematch"),
-            linker=BetssonScraper(http_client=client),
-            canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()),
-            staleness_sec=float(os.environ.get("STALENESS_SEC", "45")),
-        )
-        placers = (
-            manager.placers()
-            if live
-            else {"betano": DryRunPlacer(), "betsson-pba": DryRunPlacer()}
-        )
-        executor = Executor(
+    async with httpx.AsyncClient(headers=headers, timeout=25.0) as client:
+        # Real notifier if Telegram creds are in the keychain, else a NullNotifier.
+        # Shared by the manager (cold-session alerts), executor (naked leg / freeze)
+        # and orchestrator (arb found / errors). See src/execution/notify.py.
+        notifier = build_notifier(client)
+        manager = HotSessionManager(
+            betano=betano_t,
+            betsson=betsson_t,
             guardrails=guard,
-            notifier=NullNotifier(),
-            recovery=HumanRecoveryHandler(NullNotifier()),
-            placers=placers,
-            dry_run=not live,
+            login_gate=_operator_login,
+            arm=live,
+            notifier=notifier,
         )
-        orch = ArbOrchestrator(
-            quote_source=source,
-            risk_evaluator=risk,
-            executor=executor,
-            guardrails=guard,
-            budget_ars=budget,
-            dynamic_stake_cap_ars=betano_cap,
-        )
-        log.warning("hot_loop.start", live=live, budget=budget, poll=poll)
-        await orch.run_forever(poll_interval_sec=poll)  # stops when the kill switch trips
+        async with manager:
+            source = OverlapQuoteSource(
+                anchor=BetanoScraper(http_client=client, mode="prematch"),
+                linker=BetssonScraper(http_client=client),
+                canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()),
+                staleness_sec=float(os.environ.get("STALENESS_SEC", "45")),
+            )
+            placers = (
+                manager.placers()
+                if live
+                else {"betano": DryRunPlacer(), "betsson-pba": DryRunPlacer()}
+            )
+            executor = Executor(
+                guardrails=guard,
+                notifier=notifier,
+                recovery=HumanRecoveryHandler(notifier),
+                placers=placers,
+                dry_run=not live,
+            )
+            orch = ArbOrchestrator(
+                quote_source=source,
+                risk_evaluator=risk,
+                executor=executor,
+                guardrails=guard,
+                budget_ars=budget,
+                dynamic_stake_cap_ars=betano_cap,
+                notifier=notifier,
+            )
+            log.warning("hot_loop.start", live=live, budget=budget, poll=poll)
+            await orch.run_forever(poll_interval_sec=poll)  # until Ctrl-C (never self-halts)
     log.info("hot_loop.stopped")
     return 0
 

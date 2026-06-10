@@ -187,7 +187,7 @@ class Executor:
         if not res_a.accepted:
             return await self._abort(opp_id, f"Leg A rejected: {res_a.detail}", leg_a=res_a)
         self._guardrails.record_exposure(leg_a.match_id, res_a.stake_filled)
-        await self._notifier.send(f"{self._tag}arb {opp_id}: Leg A filled @ {res_a.odds_filled}")
+        await self._notifier.send(self._format_placed(opp_id, "A", leg_a, res_a))
 
         # 3) Re-verify Leg B before committing the second leg (the naked-exposure guard).
         current_b = await self._reverify(leg_b)
@@ -197,6 +197,7 @@ class Executor:
         if not res_b.accepted:
             return await self._naked(opp_id, f"Leg B rejected: {res_b.detail}", res_a)
         self._guardrails.record_exposure(leg_b.match_id, res_b.stake_filled)
+        await self._notifier.send(self._format_placed(opp_id, "B", leg_b, res_b))
 
         await self._notifier.send(
             f"{self._tag}arb {opp_id}: COMPLETE — Leg A {res_a.stake_filled}@{res_a.odds_filled}, "
@@ -204,6 +205,20 @@ class Executor:
         )
         self._log.info("executor.completed", opp_id=opp_id)
         return ExecutionResult(ExecutionOutcome.COMPLETED, leg_a=res_a, leg_b=res_b)
+
+    def _format_placed(self, opp_id: str, label: str, leg: Leg, res: PlacementResult) -> str:
+        """Operator alert for a placed bet: which leg, on what platform/event, the
+        exact selection + stake + odds filled, and the platform's bet reference."""
+        odds = res.odds_filled or leg.odds
+        stake = res.stake_filled or leg.stake_ars
+        return (
+            f"{self._tag}✅ BET PLACED — Leg {label} of arb {opp_id}\n"
+            f"   platform: {leg.platform}\n"
+            f"   event: {leg.platform_event_ref or leg.match_id}\n"
+            f"   market: {leg.market}\n"
+            f"   bet: {leg.outcome} @ {odds} for {stake:.0f} ARS\n"
+            f"   ref: {res.ref or '—'}"
+        )
 
     async def _abort(
         self, opp_id: str, reason: str, leg_a: PlacementResult | None = None

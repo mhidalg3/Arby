@@ -79,6 +79,13 @@ class Guardrails:
     def kill_switch_tripped(self) -> bool:
         return self._kill_switch_reason is not None
 
+    @property
+    def kill_switch_reason(self) -> str | None:
+        """The reason the switch is tripped (None if not). Lets a caller reset
+        only the trip it owns (e.g. the heartbeat auto-resuming a cold session,
+        without clearing a hard daily-loss/freeze trip)."""
+        return self._kill_switch_reason
+
     def trip_kill_switch(self, reason: str) -> None:
         if self._kill_switch_reason is None:
             self._kill_switch_reason = reason

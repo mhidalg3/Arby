@@ -8,8 +8,11 @@ is far too slow for arb timing AND re-logging-in repeatedly is a bot signal. The
 manager opens both once, arms them, establishes the Betsson context, and runs a
 background **heartbeat** that re-warms the sessions (the apps refresh their tokens
 while open + active; Betsson's context needs periodic re-establishment). If a
-session can't be (re)warmed, the heartbeat trips the kill switch — better to halt
-than place through a half-dead session.
+session goes cold the heartbeat **suspends auto-placement** (trips the kill switch)
+and alerts the operator — but it does NOT stop: it keeps probing and AUTO-RESUMES
+(resets the kill switch) once the operator has re-logged in. Detection upstream
+keeps running throughout; we never trade through a half-dead session, but we never
+stop watching either.
 
 The Betsson in-app-nav trigger inside `establish_betsson_context` is
 operator-validated against the live DOM; everything here is unit-tested against a
@@ -28,8 +31,14 @@ import structlog
 from src.execution.executor import LegPlacer
 from src.execution.guardrails import Guardrails
 from src.execution.leg_placer import BetanoLegPlacer, BetssonLegPlacer
+from src.execution.notify import Notifier, NullNotifier
 
 log = structlog.get_logger(__name__)
+
+# The kill-switch reason the manager owns. The heartbeat auto-resets ONLY this
+# trip when the session recovers — a hard trip (freeze / daily loss) carries a
+# different reason and is left alone.
+_COLD_REASON = "betsson session went cold"
 
 
 class WarmTransport(Protocol):
@@ -56,6 +65,7 @@ class HotSessionManager:
         heartbeat_sec: float = 300.0,
         login_gate: Callable[[], Awaitable[None]] | None = None,
         arm: bool = True,
+        notifier: Notifier | None = None,
     ) -> None:
         self._betano = betano
         self._betsson = betsson
@@ -69,6 +79,8 @@ class HotSessionManager:
         # the seam for the initial operator login (or a future automated re-auth).
         # None ⇒ assume the persistent profiles are already logged in.
         self._login_gate = login_gate
+        self._notifier = notifier or NullNotifier()
+        self._suspended_for_cold = False  # we tripped the switch for a cold session
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._log = log.bind(component="hot_sessions")
 
@@ -80,11 +92,10 @@ class HotSessionManager:
             self._betsson.arm()
         if self._login_gate is not None:
             await self._login_gate()
-        if not await self._betsson.establish_betsson_context():
-            # Can't reach a placeable Betsson state at startup → don't pretend we
-            # can trade; trip the kill switch so the executor aborts everything.
-            self._guardrails.trip_kill_switch("betsson context not established at startup")
-            self._log.error("hot_sessions.betsson_context_failed")
+        # Can't reach a placeable Betsson state at startup → suspend auto-placement
+        # and alert, but DON'T halt: the heartbeat keeps probing and resumes once the
+        # operator finishes logging in. Detection upstream runs regardless.
+        await self._apply_health(await self._betsson.establish_betsson_context())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._log.info("hot_sessions.started", heartbeat_sec=self._heartbeat_sec)
         return self
@@ -113,13 +124,35 @@ class HotSessionManager:
         return ok
 
     async def _heartbeat_loop(self) -> None:
+        """Probe forever. A cold session suspends auto-placement + alerts; recovery
+        resumes it. The loop never returns on a fault — detection must not stop."""
         while True:
             await asyncio.sleep(self._heartbeat_sec)
             try:
-                if not await self.heartbeat():
-                    self._guardrails.trip_kill_switch("betsson session went cold")
-                    return
-            except Exception as exc:  # noqa: BLE001 — a heartbeat fault must halt, not crash silently
+                ok = await self.heartbeat()
+            except Exception as exc:  # noqa: BLE001 — a fault suspends, never kills the loop
                 self._log.error("hot_sessions.heartbeat_error", error=str(exc))
-                self._guardrails.trip_kill_switch(f"heartbeat error: {exc!s}")
-                return
+                ok = False
+            await self._apply_health(ok)
+
+    async def _apply_health(self, ok: bool) -> None:
+        """Reconcile session health with the kill switch + alerts on transitions
+        only (so we don't spam an alert every heartbeat while a session stays cold)."""
+        if not ok and not self._suspended_for_cold:
+            self._suspended_for_cold = True
+            self._guardrails.trip_kill_switch(_COLD_REASON)
+            await self._notifier.send(
+                "🔌 Betsson session went COLD — auto-placement suspended. Re-log into the "
+                "Betsson window; I'll resume automatically. Detection keeps running."
+            )
+        elif ok and self._suspended_for_cold:
+            self._suspended_for_cold = False
+            # Reset only OUR trip — leave a hard freeze / daily-loss stop in place.
+            if self._guardrails.kill_switch_reason == _COLD_REASON:
+                self._guardrails.reset_kill_switch()
+                await self._notifier.send("✅ Betsson session restored — auto-placement resumed.")
+            else:
+                await self._notifier.send(
+                    "✅ Betsson session restored, but auto-placement stays suspended "
+                    f"({self._guardrails.kill_switch_reason}) — resolve + restart to resume."
+                )

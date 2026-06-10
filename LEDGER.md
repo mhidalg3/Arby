@@ -1,5 +1,45 @@
 # Project Ledger
 
+## 2026-06-10 — Telegram alerts + never-halt detection (notify + manual-assist)
+
+**Context:** Run the 2-leg loop supervised for long stretches while the 3-leg
+version is developed. Requirement: real Telegram alerts (arb found / error / naked
+leg) and ingestion that NEVER halts — on a fault the operator is notified and
+assists placement manually, rather than the loop stopping.
+
+**Decisions:**
+- The `TelegramNotifier` already existed (keychain-backed, fail-soft); the executor
+  already alerted on naked leg/abort/freeze. Wired the real notifier (`build_notifier`)
+  into `run_hot_loop` (was `NullNotifier`), shared by manager + executor + orchestrator.
+- **Decoupled detection from the kill switch.** `ArbOrchestrator.run_forever` now loops
+  until `stop()` (operator), not on the kill switch. The kill switch gates only
+  AUTO-placement: while tripped, the loop keeps detecting and, per found arb, alerts the
+  operator to place MANUALLY (`🎯 ARB …` + `✋ … place MANUALLY`).
+- **Cold session = suspend + auto-resume, not halt.** `HotSessionManager` heartbeat
+  alerts (`🔌 COLD`), trips the kill switch with reason `_COLD_REASON`, keeps probing,
+  and auto-resets ONLY that trip on recovery (`✅ restored`). Hard trips (freeze /
+  daily-loss, different reason) survive a recovery. Startup context failure now suspends
+  + alerts instead of halting. Added `Guardrails.kill_switch_reason` for ownership-scoped
+  reset.
+- **Ingestion-stalled alert:** orchestrator alerts once after `empty_alert_after` (default
+  5) consecutive no-data cycles and again on recovery — catches a blocked/down scrape
+  without halting. Loop-error alerts are de-duped (no per-poll spam).
+- **Per-bet placed alert** (`executor._format_placed`): on each accepted leg, a
+  `✅ BET PLACED — Leg A/B` message with platform, event (platform_event_ref|match_id),
+  market, the selection @ odds × stake, and the platform bet ref. Event uses the canonical
+  id; threading the human team-name through OddsQuote→Leg is a deferred nicety.
+
+**Telegram verification (2026-06-10):** token valid (`@arby_notif_bot`) but the stored
+`chat_id` was the BOT's own id → sendMessage 403 "can't send messages to the bot". Fix:
+operator messages the bot once, then auto-detect the real chat_id from getUpdates and
+store it. Code is correct regardless; this is keychain config.
+
+**State:** branch `feat/telegram-notify-never-halt`. 586 tests (+6), mypy/ruff clean.
+Telegram chat_id needs the fix above before alerts deliver. Open: no in-band reset channel
+— a hard trip needs a restart to re-enable auto-placement (a Telegram command handler is
+the future seam). 3-leg detector/executor is the next build.
+
+
 ## 2026-06-09 — Fix fixture-matching false positive (the 72% phantom arb)
 
 **Context:** The dry-run hot loop surfaced a persistent phantom arb

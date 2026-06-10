@@ -24,7 +24,10 @@
       "Bash(python3)",
       "Bash(kill -9 47694 47699)",
       "Bash(pkill -9 -f \"recon_watchdog\")",
-      "Bash(KICKOFF_UTC=2026-05-27T22:00:00Z uv run *)"
+      "Bash(KICKOFF_UTC=2026-05-27T22:00:00Z uv run *)",
+      "Bash(git commit -q -m 'semantic: require both teams for Betsson fixture link \\(kill phantom arb\\) *)",
+      "Bash(git push *)",
+      "Bash(git branch *)"
     ]
   },
   "enableAllProjectMcpServers": true,

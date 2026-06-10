@@ -91,3 +91,58 @@ async def test_heartbeat_loop_trips_kill_switch_when_session_dies() -> None:
         bsn.context_ok = False  # next heartbeat finds it cold
         await asyncio.sleep(0.05)  # let the loop fire
         assert g.kill_switch_tripped
+
+
+class _RecordingNotifier:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, text: str) -> bool:
+        self.sent.append(text)
+        return True
+
+
+async def test_cold_session_suspends_then_auto_resumes_on_recovery() -> None:
+    """A cold session suspends auto-placement + alerts; the loop keeps probing and
+    auto-resumes (resets the kill switch) once the session is restored."""
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.context_ok = False  # goes cold
+        await asyncio.sleep(0.04)
+        assert g.kill_switch_tripped  # auto-placement suspended
+        assert any("COLD" in s for s in note.sent)
+        bsn.context_ok = True  # operator re-logs in
+        await asyncio.sleep(0.04)
+        assert not g.kill_switch_tripped  # auto-resumed
+        assert any("restored" in s for s in note.sent)
+
+
+async def test_cold_recovery_does_not_clear_a_hard_trip() -> None:
+    """The heartbeat resets only ITS cold-session trip; a hard freeze/daily-loss
+    trip (different reason) survives a session recovery."""
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        # Realistic ordering: a hard trip lands first (placement is suspended while
+        # cold, so a freeze can't originate during a cold window). Then the session
+        # goes cold and recovers — the hard trip must survive.
+        g.trip_kill_switch("frozen: something bad")
+        bsn.context_ok = False
+        await asyncio.sleep(0.03)
+        bsn.context_ok = True
+        await asyncio.sleep(0.03)
+        assert g.kill_switch_tripped  # the hard trip is NOT auto-cleared
+        assert g.kill_switch_reason == "frozen: something bad"
