@@ -271,14 +271,15 @@ def parse_bplay(resp: dict[str, Any]) -> PlacementResult:
 
 def parse_betwarrior(resp: dict[str, Any]) -> PlacementResult:
     """``{"status":"SUCCESS","couponRef":N,"coupon":{"bets":[{"betOdds","stake"}]}}``
-    Kambi units: odds are ×100, stake is ×1000."""
+    Kambi units: BOTH odds and stake are ×1000 (confirmed by a live placement — a 1.14
+    bet echoes ``betOdds: 1140``, 50 ARS ``stake: 50000``)."""
     if resp.get("status") != "SUCCESS":
         return PlacementResult(accepted=False, detail=f"betwarrior: status={resp.get('status')}")
     bet = _first(_d(resp.get("coupon")).get("bets"))
     return PlacementResult(
         accepted=True,
         stake_filled=_f(bet.get("stake")) / 1000.0,
-        odds_filled=_f(bet.get("betOdds")) / 100.0,
+        odds_filled=_f(bet.get("betOdds")) / 1000.0,
         ref=str(resp.get("couponRef", "")),
     )
 

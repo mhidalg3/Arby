@@ -1,5 +1,27 @@
 # Project Ledger
 
+## 2026-06-10 — BetWarrior VALIDATED end-to-end (+ parse odds-scale fix)
+
+**Milestone:** BetWarrior placed a real bet via the production path — `accepted=True`,
+couponRef `12735543373`, 50 ARS @ 1.14. Bearer capture → correct coupon contract (×1000, NO)
+→ placement, all confirmed live. BetWarrior is the 4th platform validated for execution.
+(First attempt 400'd on a sub-second tick; the retry caught a stable window — expected on a
+live line.)
+
+**Bug found in the result:** `parse_betwarrior` divided `betOdds` by 100 → reported
+`odds_filled=11.4` for a 1.14 bet (the SAME ×100/×1000 error, response side). The bet placed
+fine but the misreported odds would corrupt exposure/P&L. Fixed: `betOdds / 1000`.
+
+**Operator insight (logged for the readiness follow-up):** the most reliable session-freshness
+signal is whether the bet is PLACEABLE (the app's green "place" button after adding a
+selection + stake). The API equivalent for Kambi is `coupon/validate.json` → `validSession:
+true` (recon 2026-06-01) — a no-stake session check. Wire it as the BetWarrior hot-session
+readiness/heartbeat check (analogous to Betsson's context establishment): confirm validSession
+before relying on the warm session, alert + suspend if it goes false.
+
+**State:** branch `fix/betwarrior-parse-odds`. 596 tests, mypy/ruff clean. BetWarrior
+execution-validated. Open: executor-wide live re-verify; BetWarrior validate.json readiness.
+
 ## 2026-06-10 — BetWarrior coupon.json: fix odds scale ×100 → ×1000 (from capture)
 
 **Root cause (capture-ui ground truth):** the app's real `coupon.json` sends odds at Kambi

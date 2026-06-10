@@ -52,7 +52,7 @@ def test_betwarrior_accepted_normalizes_kambi_units() -> None:
     )
     assert r.accepted
     assert r.ref == "12713234454"
-    assert r.odds_filled == 14.0  # ×100
+    assert r.odds_filled == 1.4  # ×1000 (confirmed by live placement)
     assert r.stake_filled == 1000.0  # ×1000
 
 
