@@ -20,8 +20,8 @@ Usage:
         --stake 50 --arm --yes-real-money                            # SENDS
     uv run python scripts/trial_place.py --platform betwarrior --discover
     uv run python scripts/trial_place.py --platform betwarrior \
-        --selection 4206111729 --odds 1.41 \
-        --stake 50 --arm --yes-real-money                            # SENDS
+        --selection 4206111729 --event-id 1027854437 --odds 1.41 \
+        --stake 50 --arm --yes-real-money     # re-reads live odds, places if within tol; SENDS
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from src.execution.leg_placer import BetanoLegPlacer, BetssonLegPlacer, BetWarri
 from src.execution.session import InSessionTransport
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
-from src.ingestion.scrapers.betwarrior import BetWarriorPbaScraper
+from src.ingestion.scrapers.betwarrior import BetWarriorPbaDepthScraper, BetWarriorPbaScraper
 
 TRIAL_HARD_CAP_ARS = 300.0  # a bug cannot bet more than this in trial mode
 REPO_ROOT_ARTIFACTS = Path(__file__).resolve().parent.parent / "recon" / "artifacts"
@@ -418,12 +418,26 @@ async def _arm_betano(args: argparse.Namespace) -> None:
     )
 
 
+async def _betwarrior_live_odds(event_id: str, outcome_id: str) -> float | None:
+    """Re-fetch BetWarrior's CURRENT odds for one outcome via the public Kambi per-event
+    endpoint — the live re-verify primitive (so placement uses fresh odds, not a stale
+    CLI value). Returns None if the outcome isn't found."""
+    headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "es-AR,es;q=0.9"}
+    async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
+        depth = BetWarriorPbaDepthScraper(http_client=client)
+        for snap in await depth.fetch_event_quotes(event_id):
+            if snap.platform_outcome_id == outcome_id:
+                return snap.decimal_odds
+    return None
+
+
 async def _arm_betwarrior(args: argparse.Namespace) -> None:
-    """BetWarrior (Kambi) place via the production BetWarriorLegPlacer + transport.
-    The placer reads the live Kambi session bearer the transport captures from the
-    SPA's authenticated player-API calls — so the operator must be logged in AND have
-    triggered such a call (the balance/account view does it) before placing."""
-    leg = _build_leg(args)  # platform_outcome_id=selection (the Kambi outcome id)
+    """BetWarrior (Kambi) place via the production BetWarriorLegPlacer + transport, with a
+    LIVE odds re-verify at placement time: re-fetch the selection's current odds, confirm
+    they still clear the arb threshold (within `--odds-tolerance-pct` of the expected
+    `--odds`), then place AT the current odds. This is the dynamic-capture model — not a
+    stale fixed odds. The placer reads the Kambi session bearer the transport captures from
+    the SPA's authenticated calls, so be logged in with the balance visible."""
     print(f"⚠️  LIVE (BetWarrior, production placer): real {args.stake} ARS — watch the browser.")
     transport = InSessionTransport("betwarrior", dry_run=False)
     async with transport:
@@ -435,11 +449,34 @@ async def _arm_betwarrior(args: argparse.Namespace) -> None:
             input,
             "\n  ▶ LOG IN to BetWarrior in the window. Make sure your BALANCE is visible "
             "(that fires the authenticated call whose bearer we capture). Then press ENTER "
-            "to place… ",
+            "— I'll re-read the live odds and place if they still clear the threshold… ",
         )
-        # Trial accepts the book's current odds (reserve lines move faster than the
-        # discover→arm gap, else Kambi rejects "Invalid odds specified"). This validates
-        # the mechanics; production keeps odds fixed (the arb edge) + live re-verify.
+        # Dynamic capture: re-read the CURRENT odds right now (not the stale CLI value).
+        current = await _betwarrior_live_odds(args.event_id, args.selection)
+        if current is None:
+            print("\n=== RESULT (betwarrior) ===\nABORT: couldn't read live odds for that "
+                  "selection (check --event-id / --selection from --discover) — nothing placed")
+            return
+        floor = args.odds * (1.0 - args.odds_tolerance_pct / 100.0)
+        print(
+            f"  expected(discovery)={args.odds}  live={current}  "
+            f"threshold floor={floor:.3f} (tol {args.odds_tolerance_pct}%)"
+        )
+        # Arb-threshold check: only place if the live odds haven't dropped below the floor
+        # (higher is always fine — better for us). This is what `odds_still_acceptable` does.
+        if current < floor:
+            print(
+                f"\n=== RESULT (betwarrior) ===\nABORT: live odds {current} < floor {floor:.3f} "
+                "— drifted past tolerance, the arb would not hold. Nothing placed."
+            )
+            return
+        # Place AT the verified current odds (allow_odds_change so Kambi honors the residual
+        # sub-second move between this read and the POST).
+        leg = Leg(
+            platform="betwarrior-pba", match_id=args.event_id, market="1X2",
+            outcome=args.outcome, stake_ars=args.stake, odds=current,
+            platform_outcome_id=args.selection,
+        )
         res = await BetWarriorLegPlacer(transport, allow_odds_change=True).place(leg)
     print(
         f"\n=== RESULT (betwarrior) ===\naccepted={res.accepted}  ref={res.ref!r}  "
@@ -561,7 +598,13 @@ def main() -> None:
     p.add_argument("--event-id", default="", help="Betano eventId (from --discover)")
     p.add_argument("--slug", default="", help="Betsson event-page slug (from --discover)")
     p.add_argument("--outcome", default="home", help="label only, for logging")
-    p.add_argument("--odds", type=float, default=0.0)
+    p.add_argument("--odds", type=float, default=0.0, help="expected odds (from discovery) — the re-verify floor reference")
+    p.add_argument(
+        "--odds-tolerance-pct",
+        type=float,
+        default=2.0,
+        help="betwarrior: live odds may drop at most this %% below --odds and still place",
+    )
     p.add_argument("--stake", type=float, default=50.0)
     p.add_argument("--arm", action="store_true", help="actually send (real money)")
     p.add_argument("--yes-real-money", action="store_true", help="required alongside --arm")
@@ -631,6 +674,8 @@ def main() -> None:
                 sys.exit("REFUSED: betsson --arm needs --slug (from --discover)")
             if args.platform == "betano" and not args.event_id:
                 sys.exit("REFUSED: betano --arm needs --event-id (from --discover)")
+            if args.platform == "betwarrior" and not args.event_id:
+                sys.exit("REFUSED: betwarrior --arm needs --event-id (for the live odds re-verify)")
         asyncio.run(_arm_and_send(args))
     else:
         if not args.selection or not args.odds:

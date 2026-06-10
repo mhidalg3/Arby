@@ -1,5 +1,32 @@
 # Project Ledger
 
+## 2026-06-10 — BetWarrior trial: dynamic odds re-verify (capture-at-placement + threshold)
+
+**Context (operator clarification):** the right model is NOT "place at the exact discovery
+odds" — it's "re-read the live odds at placement and place only if they still clear the arb
+threshold (within tolerance), at the current odds." A fixed CLI `--odds` is stale by ENTER on
+live games.
+
+**Decision:** `trial_place.py` BetWarrior arm now does a LIVE re-verify at ENTER:
+`_betwarrior_live_odds(event_id, outcome_id)` re-fetches the selection's current odds via the
+public Kambi per-event endpoint (`BetWarriorPbaDepthScraper.fetch_event_quotes`); the trial
+places only if `live >= --odds * (1 - --odds-tolerance-pct/100)` (default tol 2%), AT the
+current odds (allow_odds_change=YES for the residual sub-second move), else ABORTS. `--odds`
+is now the discovery reference/floor, not the placed value; `--event-id` required for the
+re-fetch.
+
+**Verified live:** the re-fetch primitive works — a selection that was 3.3 at discovery read
+1.02 live (match went in-play); the threshold check would correctly abort that, not place
+blindly.
+
+**Production follow-up (the real target):** wire this live re-verify as the Executor's
+`reverify` callable per platform, so every arb leg re-reads current odds + checks
+`odds_still_acceptable` before placing (place-at-current-within-tolerance). The trial proves
+the mechanism; the executor wiring (all platforms) is the production piece.
+
+**State:** branch `feat/betwarrior-live-reverify-trial`. 597 tests, ruff clean. Operator
+re-runs against a PREMATCH match (stable odds) to get a clean place + validate end-to-end.
+
 ## 2026-06-10 — BetWarrior trial: odds-change handling (400 "Invalid odds specified")
 
 **Context:** The standalone BetWarrior trial reached Kambi (bearer capture + coupon contract
