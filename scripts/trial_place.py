@@ -57,6 +57,14 @@ _BASE_URL = {
     "betwarrior": "https://pba.betwarrior.bet.ar/",
 }
 
+# URL substrings that mark an authenticated session / readiness call — the API
+# equivalents of "is the place button green". `--capture-session` records these so
+# the per-platform readiness check is built against the real contract, not a guess.
+_READINESS_HINTS = (
+    "validate", "balance", "account", "wallet", "session", "punter",
+    "user-context", "profile", "kambicdn.com/player/",
+)
+
 
 async def _discover(platform: str) -> None:
     """Read-only: print current bettable events grouped by event, with the real
@@ -418,6 +426,75 @@ async def _arm_betano(args: argparse.Namespace) -> None:
     )
 
 
+async def _capture_session(platform: str) -> None:
+    """Read-only: record the authenticated session/readiness API calls the app makes
+    (validate.json / balance / account / user-context) so the per-platform "is this
+    session placeable?" check can be built against the real contract. NO bet placed."""
+    import time as _time  # noqa: PLC0415
+
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from scripts.recon.stealth import apply_stealth  # noqa: PLC0415
+
+    reqs: list[dict[str, object]] = []
+    resps: dict[str, tuple[int, str]] = {}
+
+    def on_request(req: object) -> None:
+        u = req.url  # type: ignore[attr-defined]
+        if any(h in u.lower() for h in _READINESS_HINTS):
+            reqs.append({"method": req.method, "url": u, "body": req.post_data})  # type: ignore[attr-defined]
+
+    async def on_response(resp: object) -> None:
+        u = resp.url  # type: ignore[attr-defined]
+        if any(h in u.lower() for h in _READINESS_HINTS):
+            with contextlib.suppress(Exception):
+                resps[u] = (resp.status, (await resp.text())[:400])  # type: ignore[attr-defined]
+
+    print(f"⚠️  CAPTURE SESSION on {platform} (read-only; no bet).\n  {_BASE_URL[platform]}")
+    pw = await async_playwright().start()
+    ctx = await pw.chromium.launch_persistent_context(
+        user_data_dir=f"recon/profile/{platform}",
+        headless=False,
+        channel="chrome",
+        locale="es-AR",
+        timezone_id="America/Argentina/Buenos_Aires",
+        permissions=["geolocation"],
+        geolocation={"latitude": -34.9215, "longitude": -57.9545},
+    )
+    try:
+        await apply_stealth(ctx)
+        ctx.on("request", on_request)
+        ctx.on("response", on_response)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(_BASE_URL[platform], wait_until="networkidle", timeout=60000)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            input,
+            f"\n  ▶ Log into {platform}, VIEW YOUR BALANCE, and ADD a selection to the betslip "
+            "with a stake (do NOT place). That fires the session/validate calls.\n"
+            "  Press ENTER when done to dump what I captured… ",
+        )
+        print(f"\n=== CAPTURED session/readiness calls on {platform} ({len(reqs)}) ===")
+        for r in reqs:
+            resp = resps.get(str(r["url"]))
+            print(f"\n  {r['method']} {r['url']}")
+            if r["body"]:
+                print(f"     body: {str(r['body'])[:300]}")
+            if resp:
+                print(f"     -> {resp[0]}  {resp[1]}")
+        out = REPO_ROOT_ARTIFACTS / f"{platform}_session_capture_{int(_time.time())}.json"
+        out.write_text(
+            json.dumps({"requests": reqs, "responses": {k: list(v) for k, v in resps.items()}}, indent=2)
+        )
+        print(f"\n  saved → {out}")
+        print("  Paste the validate / balance / session call (URL, method, body, response) and")
+        print("  I'll build the readiness check against it.")
+    finally:
+        await ctx.close()
+        await pw.stop()
+
+
 async def _capture_betwarrior_ui(args: argparse.Namespace) -> None:
     """Operator places ONE bet through the BetWarrior app UI; we intercept the exact
     `coupon.json` request the app sends — ground truth for the odds scale, the
@@ -694,6 +771,11 @@ def main() -> None:
         action="store_true",
         help="betsson: place through the production BetssonLegPlacer + transport",
     )
+    p.add_argument(
+        "--capture-session",
+        action="store_true",
+        help="read-only: record the session/readiness API calls (validate/balance) — no bet",
+    )
     # Two-leg mechanics test (Betsson Leg A + Betano Leg B, both live).
     p.add_argument("--two-leg", action="store_true", help="run a live two-leg execution test")
     p.add_argument("--betsson-slug", default="")
@@ -735,6 +817,9 @@ def main() -> None:
         return
     if not args.platform:
         sys.exit("--platform is required (or use --two-leg)")
+    if args.capture_session:
+        asyncio.run(_capture_session(args.platform))  # read-only, no bet
+        return
     if args.discover:
         asyncio.run(_discover(args.platform))
     elif args.arm:

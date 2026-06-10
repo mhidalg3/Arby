@@ -1,5 +1,23 @@
 # Project Ledger
 
+## 2026-06-10 — Stage 2 prep: --capture-session (readiness contracts, capture-first)
+
+**Context:** Stage 2 (per-platform session readiness — the "is the place button green" check)
+needs each platform's session/validate request contract. Operator chose capture-first (no
+guessing, after the coupon.json odds-scale lesson).
+
+**Decision:** Added a read-only `--capture-session` mode to `trial_place.py`: opens the
+logged-in profile, records every authenticated session/readiness API call (URL substrings:
+validate / balance / account / wallet / session / punter / user-context / profile /
+kambicdn.com/player/), prints request (method/url/body) + response, saves to recon/artifacts.
+No bet placed. Operator runs it per platform (login → view balance → build a betslip without
+placing), pastes the validate/balance call, then the readiness checks get built against real
+contracts.
+
+**State:** branch `chore/capture-session`. ruff clean. Next: operator captures BetWarrior
+(coupon/validate.json → validSession) + Betano (balance/account) contracts; then build the
+readiness checks into the hot-session heartbeat (Betsson already has establish_betsson_context).
+
 ## 2026-06-10 — Stage 1: live odds re-verify wired into execution (place-at-current)
 
 **Context:** Every arb leg must re-read its CURRENT odds at placement and place only if the
