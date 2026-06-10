@@ -30,7 +30,7 @@ import structlog
 
 from src.execution.executor import LegPlacer
 from src.execution.guardrails import Guardrails
-from src.execution.leg_placer import BetanoLegPlacer, BetssonLegPlacer
+from src.execution.leg_placer import BetanoLegPlacer, BetssonLegPlacer, BetWarriorLegPlacer
 from src.execution.notify import Notifier, NullNotifier
 
 log = structlog.get_logger(__name__)
@@ -66,9 +66,13 @@ class HotSessionManager:
         login_gate: Callable[[], Awaitable[None]] | None = None,
         arm: bool = True,
         notifier: Notifier | None = None,
+        betwarrior: WarmTransport | None = None,
     ) -> None:
         self._betano = betano
         self._betsson = betsson
+        # BetWarrior (Kambi) is optional: a stateless bearer session (no context
+        # nav), so it just opens + arms + provides its placer. None ⇒ not wired.
+        self._betwarrior = betwarrior
         self._guardrails = guardrails
         self._heartbeat_sec = heartbeat_sec
         # When False, the transports are NOT armed — they open + warm but `fetch`
@@ -87,9 +91,13 @@ class HotSessionManager:
     async def __aenter__(self) -> HotSessionManager:
         await self._betano.__aenter__()
         await self._betsson.__aenter__()
+        if self._betwarrior is not None:
+            await self._betwarrior.__aenter__()
         if self._arm:
             self._betano.arm()
             self._betsson.arm()
+            if self._betwarrior is not None:
+                self._betwarrior.arm()
         if self._login_gate is not None:
             await self._login_gate()
         # Can't reach a placeable Betsson state at startup → suspend auto-placement
@@ -105,15 +113,20 @@ class HotSessionManager:
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
+        if self._betwarrior is not None:
+            await self._betwarrior.__aexit__(*exc)
         await self._betsson.__aexit__(*exc)
         await self._betano.__aexit__(*exc)
 
     def placers(self) -> dict[str, LegPlacer]:
         """The per-platform placers, bound to the warm transports, for the Executor."""
-        return {
+        placers: dict[str, LegPlacer] = {
             "betano": BetanoLegPlacer(self._betano),  # type: ignore[arg-type]
             "betsson-pba": BetssonLegPlacer(self._betsson),  # type: ignore[arg-type]
         }
+        if self._betwarrior is not None:
+            placers["betwarrior-pba"] = BetWarriorLegPlacer(self._betwarrior)  # type: ignore[arg-type]
+        return placers
 
     async def heartbeat(self) -> bool:
         """Re-warm the sessions once: re-establish the Betsson betting context

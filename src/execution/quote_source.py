@@ -15,6 +15,7 @@ dropped here so the detector only ever sees valid ones.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -26,7 +27,7 @@ import structlog
 from src.arbitrage.quotes import OddsQuote
 from src.ingestion.scrapers.base import RawOddsSnapshot
 from src.semantic.canonical import EXPECTED_CELLS, CanonicalQuote
-from src.semantic.team_normalize import normalize_team_name, team_similarity
+from src.semantic.team_normalize import team_similarity
 
 log = structlog.get_logger(__name__)
 
@@ -99,66 +100,95 @@ class CanonicalizingQuoteSource:
 
 @dataclass
 class OverlapQuoteSource:
-    """Latency + anti-bot optimized two-platform source.
+    """Latency + anti-bot optimized multi-platform source.
 
-    The `anchor` (Betano) returns all its fixtures+odds in one bulk call and
-    registers fixtures. We then fetch the `linker`'s (Betsson) odds ONLY for
-    fixtures the anchor also covers — found by matching the anchor's
-    ``"{home} {away}"`` against the linker's cheap fixture-list slugs. An arb
-    needs both books, so the overlap is all we need; this cuts the linker from
-    ~200 per-event calls to a handful — much faster AND far fewer repeated
-    requests (the real anti-bot risk for continuous polling). Canonicalization
-    re-validates every quote, so a loose name-match only wastes/drops a fetch."""
+    Each `bulk_sources` scraper (Betano, BetWarrior — Kambi) returns all its
+    fixtures+odds in one cheap call and REGISTERS fixtures (they're anchors: a
+    parseable ``home``/``away``, so a match both bulk books cover links directly).
+    Then for each `linkers` scraper (Betsson — per-event, ~200 calls if fetched
+    whole) we fetch odds ONLY for fixtures a bulk source also covers, matched by
+    the bulk fixtures' canonical ``"{home} {away}"`` against the linker's cheap
+    fixture-list slugs. An arb needs ≥2 books, so the overlap is all we need —
+    far fewer repeated requests (the real anti-bot risk for continuous polling).
+    Canonicalization re-validates every quote, so a loose name-match only
+    wastes/drops a fetch."""
 
-    anchor: LiveScraper
-    linker: LinkerScraper
+    bulk_sources: Sequence[LiveScraper]
+    linkers: Sequence[LinkerScraper]
     canonicalizer: QuoteCanonicalizer
     match_threshold: float = 0.80
     staleness_sec: float = 45.0
     now_fn: Callable[[], float] = field(default=time.time)
+    # Per-event linker fetches run concurrently up to this many — the overlap set
+    # grows with bulk coverage (more books ⇒ more matched linker events), so the
+    # fetches must parallelize or the cycle blows the staleness window.
+    max_concurrent_linker_fetches: int = 8
 
     async def fetch(self) -> dict[str, list[OddsQuote]]:
         by_market: dict[str, list[CanonicalQuote]] = defaultdict(list)
-        targets: set[str] = set()  # normalized "home away" per anchor fixture
+        targets: set[str] = set()  # canonical "home away" of every bulk fixture
 
-        # 1) Anchor: bulk fetch + canonicalize (registers fixtures); collect names.
-        try:
-            async for snap in self.anchor.fetch_live_soccer():
-                if " vs " in snap.raw_event_name:
-                    home, away = snap.raw_event_name.split(" vs ", 1)
-                    label = f"{normalize_team_name(home)} {normalize_team_name(away)}".strip()
-                    if label:
-                        targets.add(label)
-                cq = await self.canonicalizer.canonicalize(snap)
-                if cq is not None:
-                    by_market[cq.odds_quote.market_id].append(cq)
-        except Exception as exc:  # noqa: BLE001 — no anchor → nothing to link against
-            log.warning("quote_source.anchor_error", error=str(exc))
-            return {}
-
-        # 2) Linker fixture list (one cheap call) → the events the anchor also has.
-        overlap: list[tuple[str, str]] = []  # (event_id, slug)
-        try:
-            for event_id, slug in await self.linker.list_fixture_refs():
-                slug_teams = slug.rsplit("/", 1)[-1].replace("-", " ")
-                if any(team_similarity(t, slug_teams) >= self.match_threshold for t in targets):
-                    overlap.append((event_id, slug))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("quote_source.linker_list_error", error=str(exc))
-
-        # 3) Fetch linker odds ONLY for the overlap events. The slug MUST be passed:
-        # it seeds raw_event_name, which the fixture resolver parses for both team
-        # names to link the event (without it nothing links → no cross-platform market).
-        for event_id, slug in overlap:
+        # 1) Bulk sources: full fetch + canonicalize (registers/links fixtures). Build
+        #    overlap targets from the CANONICAL fixture names — separator-agnostic
+        #    (Betano " vs " vs BetWarrior " - ") and already reserve-base-normalized.
+        for source in self.bulk_sources:
             try:
-                for snap in await self.linker.fetch_event_quotes(event_id, slug):
+                async for snap in source.fetch_live_soccer():
                     cq = await self.canonicalizer.canonicalize(snap)
                     if cq is not None:
                         by_market[cq.odds_quote.market_id].append(cq)
-            except Exception as exc:  # noqa: BLE001 — one bad event mustn't sink the cycle
-                log.warning("quote_source.linker_event_error", event_id=event_id, error=str(exc))
+                        targets.add(f"{cq.fixture.home_team} {cq.fixture.away_team}".strip())
+            except Exception as exc:  # noqa: BLE001 — one source must not sink the cycle
+                log.warning("quote_source.bulk_error", error=str(exc))
+        if not targets:
+            return {}  # no bulk data → nothing to link against
+
+        # 2) Each linker: list fixtures (one cheap call), fetch odds ONLY for events a
+        #    bulk source also covers. The slug MUST be passed — it seeds raw_event_name,
+        #    which the fixture resolver parses for both team names to link the event.
+        overlap_events = 0
+        for linker in self.linkers:
+            try:
+                refs = await linker.list_fixture_refs()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("quote_source.linker_list_error", error=str(exc))
+                continue
+            overlap = [
+                (event_id, slug)
+                for event_id, slug in refs
+                if any(
+                    team_similarity(t, slug.rsplit("/", 1)[-1].replace("-", " "))
+                    >= self.match_threshold
+                    for t in targets
+                )
+            ]
+            overlap_events += len(overlap)
+            # Fetch the matched events concurrently (bounded) — sequential here is what
+            # blew the staleness window once the overlap set grew with multi-book bulk.
+            sem = asyncio.Semaphore(self.max_concurrent_linker_fetches)
+
+            async def _fetch(
+                event_id: str,
+                slug: str,
+                _linker: LinkerScraper = linker,
+                _sem: asyncio.Semaphore = sem,
+            ) -> list[RawOddsSnapshot]:
+                async with _sem:
+                    try:
+                        return await _linker.fetch_event_quotes(event_id, slug)
+                    except Exception as exc:  # noqa: BLE001 — one bad event mustn't sink the cycle
+                        log.warning(
+                            "quote_source.linker_event_error", event_id=event_id, error=str(exc)
+                        )
+                        return []
+
+            for snaps in await asyncio.gather(*(_fetch(eid, slug) for eid, slug in overlap)):
+                for snap in snaps:
+                    cq = await self.canonicalizer.canonicalize(snap)
+                    if cq is not None:
+                        by_market[cq.odds_quote.market_id].append(cq)
 
         log.info(
-            "overlap_quote_source.fetched", anchor_fixtures=len(targets), overlap_events=len(overlap)
+            "overlap_quote_source.fetched", bulk_fixtures=len(targets), overlap_events=overlap_events
         )
         return assemble_partitions(by_market, self.now_fn(), self.staleness_sec)

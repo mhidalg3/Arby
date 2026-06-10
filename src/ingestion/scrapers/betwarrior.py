@@ -64,6 +64,7 @@ platform-wide policy defaults.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, Final
@@ -139,6 +140,10 @@ KAMBI_ODDS_SCALE: Final[float] = 1000.0
 # transient Cloudflare slowness without stalling the poll loop.
 DEFAULT_HTTP_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(15.0, connect=5.0)
 
+# Per-competition list-view calls run concurrently up to this many at once, so a
+# full poll stays well inside the quote-source staleness window.
+DEFAULT_MAX_CONCURRENT_COMPETITIONS: Final[int] = 6
+
 
 class BetWarriorContractError(RuntimeError):
     """Kambi returned a payload that doesn't match the recon-frozen contract.
@@ -169,9 +174,11 @@ class BetWarriorPbaScraper(BaseScraper):
         http_client: httpx.AsyncClient,
         competitions: dict[str, str] | None = None,
         guard: RateLimitGuard | None = None,
+        max_concurrent_competitions: int = DEFAULT_MAX_CONCURRENT_COMPETITIONS,
     ) -> None:
         self._client = http_client
         self._competitions = competitions if competitions is not None else dict(TARGET_COMPETITIONS)
+        self._max_concurrent = max_concurrent_competitions
         self._guard = guard or RateLimitGuard(platform=self.platform_name)
         self._log = log.bind(platform=self.platform_name)
         # Mirrors the SPA's request shape. The offering-api itself
@@ -185,17 +192,31 @@ class BetWarriorPbaScraper(BaseScraper):
         }
 
     async def fetch_live_soccer(self) -> AsyncIterator[RawOddsSnapshot]:
-        for slug, label in self._competitions.items():
-            try:
-                async for snapshot in self._fetch_competition(slug, label):
-                    yield snapshot
-            except BetWarriorContractError as exc:
-                self._log.warning(
-                    "scraper.competition_skipped",
-                    competition_slug=slug,
-                    competition_label=label,
-                    error=str(exc),
-                )
+        # Fetch the per-competition list views with bounded concurrency: ~Nx faster
+        # wall time than the old sequential loop (8 competitions × one call each), which
+        # otherwise blew the quote-source staleness window. A single bad competition
+        # (404 / tripped circuit) is logged and skipped, not fatal.
+        semaphore = asyncio.Semaphore(self._max_concurrent)
+
+        async def _collect(slug: str, label: str) -> list[RawOddsSnapshot]:
+            async with semaphore:
+                try:
+                    return [snap async for snap in self._fetch_competition(slug, label)]
+                except BetWarriorContractError as exc:
+                    self._log.warning(
+                        "scraper.competition_skipped",
+                        competition_slug=slug,
+                        competition_label=label,
+                        error=str(exc),
+                    )
+                    return []
+
+        groups = await asyncio.gather(
+            *(_collect(slug, label) for slug, label in self._competitions.items())
+        )
+        for snaps in groups:
+            for snapshot in snaps:
+                yield snapshot
 
     # ---- internals ----
 

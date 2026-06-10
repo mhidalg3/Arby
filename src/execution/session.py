@@ -32,6 +32,9 @@ _HEADER_DROP = frozenset(
     {":authority", ":method", ":path", ":scheme", "host", "content-length", "accept-encoding"}
 )
 _BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
+# BetWarrior (Kambi) sends its session bearer on calls to the authenticated player
+# API host; we capture it from those outgoing requests (no nav, no storage probing).
+_KAMBI_PLAYER_API = "kambicdn.com/player/"
 
 
 class Transport(Protocol):
@@ -83,6 +86,7 @@ class InSessionTransport:
         self._page: Any = None
         self._pw: Any = None
         self._captured_ctx: dict[str, str] | None = None  # Betsson authenticated header set
+        self._captured_bearer: str | None = None  # BetWarrior (Kambi) session bearer token
         # Serializes page-mutating ops (the heartbeat's establish-nav vs a placement
         # fetch) so a re-navigation can't abort an in-flight in-page fetch.
         self._page_lock = asyncio.Lock()
@@ -134,11 +138,17 @@ class InSessionTransport:
         return self
 
     def _on_request(self, req: Any) -> None:
-        # Capture ONLY from /api/sb/ requests: those carry the full coupons-compatible
-        # header set (brandid/marketcode/x-sb-type). /sb/fe-api/ requests also bear a
-        # ctx- but lack those → replaying them 400s (E_VALIDATION_INVALIDHEADER).
+        # Betsson: capture ONLY from /api/sb/ requests — those carry the full
+        # coupons-compatible header set (brandid/marketcode/x-sb-type). /sb/fe-api/
+        # requests also bear a ctx- but lack those → replaying them 400s.
         if "/api/sb/" in req.url and req.headers.get("x-sb-user-context-id", "").startswith("ctx-"):
             self._captured_ctx = dict(req.headers)
+        # BetWarrior (Kambi): capture the session bearer the SPA sends on its
+        # authenticated player-API calls (session.json, coupon/validate, …).
+        if _KAMBI_PLAYER_API in req.url:
+            auth = req.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                self._captured_bearer = auth.split(" ", 1)[1].strip()
 
     async def __aexit__(self, *exc: object) -> None:
         if self._context is not None:
@@ -185,6 +195,21 @@ class InSessionTransport:
         if self._captured_ctx is None:
             return None
         return {k: v for k, v in self._captured_ctx.items() if k not in _HEADER_DROP}
+
+    async def prepare_betwarrior_auth(self, timeout_s: int = 30) -> str | None:
+        """Return the live BetWarrior (Kambi) session bearer token, captured
+        passively from the SPA's own authenticated player-API calls. Like the
+        Betsson context we do NOT navigate — the logged-in SPA emits the bearer on
+        its background polling. Returns ``None`` if none appears within
+        ``timeout_s`` (not logged in / no authenticated call yet)."""
+        if self._dry_run:
+            self._log.info("transport.dry_run_prepare")
+            return None
+        for _ in range(timeout_s):
+            if self._captured_bearer is not None:
+                break
+            await asyncio.sleep(1)
+        return self._captured_bearer
 
     async def establish_betsson_context(self, timeout_s: int = 30) -> bool:
         """Drive the SPA into the placeable state and confirm the authenticated

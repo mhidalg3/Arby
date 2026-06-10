@@ -30,16 +30,22 @@ class FakeTransport:
         status: int = 200,
         body: dict[str, Any] | None = None,
         ctx_headers: dict[str, str] | None = _FAKE_CTX,
+        bearer: str | None = "TOK",
     ) -> None:
         self.status = status
         self.body = body or {}
         self.ctx_headers = ctx_headers
+        self.bearer = bearer
         self.calls: list[dict[str, Any]] = []
         self.prepared = 0
 
     async def prepare_betsson_context(self) -> dict[str, str] | None:
         self.prepared += 1
         return self.ctx_headers
+
+    async def prepare_betwarrior_auth(self) -> str | None:
+        self.prepared += 1
+        return self.bearer
 
     async def fetch(self, method, url, *, json_body=None, headers=None):  # type: ignore[no-untyped-def]
         self.calls.append({"method": method, "url": url, "json": json_body, "headers": headers})
@@ -143,16 +149,21 @@ async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
             "coupon": {"bets": [{"betOdds": 141, "stake": 500000}]},
         },
     )
-    res = await BetWarriorLegPlacer(t, auth_token="TOK").place(
-        _leg("betwarrior-pba", "4206111729", 500.0, 1.41)
-    )
+    res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "4206111729", 500.0, 1.41))
     assert res.accepted and res.ref == "999"
     call = t.calls[0]
     assert call["url"].endswith("/coupon.json")
-    assert call["headers"]["authorization"] == "Bearer TOK"
+    assert call["headers"]["authorization"] == "Bearer TOK"  # bearer read from the transport
     assert call["json"]["couponRows"][0]["outcomeId"] == 4206111729
     assert call["json"]["couponRows"][0]["odds"] == 141  # 1.41 ×100
     assert call["json"]["bets"][0]["stake"] == 500000  # 500.0 ×1000
+
+
+async def test_betwarrior_fails_closed_when_bearer_not_captured() -> None:
+    t = FakeTransport(bearer=None)  # not logged in → no session bearer
+    res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
+    assert not res.accepted and "bearer not captured" in res.detail
+    assert not t.calls  # never POSTed
 
 
 async def test_betano_runs_slip_sequence_and_places_with_refreshed_hash() -> None:

@@ -26,6 +26,7 @@ from src.arbitrage.dutch_book import detect_arbitrage
 from src.execution.quote_source import OverlapQuoteSource
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
+from src.ingestion.scrapers.betwarrior import BetWarriorPbaScraper
 from src.logging_setup import configure_logging
 from src.risk.decision import Verdict
 from src.risk.evaluator import RiskEvaluator
@@ -57,8 +58,11 @@ async def main() -> int:
         # few requests instead of ~200, so the cycle is faster AND far less
         # bot-detectable (fewer repeated actions) for continuous polling.
         source = OverlapQuoteSource(
-            anchor=BetanoScraper(http_client=client, mode="prematch"),
-            linker=BetssonScraper(http_client=client),
+            bulk_sources=[
+                BetanoScraper(http_client=client, mode="prematch"),
+                BetWarriorPbaScraper(http_client=client),
+            ],
+            linkers=[BetssonScraper(http_client=client)],
             canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()),
             staleness_sec=float(os.environ.get("STALENESS_SEC", "45")),
         )

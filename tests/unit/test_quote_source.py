@@ -39,8 +39,14 @@ def _snap(platform: str, cell: str, odds: float, ts: float = 0.0) -> RawOddsSnap
 
 
 def _cq(snap: RawOddsSnapshot, cell: str) -> CanonicalQuote:
+    # Derive fixture teams from the event name so OverlapQuoteSource's target-building
+    # (now off the canonical fixture) reflects the snapshot ("Panama vs Dominicana").
+    if " vs " in snap.raw_event_name:
+        home, away = (p.strip().lower() for p in snap.raw_event_name.split(" vs ", 1))
+    else:
+        home, away = "home", "away"
     return CanonicalQuote(
-        fixture=CanonicalFixture(fixture_id="FIX1", home_team="home", away_team="away"),
+        fixture=CanonicalFixture(fixture_id="FIX1", home_team=home, away_team=away),
         outcome=CanonicalOutcome(market=_MARKET, cell=cell),
         odds_quote=OddsQuote(
             platform=snap.platform,
@@ -196,7 +202,7 @@ async def test_overlap_source_fetches_only_matched_linker_events() -> None:
                                      _bsnap(CELL_AWAY, 4.2)]},
     )
     src = OverlapQuoteSource(
-        anchor=anchor, linker=linker, canonicalizer=_StubCanonicalizer(), now_fn=lambda: 0.0
+        bulk_sources=[anchor], linkers=[linker], canonicalizer=_StubCanonicalizer(), now_fn=lambda: 0.0
     )
     out = await src.fetch()
     assert linker.fetched == ["ev-match"]  # only the anchor-covered fixture was fetched
@@ -205,6 +211,32 @@ async def test_overlap_source_fetches_only_matched_linker_events() -> None:
     legs = {q.outcome: q.platform for q in out[_MKT_ID]}
     assert legs[CELL_HOME] == "betsson-pba"  # 2.1 > 2.0
     assert legs[CELL_DRAW] == "betano"  # 3.5 > 3.4
+
+
+async def test_overlap_source_multiple_bulk_sources_plus_linker_span_one_partition() -> None:
+    """Two bulk anchors (Betano + BetWarrior) AND a linker (Betsson) all feed one
+    partition; best-per-cell can span all three books — the multi-platform path."""
+    def _ev(platform: str, name: str, cell: str, odds: float) -> RawOddsSnapshot:
+        return RawOddsSnapshot(
+            platform=platform, platform_event_id=f"{platform}-e", platform_market_id="m",
+            platform_outcome_id=f"{platform}-{cell}", raw_event_name=name, raw_market_name="1X2",
+            raw_outcome_name=cell, decimal_odds=odds, max_stake=5000.0, timestamp=0.0,
+        )
+
+    betano = _FakeScraper([_ev("betano", "Panama vs Dominicana", CELL_HOME, 2.5)])  # best HOME
+    betwarrior = _FakeScraper([_ev("betwarrior-pba", "Panama vs Dominicana", CELL_DRAW, 3.9)])  # DRAW
+    linker = _FakeLinker(
+        refs=[("ev", "futbol/x/panama-dominicana")],
+        snaps_by_event={"ev": [_ev("betsson-pba", "Home vs Away", CELL_AWAY, 4.5)]},  # best AWAY
+    )
+    src = OverlapQuoteSource(
+        bulk_sources=[betano, betwarrior], linkers=[linker],
+        canonicalizer=_StubCanonicalizer(), now_fn=lambda: 0.0,
+    )
+    out = await src.fetch()
+    assert len(out) == 1
+    (quotes,) = out.values()
+    assert {q.platform for q in quotes} == {"betano", "betwarrior-pba", "betsson-pba"}
 
 
 async def test_overlap_source_threads_slug_so_betsson_links_under_real_canonicalizer() -> None:
@@ -250,7 +282,7 @@ async def test_overlap_source_threads_slug_so_betsson_links_under_real_canonical
                                      _bets(slug, "River Plate", 4.2)]},
     )
     src = OverlapQuoteSource(
-        anchor=anchor, linker=linker,
+        bulk_sources=[anchor], linkers=[linker],
         canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()), now_fn=lambda: 0.0,
     )
     out = await src.fetch()

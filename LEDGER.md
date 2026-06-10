@@ -1,5 +1,45 @@
 # Project Ledger
 
+## 2026-06-10 — BetWarrior full participation (execution + detection)
+
+**Context:** Wire BetWarrior into both execution and detection so its prices ride arbs
+(esp. 3-leg 1X2). BetWarrior (Kambi) is a BULK scraper (one offering call) and a bearer-auth
+placer; the placement contract was recon-validated, the gap was acquiring the live bearer.
+
+**Execution:**
+- `InSessionTransport` captures the Kambi session bearer passively from the SPA's
+  authenticated player-API calls (`kambicdn.com/player/`), analogous to Betsson's ctx-;
+  `prepare_betwarrior_auth()` reads it.
+- `BetWarriorLegPlacer` refactored to read the bearer from the transport at place-time
+  (was a constructor arg) — fresh token, fail-closed if not logged in.
+- `HotSessionManager` gains an optional `betwarrior` transport (stateless bearer, no context
+  nav); `placers()` adds `betwarrior-pba` when present. `run_hot_loop` opens a 3rd login
+  window only when live (BetWarrior odds are scraped for detection in both modes — public API).
+
+**Detection:** `OverlapQuoteSource` generalized from single anchor+linker to
+`bulk_sources: [betano, betwarrior]` + `linkers: [betsson]`. Overlap targets now come from
+the CANONICAL fixture names (separator-agnostic: Betano " vs " vs BetWarrior " - ").
+
+**Latency (the hard part):** adding BetWarrior's broad slate took bulk_fixtures 12→226, so
+the Betsson overlap grew 4→134 events and the cycle hit ~78s — past the 45s staleness window
+→ Betano quotes staled out → cross_platform 4→**0** (caught before shipping). Fixes:
+parallelized the BetWarrior scraper's 8 competition calls (was sequential) AND the
+OverlapQuoteSource per-event linker fetches (bounded concurrency). Cycle **78s → 18s**;
+**verified live: cross_platform 4 → 93** at staleness=45 (87 betsson+betwarrior, betano
+combos, a 3-way).
+
+**Open / flags:**
+- **Standalone validation still required:** BetWarrior placement has NEVER fired a real bet;
+  the bearer-capture is unvalidated live. Per the safety rule, the operator must do a tiny
+  standalone BetWarrior trial before it rides any arb.
+- **Anti-bot:** the Betsson overlap is now ~134 accordion calls/cycle (vs a handful) because
+  BetWarrior's slate widens the target set. Parallelized so latency is fine, but the call
+  VOLUME under continuous polling is heavier — consider a larger poll interval or capping the
+  overlap (e.g. by liquidity) as a follow-up.
+
+**State:** branch `feat/betwarrior-full-participation`. 596 tests (+ betwarrior bearer/
+fail-closed, multi-bulk 3-way), mypy/ruff clean.
+
 ## 2026-06-10 — Reserve-aware fixture matching (cross-platform reserve coverage)
 
 **Context:** On reserve-heavy AR slates, cross-platform linking dropped 3 of 4 overlaps:

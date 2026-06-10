@@ -116,24 +116,51 @@ class BetssonLegPlacer:
         return result
 
 
+class BetWarriorTransport(Protocol):
+    """What BetWarriorLegPlacer needs: the generic fetch + the live Kambi session
+    bearer read (`InSessionTransport.prepare_betwarrior_auth`)."""
+
+    async def prepare_betwarrior_auth(self) -> str | None: ...
+    async def fetch(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, Any]]: ...
+
+
 class BetWarriorLegPlacer:
     """BetWarrior (Kambi) — stateless single POST to ``coupon.json``.
-    Needs the Kambi session bearer token (``auth_token``)."""
+
+    Reads the live Kambi session bearer from the warm transport at place-time
+    (captured passively from the SPA's authenticated calls — analogous to
+    Betsson's context), so a refreshed token is always used and a not-logged-in
+    session fails closed rather than placing with a stale/absent token."""
 
     platform = "betwarrior-pba"
 
-    def __init__(self, transport: Transport, auth_token: str) -> None:
+    def __init__(self, transport: BetWarriorTransport) -> None:
         self._t = transport
-        self._auth = auth_token
         self._log = log.bind(component="leg_placer", platform=self.platform)
 
     async def place(self, leg: Leg) -> PlacementResult:
+        try:
+            bearer = await self._t.prepare_betwarrior_auth()
+        except TransportError as exc:
+            self._log.warning("leg_placer.transport_error", error=str(exc))
+            return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
+        if not bearer:
+            return PlacementResult(
+                accepted=False, detail="betwarrior: session bearer not captured (logged in?)"
+            )
         request = placers.build_betwarrior_request(
             outcome_id=int(leg.platform_outcome_id),
             odds_x100=round(leg.odds * 100),
             stake_thousandths=round(leg.stake_ars * 1000),
         )
-        headers = {"content-type": "application/json", "authorization": f"Bearer {self._auth}"}
+        headers = {"content-type": "application/json", "authorization": f"Bearer {bearer}"}
         try:
             status, resp = await self._t.fetch(
                 "POST", _BETWARRIOR_PLACE_URL, json_body=request, headers=headers

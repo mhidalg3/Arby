@@ -33,6 +33,7 @@ from src.execution.recovery import HumanRecoveryHandler
 from src.execution.session import InSessionTransport
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
+from src.ingestion.scrapers.betwarrior import BetWarriorPbaScraper
 from src.logging_setup import configure_logging
 from src.risk.evaluator import RiskEvaluator
 from src.risk.policy import RiskPolicy
@@ -46,6 +47,7 @@ _UA = (
 PER_LEG_CAP_ARS = 300.0  # hard trial cap, mirrors trial_place
 _BETANO_HOME = "https://www.betano.bet.ar/"
 _BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
+_BETWARRIOR_HOME = "https://pba.betwarrior.bet.ar/"
 
 
 async def main() -> int:
@@ -69,27 +71,38 @@ async def main() -> int:
         max_daily_loss_ars=1000.0,
         odds_tolerance_pct=1.0,
     )
-    risk = RiskEvaluator(policy=RiskPolicy(platform_reliability={"betano": 1.0, "betsson-pba": 1.0}))
+    risk = RiskEvaluator(
+        policy=RiskPolicy(
+            platform_reliability={"betano": 1.0, "betsson-pba": 1.0, "betwarrior-pba": 1.0}
+        )
+    )
     headers = {"User-Agent": _UA, "Accept-Language": "es-AR,es;q=0.9"}
 
     # Real sessions either way (so a dry-run validates the warm-session lifecycle);
     # placement is what differs. In dry-run the transports are NOT armed (fetch
-    # refuses) AND the placers are DryRunPlacers — two independent guards.
+    # refuses) AND the placers are DryRunPlacers — two independent guards. BetWarrior's
+    # execution session (a login window) is opened only when live; its odds are scraped
+    # for detection in BOTH modes (public Kambi API, no login).
     betano_t = InSessionTransport("betano", dry_run=False)
     betsson_t = InSessionTransport("betsson", dry_run=False)
+    betwarrior_t = InSessionTransport("betwarrior", dry_run=False) if live else None
 
     async def _operator_login() -> None:
         # The manager has just opened the (blank) windows — point each at its site
         # so the operator has a login page, then wait for them to finish.
         await betano_t.goto(_BETANO_HOME)
         await betsson_t.goto(_BETSSON_HOME)
+        windows = "BOTH windows"
+        if betwarrior_t is not None:
+            await betwarrior_t.goto(_BETWARRIOR_HOME)
+            windows = "ALL THREE windows"
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
             input,
-            "\n  ▶ Log into BOTH windows (Betano: complete any challenge; Betsson: log in, "
-            "stay on PBA — the manager will do the My-Account nav). When BOTH show your "
-            "balance, press ENTER… ",
+            f"\n  ▶ Log into {windows} (Betano: complete any challenge; Betsson: log in, "
+            "stay on PBA — the manager will do the My-Account nav; BetWarrior: log in). "
+            "When all show your balance, press ENTER… ",
         )
 
     async with httpx.AsyncClient(headers=headers, timeout=25.0) as client:
@@ -100,22 +113,32 @@ async def main() -> int:
         manager = HotSessionManager(
             betano=betano_t,
             betsson=betsson_t,
+            betwarrior=betwarrior_t,
             guardrails=guard,
             login_gate=_operator_login,
             arm=live,
             notifier=notifier,
         )
         async with manager:
+            # Detection over all three books: Betano + BetWarrior are bulk anchors
+            # (one cheap call each, register fixtures); Betsson is the overlap linker.
             source = OverlapQuoteSource(
-                anchor=BetanoScraper(http_client=client, mode="prematch"),
-                linker=BetssonScraper(http_client=client),
+                bulk_sources=[
+                    BetanoScraper(http_client=client, mode="prematch"),
+                    BetWarriorPbaScraper(http_client=client),
+                ],
+                linkers=[BetssonScraper(http_client=client)],
                 canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()),
                 staleness_sec=float(os.environ.get("STALENESS_SEC", "45")),
             )
             placers = (
                 manager.placers()
                 if live
-                else {"betano": DryRunPlacer(), "betsson-pba": DryRunPlacer()}
+                else {
+                    "betano": DryRunPlacer(),
+                    "betsson-pba": DryRunPlacer(),
+                    "betwarrior-pba": DryRunPlacer(),
+                }
             )
             executor = Executor(
                 guardrails=guard,

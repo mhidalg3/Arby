@@ -134,8 +134,8 @@ async def test_real_scrapers_and_canonicalizer_form_a_cross_platform_market() ->
     Betsson leg here, leaving a single-platform (or no) market — caught by this test."""
     async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
         src = OverlapQuoteSource(
-            anchor=BetanoScraper(http_client=client, mode="prematch"),
-            linker=BetssonScraper(http_client=client),
+            bulk_sources=[BetanoScraper(http_client=client, mode="prematch")],
+            linkers=[BetssonScraper(http_client=client)],
             canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()),
         )
         out = await src.fetch()
