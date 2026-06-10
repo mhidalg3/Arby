@@ -219,20 +219,20 @@ class BetssonScraper(BaseScraper):
         (overlap-only fetching: skip events the other book doesn't cover)."""
         return [(fx.event_id, fx.slug) for fx in await self._discover_soccer_fixtures()]
 
-    async def fetch_event_quotes(self, event_id: str) -> list[RawOddsSnapshot]:
+    async def fetch_event_quotes(self, event_id: str, slug: str = "") -> list[RawOddsSnapshot]:
         """Surgical per-event refetch — bypasses discovery + polling.
 
-        Used by the pre-execution Tier-2 verifier to get the freshest
-        available odds for a known event. Returns a list of snapshots
-        for that single event's markets in v1 scope (MW3W + BTTS +
-        MTG2W). Raises `BetssonContractError` on transport / schema
-        failure; the caller decides whether to fall back.
+        Used by (a) the pre-execution Tier-2 verifier (matches on
+        ``platform_outcome_id``, so it omits ``slug``) and (b)
+        ``OverlapQuoteSource`` for linker odds, which DOES need the slug:
+        the fixture resolver links a Betsson event by matching BOTH team
+        names parsed from ``raw_event_name`` (seeded from the slug). Pass
+        the slug (``list_fixture_refs`` returns it) or the event won't link
+        and no cross-platform market forms. Returns snapshots for that
+        single event's v1-scope markets (MW3W + BTTS + MTG2W); raises
+        `BetssonContractError` on transport / schema failure.
         """
-        # Build a minimal `_Fixture` — only `event_id` is used by
-        # `_fetch_event_odds`. `slug` would normally seed the
-        # `raw_event_name`; for verification we don't need it
-        # (verifier matches on `platform_outcome_id`, not name).
-        fx = _Fixture(event_id=event_id, competition_id="", slug="")
+        fx = _Fixture(event_id=event_id, competition_id="", slug=slug)
         return [snap async for snap in self._fetch_event_odds(fx)]
 
     async def fetch_live_soccer(self) -> AsyncIterator[RawOddsSnapshot]:

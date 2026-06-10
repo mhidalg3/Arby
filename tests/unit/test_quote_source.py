@@ -161,12 +161,14 @@ class _FakeLinker:
         self._refs = refs
         self._snaps = snaps_by_event
         self.fetched: list[str] = []
+        self.fetched_slugs: list[str] = []
 
     async def list_fixture_refs(self) -> list[tuple[str, str]]:
         return self._refs
 
-    async def fetch_event_quotes(self, event_id: str) -> list[RawOddsSnapshot]:
+    async def fetch_event_quotes(self, event_id: str, slug: str = "") -> list[RawOddsSnapshot]:
         self.fetched.append(event_id)
+        self.fetched_slugs.append(slug)
         return self._snaps.get(event_id, [])
 
 
@@ -203,3 +205,56 @@ async def test_overlap_source_fetches_only_matched_linker_events() -> None:
     legs = {q.outcome: q.platform for q in out[_MKT_ID]}
     assert legs[CELL_HOME] == "betsson-pba"  # 2.1 > 2.0
     assert legs[CELL_DRAW] == "betano"  # 3.5 > 3.4
+
+
+async def test_overlap_source_threads_slug_so_betsson_links_under_real_canonicalizer() -> None:
+    """Regression: the linker's slug seeds raw_event_name, which the REAL fixture
+    resolver parses for both team names to link a Betsson event. If the slug isn't
+    threaded (the Tier-2-verifier default of ""), the Betsson legs drop and NO
+    cross-platform market forms — the bug that silently zeroed cross-platform
+    overlap in the live loop. Use the real Canonicalizer so the empty-name drop
+    path is actually exercised (a stub canonicalizer hides it)."""
+    from src.semantic.canonicalizer import Canonicalizer
+    from src.semantic.fixture_resolver import FixtureResolver
+
+    def _ev(name: str, market: str, outcome: str, odds: float) -> RawOddsSnapshot:
+        return RawOddsSnapshot(
+            platform="bplay-pba", platform_event_id="b-evt", platform_market_id="b-mkt",
+            platform_outcome_id=f"bp-{outcome}", raw_event_name=name, raw_market_name=market,
+            raw_outcome_name=outcome, decimal_odds=odds, max_stake=5000.0, timestamp=0.0,
+        )
+
+    # Anchor (Bplay) registers the fixture via "{home} vs {away}".
+    anchor = _FakeScraper([
+        _ev("Boca Juniors vs River Plate", "1-X-2", "Boca Juniors", 2.0),
+        _ev("Boca Juniors vs River Plate", "1-X-2", "Empate", 3.5),
+        _ev("Boca Juniors vs River Plate", "1-X-2", "River Plate", 4.0),
+    ])
+
+    # Linker (Betsson) builds raw_event_name FROM THE SLUG it's handed — exactly like
+    # the real scraper (empty slug ⇒ empty name ⇒ no link). Markets/outcomes resolvable.
+    def _bets(slug: str, outcome: str, odds: float) -> RawOddsSnapshot:
+        name = slug.rsplit("/", 1)[-1].replace("-", " ")  # mirrors _event_name_from_slug
+        return RawOddsSnapshot(
+            platform="betsson-pba", platform_event_id="ev-match", platform_market_id="m",
+            platform_outcome_id=f"bs-{outcome}", raw_event_name=name,
+            raw_market_name="Ganador del partido", raw_outcome_name=outcome,
+            decimal_odds=odds, max_stake=5000.0, timestamp=0.0,
+        )
+
+    slug = "futbol/argentina/lpf/boca-juniors-river-plate"
+    linker = _FakeLinker(
+        refs=[("ev-match", slug)],
+        snaps_by_event={"ev-match": [_bets(slug, "Boca Juniors", 2.1),
+                                     _bets(slug, "Empate", 3.4),
+                                     _bets(slug, "River Plate", 4.2)]},
+    )
+    src = OverlapQuoteSource(
+        anchor=anchor, linker=linker,
+        canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()), now_fn=lambda: 0.0,
+    )
+    out = await src.fetch()
+    assert linker.fetched_slugs == [slug]  # the slug was threaded, not dropped
+    assert len(out) == 1  # one cross-platform 1X2 market formed
+    (quotes,) = out.values()
+    assert {q.platform for q in quotes} == {"bplay-pba", "betsson-pba"}  # both books linked

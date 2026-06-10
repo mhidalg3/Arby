@@ -1,5 +1,39 @@
 # Project Ledger
 
+## 2026-06-10 — Verify 2-leg live: found + fixed a cross-platform linking regression
+
+**Context:** Verify the 2-leg arb pipeline is live before building 3-leg. Live dry-run
+(`run_arb_loop`) showed the pipeline running (14 Betano fixtures, partitions assembling)
+but **`cross_platform: 0`** every cycle — no market ever had both books, so no arb was
+detectable at all.
+
+**Root cause (regression from the 2026-06-09 both-teams fix):** `BetssonScraper.
+fetch_event_quotes()` — the method `OverlapQuoteSource` uses for linker odds — built its
+`_Fixture` with `slug=""` (it was written for the Tier-2 verifier, which matches on
+`platform_outcome_id` and doesn't need the name). So its snapshots had an EMPTY
+`raw_event_name`. The old fixture matcher keyed off `raw_outcome_name` (populated), so it
+worked; the both-teams fix switched to parsing `raw_event_name` (the slug) → empty → every
+Betsson leg dropped at fixture resolution → zero cross-platform markets. Unit tests missed
+it because they use synthetic snapshots with `raw_event_name` filled in (or a stub
+canonicalizer); the gap was exactly at the scraper↔canonicalizer boundary.
+
+**Decisions:** Thread the slug through. `fetch_event_quotes(event_id, slug="")` now seeds
+`raw_event_name` from the slug; `OverlapQuoteSource` passes the slug it already has from
+`list_fixture_refs` (kept optional → the verifier path is unchanged + stays fast).
+Regression test uses the REAL Canonicalizer (`test_overlap_source_threads_slug_…`) so the
+empty-name drop is actually exercised. **Verified live: cross_platform 0 → 1** (a real
+betano+betsson 1X2 market formed; detector ran, no arb present — efficient market).
+
+**Open — reserve-naming coverage gap (NOT a regression):** the current live slate is all
+Argentine RESERVE matches. Betano writes reserves `"… ii"`, Betsson `"reserve"`/bare, so
+the both-teams check (0.85) drops 3 of 4 (e.g. `huracan` vs `huracan ii` = 0.79); only
+`newells/boca` (0.89) links. Senior fixtures (where the validated arbs were) align fine.
+Reserve-aware normalization is the fix but is delicate (must not conflate a reserve with
+its senior side) — a focused follow-up, higher-value for the AR market than 3-leg IMO.
+
+**State:** branch `fix/linker-slug-passthrough`. 587 tests (+1), mypy/ruff clean. The
+scraper↔canonicalizer boundary needs an integration test (this bug lived undetected ~1 day).
+
 ## 2026-06-10 — Telegram alerts + never-halt detection (notify + manual-assist)
 
 **Context:** Run the 2-leg loop supervised for long stretches while the 3-leg

@@ -40,7 +40,8 @@ class LinkerScraper(Protocol):
     odds on demand — so we fetch odds only for fixtures the anchor also covers."""
 
     async def list_fixture_refs(self) -> list[tuple[str, str]]: ...  # (event_id, slug)
-    async def fetch_event_quotes(self, event_id: str) -> list[RawOddsSnapshot]: ...
+    # slug seeds raw_event_name → the fixture link needs it (both-team match).
+    async def fetch_event_quotes(self, event_id: str, slug: str = "") -> list[RawOddsSnapshot]: ...
 
 
 class QuoteCanonicalizer(Protocol):
@@ -136,19 +137,21 @@ class OverlapQuoteSource:
             return {}
 
         # 2) Linker fixture list (one cheap call) → the events the anchor also has.
-        overlap: list[str] = []
+        overlap: list[tuple[str, str]] = []  # (event_id, slug)
         try:
             for event_id, slug in await self.linker.list_fixture_refs():
                 slug_teams = slug.rsplit("/", 1)[-1].replace("-", " ")
                 if any(team_similarity(t, slug_teams) >= self.match_threshold for t in targets):
-                    overlap.append(event_id)
+                    overlap.append((event_id, slug))
         except Exception as exc:  # noqa: BLE001
             log.warning("quote_source.linker_list_error", error=str(exc))
 
-        # 3) Fetch linker odds ONLY for the overlap events.
-        for event_id in overlap:
+        # 3) Fetch linker odds ONLY for the overlap events. The slug MUST be passed:
+        # it seeds raw_event_name, which the fixture resolver parses for both team
+        # names to link the event (without it nothing links → no cross-platform market).
+        for event_id, slug in overlap:
             try:
-                for snap in await self.linker.fetch_event_quotes(event_id):
+                for snap in await self.linker.fetch_event_quotes(event_id, slug):
                     cq = await self.canonicalizer.canonicalize(snap)
                     if cq is not None:
                         by_market[cq.odds_quote.market_id].append(cq)
