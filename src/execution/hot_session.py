@@ -60,7 +60,8 @@ class BetanoWarmTransport(WarmTransport, Protocol):
 
 
 class BetWarriorWarmTransport(WarmTransport, Protocol):
-    # Readiness = the PAM checkSessionAlive probe ({"alive":"true"}).
+    # Readiness = captured Kambi bearer present AND its JWT exp not lapsed (an
+    # inactivity logout stops the SPA's token refresh, so the held bearer expires).
     async def check_betwarrior_ready(self) -> bool: ...
 
 

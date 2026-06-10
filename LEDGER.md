@@ -1,5 +1,28 @@
 # Project Ledger
 
+## 2026-06-10 — BetWarrior inactivity logout now detected + alerted
+
+**Gap (operator-found, live):** BetWarrior logged out from inactivity but nothing caught
+it — no suspension, no alert, and the hourly status kept showing `betwarrior ✅`. Cause: the
+crash-fix had made `check_betwarrior_ready` PASSIVE (bearer-presence only); the captured
+bearer lingers in memory after the server-side session dies, so the probe always returned
+True. Detection was unaffected (it scrapes the PUBLIC Kambi API); only placement readiness
+was blind.
+
+**Fix:** The Kambi bearer is a JWT. `check_betwarrior_ready` now decodes its `exp` (new
+`_jwt_exp` helper) and returns not-ready once the held token has lapsed — no network/CORS/DOM
+probe (the cross-origin PAM fetch is what crashed before). While logged-in+active the SPA
+refreshes the token and `_on_request` captures each fresh one (+exp); an inactivity logout
+stops the refresh → exp lapses → `_apply_health` suspends placement + fires the existing
+`🔌 betwarrior NOT READY` alert → re-login emits a fresh bearer → auto-resume. Non-JWT/opaque
+bearer ⇒ presence-only fallback (never worse than before). Placer 401 fail-close stays the
+backstop. Detection lag ≤ heartbeat (300s) after exp.
+
+**State:** branch `fix/betwarrior-inactivity-logout`. New `tests/unit/test_session_betwarrior_ready.py`;
+610 tests, mypy/ruff clean. Open: if some BetWarrior logout is a server-side kill BEFORE the
+JWT exp, this won't catch it — would need an active liveness check (httpx call to an
+authenticated Kambi endpoint with the bearer; needs a capture to ground the path).
+
 ## 2026-06-10 — Armed deploy: Betsson WAF 403 from overlap volume → throttle
 
 **Symptom (live armed run):** clean start, but Betsson 403'd the accordion endpoint and the

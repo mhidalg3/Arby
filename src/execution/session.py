@@ -16,7 +16,10 @@ live tiny bet in the Phase-1 trial, not unit tests.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -35,6 +38,27 @@ _BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
 # BetWarrior (Kambi) sends its session bearer on calls to the authenticated player
 # API host; we capture it from those outgoing requests (no nav, no storage probing).
 _KAMBI_PLAYER_API = "kambicdn.com/player/"
+# Clock skew tolerance when judging a captured JWT bearer expired (seconds).
+_BEARER_EXP_SKEW_SEC = 30.0
+
+
+def _jwt_exp(token: str) -> float | None:
+    """Best-effort decode of a JWT bearer's ``exp`` (epoch seconds), or ``None`` if
+    the token isn't a decodable JWT with an ``exp`` claim. The Kambi session bearer is
+    a JWT; reading its expiry lets readiness detect an inactivity logout (token TTL
+    lapses, the SPA stops refreshing it) WITHOUT any network/CORS/DOM probe. ``None`` ⇒
+    caller falls back to presence-only (never worse than before)."""
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)  # restore base64url padding
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, binascii.Error, json.JSONDecodeError):
+        return None
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    return float(exp) if isinstance(exp, (int, float)) else None
 # Betano's cookie-auth balance endpoint — same-origin, so the readiness probe's
 # in-page GET works (unlike BetWarrior's cross-origin PAM host).
 _BETANO_BALANCE_URL = "https://www.betano.bet.ar/api/balance"
@@ -90,6 +114,7 @@ class InSessionTransport:
         self._pw: Any = None
         self._captured_ctx: dict[str, str] | None = None  # Betsson authenticated header set
         self._captured_bearer: str | None = None  # BetWarrior (Kambi) session bearer token
+        self._bearer_exp: float | None = None  # its JWT exp (epoch s), for liveness
         # Serializes page-mutating ops (the heartbeat's establish-nav vs a placement
         # fetch) so a re-navigation can't abort an in-flight in-page fetch.
         self._page_lock = asyncio.Lock()
@@ -151,7 +176,12 @@ class InSessionTransport:
         if _KAMBI_PLAYER_API in req.url:
             auth = req.headers.get("authorization", "")
             if auth.lower().startswith("bearer "):
-                self._captured_bearer = auth.split(" ", 1)[1].strip()
+                token = auth.split(" ", 1)[1].strip()
+                # Latest token wins: while logged-in + active the SPA refreshes it, so
+                # we always hold the freshest bearer + its expiry. After an inactivity
+                # logout these stop arriving and the held token's exp lapses.
+                self._captured_bearer = token
+                self._bearer_exp = _jwt_exp(token)
 
     async def __aexit__(self, *exc: object) -> None:
         if self._context is not None:
@@ -242,14 +272,22 @@ class InSessionTransport:
         return status, parsed if isinstance(parsed, dict) else {}
 
     async def check_betwarrior_ready(self, timeout_s: int = 10) -> bool:
-        """Readiness probe: is the BetWarrior session live? PASSIVE — the Kambi session
-        bearer has been captured from the SPA's authenticated calls (the PAM
-        checkSessionAlive endpoint is a different, cross-origin host that the page
-        context can't reliably fetch). If the bearer is present the operator is logged
-        in; the placer fail-closes on a stale bearer at place time."""
+        """Readiness probe: is the BetWarrior session live? PASSIVE — no network/CORS/DOM
+        probe (the PAM checkSessionAlive host is cross-origin and crashed the page fetch).
+        The captured Kambi bearer is a JWT; we hold the freshest one the logged-in SPA
+        emits and check its ``exp``. A bearer that is present AND unexpired ⇒ ready. An
+        inactivity logout stops the SPA's token refresh, so the held bearer's exp lapses ⇒
+        not ready ⇒ the manager suspends placement + alerts, and auto-resumes when a
+        re-login emits a fresh bearer. (Bearer with no decodable exp ⇒ presence-only, as
+        before.) The placer still fail-closes on a stale bearer at place time."""
         if self._dry_run:
             return False
-        return await self.prepare_betwarrior_auth(timeout_s) is not None
+        if await self.prepare_betwarrior_auth(timeout_s) is None:
+            return False
+        if self._bearer_exp is not None and time.time() >= self._bearer_exp - _BEARER_EXP_SKEW_SEC:
+            self._log.warning("transport.betwarrior_bearer_expired", exp=self._bearer_exp)
+            return False
+        return True
 
     async def check_betano_ready(self) -> bool:
         """Readiness probe: is the Betano session authorized? Hits the cookie-auth
