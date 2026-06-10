@@ -1,5 +1,25 @@
 # Project Ledger
 
+## 2026-06-10 — Bplay BLOCKER: odds-feed outcome ids ≠ betslip outcome ids
+
+**Finding:** Bplay's public XML odds feed (the scraper's source) identifies outcomes by
+`name`+`odds` ONLY — no numeric id (`<Outcome name="Always Ready" odds="1.55"/>`). The
+betslip place needs the NUMERIC outcome id (capture: `6628049254`), which comes from a
+SEPARATE SPA event/betslip API, not the XML feed. So `BplayPbaScraper.platform_outcome_id`
+is a composite slug (`{market_id}-{slug}`), NOT placeable — a detected Bplay leg cannot be
+placed without resolving the numeric id from an API we haven't integrated.
+
+**Impact:** Bplay execution needs MORE than BetWarrior did — beyond the bootstrap-CSRF +
+clientIp + bot-protection, it needs finding + wiring the SPA event API that maps
+(event, outcome) → numeric outcome id (another capture/recon pass). Not a quick finish.
+
+**Decision (pending operator):** the 3-platform armed system (Betano/Betsson/BetWarrior) is
+complete, validated, hardened (live re-verify, readiness, heartbeat) — recommend deploying on
+three now and finishing Bplay as a focused follow-up (capture the event API → resolver →
+trial → detection). The Bplay place CONTRACT is already correct (committed); the gap is purely
+the outcome-id resolution.
+
+
 ## 2026-06-10 — Bplay place contract corrected from capture (stake ×1, event-keyed togglebet)
 
 **Context:** Captured a COMPLETE Bplay bet (togglebet → update → accept → bettingslip). Pinned
