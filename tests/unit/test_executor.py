@@ -1,4 +1,4 @@
-"""Tests for the two-leg execution state machine (dry-run)."""
+"""Tests for the N-leg execution state machine (dry-run)."""
 
 from __future__ import annotations
 
@@ -75,6 +75,17 @@ def _legs() -> tuple[Leg, Leg]:
     )
 
 
+def _three_legs() -> tuple[Leg, Leg, Leg]:
+    # A 1X2 (three-outcome) arb on one match — three legs sharing match_id. Betano is
+    # a dynamic-cap platform, so its leg carries a live_max_stake_ars (as the real flow
+    # supplies) or the guardrail fail-closes.
+    return (
+        Leg("betsson", "m1", "1X2", "home", 60.0, 3.0),
+        Leg("betano", "m1", "1X2", "draw", 60.0, 3.1, live_max_stake_ars=5000.0),
+        Leg("betwarrior", "m1", "1X2", "away", 60.0, 3.2),
+    )
+
+
 def _executor(
     g: Guardrails,
     n: _FakeNotifier,
@@ -99,6 +110,28 @@ async def test_happy_path_completes_and_records_exposure() -> None:
     assert res.outcome is ExecutionOutcome.COMPLETED
     assert g.total_exposure_ars == 200.0
     assert any("COMPLETE" in t for t in n.sent)
+
+
+async def test_three_leg_arb_completes_and_places_all_three() -> None:
+    g, n = _guard(), _FakeNotifier()
+    res = await _executor(g, n, _FakeRecovery(), DryRunPlacer()).execute_n_leg(
+        "opp", list(_three_legs())
+    )
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert len(res.legs) == 3
+    assert sum(1 for t in n.sent if "BET PLACED" in t) == 3  # one alert per leg
+    assert g.total_exposure_ars == 180.0  # 3 × 60
+
+
+async def test_three_leg_third_leg_rejected_is_naked_with_two_live() -> None:
+    """The new failure mode: a 3-leg arb where the LAST leg fails leaves TWO legs
+    live + unhedged — reported as naked exposure with the live-leg count."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _CountingPlacer(reject_index=2)  # leg C rejected
+    res = await _executor(g, n, _FakeRecovery(), placer).execute_n_leg("opp", list(_three_legs()))
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert len(res.legs) == 2  # two legs live
+    assert any("NAKED" in t and "2 leg" in t for t in n.sent)
 
 
 async def test_placed_bet_alert_describes_leg_platform_event_and_bet() -> None:

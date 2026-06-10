@@ -3,8 +3,9 @@
 The detector (`src/arbitrage`) emits an `ArbitrageOpportunity` carrying the legs
 (`OddsQuote`s) and their sized `stakes`; the risk layer (`src/risk`) approves it.
 This module maps each quote to an execution `Leg` and drives
-`Executor.execute_two_leg`. It does NOT decide profitability or sizing — that's
-already done; it only translates and sequences.
+`Executor.execute_n_leg` (N≥2 — a two-outcome O/U or a three-outcome 1X2 alike).
+It does NOT decide profitability or sizing — that's already done; it only
+translates and sequences.
 
 Field mapping (`OddsQuote` → `Leg`):
 - ``platform``             → ``platform``       (routing key for the placers map)
@@ -72,12 +73,10 @@ async def execute_opportunity(
     opp_id: str,
     dynamic_stake_cap_ars: float | None = None,
 ) -> ExecutionResult:
-    """Execute a two-leg approved opportunity through the Executor. The risk
-    layer must have APPROVED it already; this only places.
+    """Execute an approved N-leg opportunity through the Executor (N≥2 — a
+    two-outcome O/U or a three-outcome 1X2 alike). The risk layer must have
+    APPROVED it already; this only translates + places.
 
-    Raises ValueError for non-two-leg opportunities (the Executor's state machine
-    is two-leg; N-way arbs are a future extension)."""
+    A one-sided opportunity (<2 legs) is not hedgeable; the Executor aborts it."""
     legs = legs_from_opportunity(opp, dynamic_stake_cap_ars=dynamic_stake_cap_ars)
-    if len(legs) != 2:
-        raise ValueError(f"execute_opportunity handles two-leg arbs only; got {len(legs)}")
-    return await executor.execute_two_leg(opp_id, legs[0], legs[1])
+    return await executor.execute_n_leg(opp_id, legs)

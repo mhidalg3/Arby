@@ -4,8 +4,8 @@ Ties the deterministic layers together: a `QuoteSource` yields canonical quotes
 grouped by market (the cross-platform canonicalization — team/outcome alignment,
 LLM partition validation — lives upstream in `src/semantic` and is hidden behind
 this seam); for each market we run `detect_arbitrage`, gate it through the
-`RiskEvaluator`, and place an APPROVED two-leg opportunity via the `Executor`
-(through `arb_executor.execute_opportunity`).
+`RiskEvaluator`, and place an APPROVED N-leg opportunity (2-outcome O/U or
+3-outcome 1X2) via the `Executor` (through `arb_executor.execute_opportunity`).
 
 Deliberately conservative: opportunities execute **sequentially** (so the shared
 guardrails' exposure caps are respected, not raced); each market is acted on at

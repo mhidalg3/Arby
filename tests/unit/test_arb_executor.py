@@ -113,7 +113,8 @@ async def test_execute_opportunity_routes_both_legs_and_completes() -> None:
     assert ap.legs[0].live_max_stake_ars == 5000.0  # dynamic cap carried through
 
 
-async def test_execute_opportunity_rejects_non_two_leg() -> None:
+async def test_execute_opportunity_places_three_leg_arb() -> None:
+    """A 1X2 (three-outcome) arb now executes — all three legs route + complete."""
     three = _opp(stakes=(50.0, 50.0))
     legs = (*three.legs, _quote("bplay", "draw", 3.5))
     opp = ArbitrageOpportunity(
@@ -125,9 +126,17 @@ async def test_execute_opportunity_rejects_non_two_leg() -> None:
         realized_roi_pct=1.0,
         capital_utilization=1.0,
     )
-    ex = Executor(guardrails=_guard(), notifier=_Notifier(), recovery=_Recovery(), placer=_Placer())
-    with pytest.raises(ValueError, match="two-leg"):
-        await execute_opportunity(ex, opp, opp_id="opp-3")
+    bp, ap, dp = _Placer(), _Placer(), _Placer()
+    ex = Executor(
+        guardrails=_guard(),
+        notifier=_Notifier(),
+        recovery=_Recovery(),
+        placers={"betsson": bp, "betano": ap, "bplay": dp},
+    )
+    res = await execute_opportunity(ex, opp, opp_id="opp-3")
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert len(res.legs) == 3  # all three filled
+    assert len(bp.legs) == len(ap.legs) == len(dp.legs) == 1  # each platform got its leg
 
 
 def test_dynamic_cap_applied_to_betano_when_quote_has_no_max_stake() -> None:

@@ -1,5 +1,36 @@
 # Project Ledger
 
+## 2026-06-10 — N-leg executor (place 1X2 / 3-outcome arbs), sequential + re-verify
+
+**Context:** The detector already emits N-outcome opportunities (a 1X2 is 3 legs), but
+the executor capped at 2 — so 1X2 arbs (the most common, most liquid soccer market) were
+DETECTED but unplaceable: `execute_opportunity` raised for !=2 legs, which in the armed
+loop surfaced as a caught cycle-error + skip. This closes that gap.
+
+**Decision (operator chose sequential + re-verify):** generalize the two-leg state machine
+to N≥2. `Executor.execute_n_leg(opp_id, legs)` is the engine; `execute_two_leg` is a thin
+wrapper (callers/tests unchanged). Flow: resolve a placer for EVERY leg + pre-check +
+re-verify ALL up front (abort, nothing at risk, on any failure); then place sequentially,
+re-verifying each leg again right before placing it (drift accrues across sequential
+placements). The FIRST leg's rejection → abort; once ≥1 leg is live, any drift/rejection →
+NAKED EXPOSURE reporting the live-leg count (operator hedges — fits the notify+manual model).
+`execute_opportunity` now routes N≥2 to `execute_n_leg`; <2 legs aborts (not hedgeable).
+`ExecutionResult.legs` is now a tuple; `leg_a`/`leg_b` kept as back-compat properties.
+
+**Verified:** detector emits a real 3-leg 1X2 opp (home/draw/away, 3 stakes, ROI ✓);
+executor completes a 3-leg arb and reports NAKED with 2 live when leg C fails. 589 tests
+(+3 net), mypy/ruff clean.
+
+**Caveats (logged, not blockers):**
+- Per-match exposure is checked per-leg, not summed across an arb's legs (pre-existing;
+  fine at trial caps, revisit for larger stakes).
+- A 1X2 arb whose best cells span >2 books needs those books wired: the armed loop only
+  wires betano + betsson, so a leg on an unwired book aborts (fail-closed). Full 1X2 cover
+  is another reason to add BetWarrior/Bplay to execution.
+
+**State:** branch `feat/n-leg-executor`. The armed 2-book loop can now place both O/U
+(2-leg) and 1X2 (3-leg) arbs across betano+betsson.
+
 ## 2026-06-10 — Verify 2-leg live: found + fixed a cross-platform linking regression
 
 **Context:** Verify the 2-leg arb pipeline is live before building 3-leg. Live dry-run

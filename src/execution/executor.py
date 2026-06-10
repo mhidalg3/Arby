@@ -1,19 +1,22 @@
-"""Two-leg arbitrage execution — deterministic state machine (dry-run capable).
+"""N-leg arbitrage execution — deterministic state machine (dry-run capable).
 
-Consumes a sized opportunity (two legs) and places them under the guardrails,
-re-verifying odds before each placement. Execution NEVER decides profitability
-(that's ``src/risk/``); it sequences placement and contains the damage when
-reality diverges. See ``docs/architecture.md`` Layer 4.
+Consumes a sized opportunity (N≥2 legs — a two-outcome O/U or a three-outcome
+1X2 alike) and places the legs under the guardrails, re-verifying odds before
+each placement. Execution NEVER decides profitability (that's ``src/risk/``); it
+sequences placement and contains the damage when reality diverges. See
+``docs/architecture.md`` Layer 4.
 
 State machine (fail-closed, naked-exposure-aware):
 
-1. Kill-switch + per-leg guardrail pre-checks on BOTH legs, and re-verify both
-   legs' odds within tolerance. Any failure → **abort before placing anything**.
-2. Place Leg A. Rejected → abort (nothing at risk).
-3. Re-verify Leg B's odds *again* (it may have drifted while Leg A was placed).
-   Dropped beyond tolerance, or Leg B rejected → **naked exposure** (Leg A is
-   live, Leg B isn't): log + alert, do not unwind automatically.
-4. Both filled → complete.
+1. Resolve a placer for EVERY leg; kill-switch + per-leg guardrail pre-checks +
+   re-verify every leg's odds within tolerance. Any failure → **abort before
+   placing anything** (nothing at risk).
+2. Place legs sequentially. Re-verify each leg's odds again right before placing
+   it (drift accrues while earlier legs are placed). The FIRST leg's rejection →
+   abort (nothing placed). Once ≥1 leg is live, any subsequent drift/rejection →
+   **naked exposure** (some legs live, hedge incomplete): log + alert with the
+   live-leg count, do not unwind automatically — the operator hedges manually.
+3. All filled → complete.
 
 Any unexpected error escalates to the `RecoveryHandler`; if unresolved, the
 run **freezes** (halt + alert). Placement itself goes through a `LegPlacer`:
@@ -93,7 +96,7 @@ class DryRunPlacer:
 class ExecutionOutcome(StrEnum):
     COMPLETED = "completed"
     ABORTED = "aborted"  # before any leg placed — nothing at risk
-    NAKED_EXPOSURE = "naked_exposure"  # Leg A live, Leg B not — needs attention
+    NAKED_EXPOSURE = "naked_exposure"  # ≥1 leg live, hedge incomplete — needs attention
     FROZEN = "frozen"  # unexpected state, recovery failed — halt
 
 
@@ -101,8 +104,17 @@ class ExecutionOutcome(StrEnum):
 class ExecutionResult:
     outcome: ExecutionOutcome
     reason: str = ""
-    leg_a: PlacementResult | None = None
-    leg_b: PlacementResult | None = None
+    legs: tuple[PlacementResult, ...] = ()  # filled legs, in placement order
+
+    @property
+    def leg_a(self) -> PlacementResult | None:
+        """First filled leg (back-compat convenience for two-leg consumers)."""
+        return self.legs[0] if self.legs else None
+
+    @property
+    def leg_b(self) -> PlacementResult | None:
+        """Second filled leg (back-compat convenience for two-leg consumers)."""
+        return self.legs[1] if len(self.legs) > 1 else None
 
 
 async def _no_reverify(leg: Leg) -> float:
@@ -111,7 +123,8 @@ async def _no_reverify(leg: Leg) -> float:
 
 
 class Executor:
-    """Deterministic two-leg execution under guardrails."""
+    """Deterministic N-leg execution under guardrails (N≥2: two-outcome markets
+    like O/U and three-outcome 1X2 alike)."""
 
     def __init__(
         self,
@@ -143,27 +156,43 @@ class Executor:
         return self._placers.get(leg.platform) or self._placer
 
     async def execute_two_leg(self, opp_id: str, leg_a: Leg, leg_b: Leg) -> ExecutionResult:
+        """Two-leg convenience wrapper over :meth:`execute_n_leg`."""
+        return await self.execute_n_leg(opp_id, [leg_a, leg_b])
+
+    async def execute_n_leg(self, opp_id: str, legs: list[Leg]) -> ExecutionResult:
+        """Place an N-leg arb (N≥2) sequentially, fail-closed. A one-sided 'arb'
+        is never placeable (nothing to hedge against), so <2 legs aborts."""
+        if len(legs) < 2:
+            return await self._abort(opp_id, f"need ≥2 legs to hedge, got {len(legs)}")
         try:
-            return await self._run(opp_id, leg_a, leg_b)
+            return await self._run(opp_id, legs)
         except Exception as exc:  # noqa: BLE001 — any unexpected state escalates, never improvises
             return await self._freeze(opp_id, f"unexpected error: {exc!s}")
 
     # ---- internals ----
 
-    async def _run(self, opp_id: str, leg_a: Leg, leg_b: Leg) -> ExecutionResult:
+    @staticmethod
+    def _label(i: int) -> str:
+        return chr(ord("A") + i)  # 0→A, 1→B, 2→C, …
+
+    async def _run(self, opp_id: str, legs: list[Leg]) -> ExecutionResult:
         if self._guardrails.kill_switch_tripped:
             return await self._abort(opp_id, "kill switch tripped")
 
-        # Resolve a placer for each leg up front — abort before placing if either
-        # platform is unwired (never place one leg of an arb we can't complete).
-        placer_a, placer_b = self._placer_for(leg_a), self._placer_for(leg_b)
-        if placer_a is None:
-            return await self._abort(opp_id, f"no placer for leg A platform {leg_a.platform!r}")
-        if placer_b is None:
-            return await self._abort(opp_id, f"no placer for leg B platform {leg_b.platform!r}")
+        # Resolve a placer for EVERY leg up front — abort before placing anything if
+        # any platform is unwired (never place one leg of an arb we can't complete).
+        placers: list[LegPlacer] = []
+        for i, leg in enumerate(legs):
+            p = self._placer_for(leg)
+            if p is None:
+                return await self._abort(
+                    opp_id, f"no placer for leg {self._label(i)} platform {leg.platform!r}"
+                )
+            placers.append(p)
 
-        # 1) Pre-check both legs (guardrails) and re-verify both odds — nothing placed yet.
-        for label, leg in (("A", leg_a), ("B", leg_b)):
+        # 1) Pre-check every leg (guardrails) and re-verify every leg's odds — nothing
+        #    placed yet, so any failure aborts with zero at risk.
+        for i, leg in enumerate(legs):
             check = self._guardrails.check_leg(
                 platform=leg.platform,
                 match_id=leg.match_id,
@@ -172,39 +201,49 @@ class Executor:
                 live_max_stake_ars=leg.live_max_stake_ars,
             )
             if not check.allowed:
-                return await self._abort(opp_id, f"leg {label} guardrail: {check.reason}")
+                return await self._abort(opp_id, f"leg {self._label(i)} guardrail: {check.reason}")
             current = await self._reverify(leg)
             if not self._guardrails.odds_still_acceptable(leg.odds, current):
                 return await self._abort(
-                    opp_id, f"leg {label} odds drifted {leg.odds}→{current} beyond tolerance"
+                    opp_id,
+                    f"leg {self._label(i)} odds drifted {leg.odds}→{current} beyond tolerance",
                 )
 
-        # 2) Place Leg A.
-        await self._notifier.send(
-            f"{self._tag}arb {opp_id}: placing Leg A ({leg_a.platform} {leg_a.outcome})"
-        )
-        res_a = await placer_a.place(leg_a)
-        if not res_a.accepted:
-            return await self._abort(opp_id, f"Leg A rejected: {res_a.detail}", leg_a=res_a)
-        self._guardrails.record_exposure(leg_a.match_id, res_a.stake_filled)
-        await self._notifier.send(self._format_placed(opp_id, "A", leg_a, res_a))
+        # 2) Place sequentially. Re-verify each leg AGAIN right before placing it
+        #    (odds drift accrues while earlier legs are placed). Once ≥1 leg is live,
+        #    any failure is NAKED EXPOSURE (not abort) — the hedge is incomplete.
+        placed: list[PlacementResult] = []
+        for i, (leg, placer) in enumerate(zip(legs, placers, strict=True)):
+            if i > 0:  # leg 0 was just re-verified in the pre-check loop
+                current = await self._reverify(leg)
+                if not self._guardrails.odds_still_acceptable(leg.odds, current):
+                    return await self._naked(
+                        opp_id, f"leg {self._label(i)} odds drifted {leg.odds}→{current}", placed
+                    )
+            res = await placer.place(leg)
+            if not res.accepted:
+                reason = f"leg {self._label(i)} rejected: {res.detail}"
+                if placed:  # earlier legs already live → unhedged
+                    return await self._naked(opp_id, reason, placed)
+                return await self._abort(opp_id, reason)
+            self._guardrails.record_exposure(leg.match_id, res.stake_filled)
+            placed.append(res)
+            await self._notifier.send(self._format_placed(opp_id, self._label(i), leg, res))
 
-        # 3) Re-verify Leg B before committing the second leg (the naked-exposure guard).
-        current_b = await self._reverify(leg_b)
-        if not self._guardrails.odds_still_acceptable(leg_b.odds, current_b):
-            return await self._naked(opp_id, f"Leg B odds drifted {leg_b.odds}→{current_b}", res_a)
-        res_b = await placer_b.place(leg_b)
-        if not res_b.accepted:
-            return await self._naked(opp_id, f"Leg B rejected: {res_b.detail}", res_a)
-        self._guardrails.record_exposure(leg_b.match_id, res_b.stake_filled)
-        await self._notifier.send(self._format_placed(opp_id, "B", leg_b, res_b))
+        await self._notifier.send(self._format_complete(opp_id, legs, placed))
+        self._log.info("executor.completed", opp_id=opp_id, legs=len(placed))
+        return ExecutionResult(ExecutionOutcome.COMPLETED, legs=tuple(placed))
 
-        await self._notifier.send(
-            f"{self._tag}arb {opp_id}: COMPLETE — Leg A {res_a.stake_filled}@{res_a.odds_filled}, "
-            f"Leg B {res_b.stake_filled}@{res_b.odds_filled}"
-        )
-        self._log.info("executor.completed", opp_id=opp_id)
-        return ExecutionResult(ExecutionOutcome.COMPLETED, leg_a=res_a, leg_b=res_b)
+    def _format_complete(
+        self, opp_id: str, legs: list[Leg], placed: list[PlacementResult]
+    ) -> str:
+        lines = [f"{self._tag}✅ arb {opp_id}: COMPLETE — {len(placed)} legs filled (hedge secured)"]
+        for i, (leg, res) in enumerate(zip(legs, placed, strict=True)):
+            lines.append(
+                f"   Leg {self._label(i)}: {leg.platform} {leg.outcome} "
+                f"{res.stake_filled:.0f}@{res.odds_filled}"
+            )
+        return "\n".join(lines)
 
     def _format_placed(self, opp_id: str, label: str, leg: Leg, res: PlacementResult) -> str:
         """Operator alert for a placed bet: which leg, on what platform/event, the
@@ -220,19 +259,22 @@ class Executor:
             f"   ref: {res.ref or '—'}"
         )
 
-    async def _abort(
-        self, opp_id: str, reason: str, leg_a: PlacementResult | None = None
-    ) -> ExecutionResult:
+    async def _abort(self, opp_id: str, reason: str) -> ExecutionResult:
         self._log.info("executor.aborted", opp_id=opp_id, reason=reason)
         await self._notifier.send(f"{self._tag}arb {opp_id}: ABORTED (nothing placed) — {reason}")
-        return ExecutionResult(ExecutionOutcome.ABORTED, reason=reason, leg_a=leg_a)
+        return ExecutionResult(ExecutionOutcome.ABORTED, reason=reason)
 
-    async def _naked(self, opp_id: str, reason: str, leg_a: PlacementResult) -> ExecutionResult:
-        self._log.error("executor.naked_exposure", opp_id=opp_id, reason=reason)
+    async def _naked(
+        self, opp_id: str, reason: str, placed: list[PlacementResult]
+    ) -> ExecutionResult:
+        self._log.error("executor.naked_exposure", opp_id=opp_id, reason=reason, live=len(placed))
         await self._notifier.send(
-            f"🚨 {self._tag}arb {opp_id}: NAKED EXPOSURE — Leg A is live, Leg B failed: {reason}"
+            f"🚨 {self._tag}arb {opp_id}: NAKED EXPOSURE — {len(placed)} leg(s) LIVE, hedge "
+            f"incomplete: {reason}. Manual action needed (close/hedge the open position)."
         )
-        return ExecutionResult(ExecutionOutcome.NAKED_EXPOSURE, reason=reason, leg_a=leg_a)
+        return ExecutionResult(
+            ExecutionOutcome.NAKED_EXPOSURE, reason=reason, legs=tuple(placed)
+        )
 
     async def _freeze(self, opp_id: str, reason: str) -> ExecutionResult:
         self._log.error("executor.escalating", opp_id=opp_id, reason=reason)
