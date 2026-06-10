@@ -273,10 +273,10 @@ class BplayLegPlacer:
             status, resp = await self._t.fetch(
                 "POST",
                 f"{_BPLAY_BASE}/bettingslip/togglebet",
-                json_body=placers.build_bplay_togglebet(outcome_id, csrf),
+                json_body=placers.build_bplay_togglebet(outcome_id, csrf, self._url_key),
             )
             if status >= 400:
-                return PlacementResult(accepted=False, detail=f"HTTP {status} (togglebet)")
+                return PlacementResult(accepted=False, detail=f"HTTP {status} (togglebet): {str(resp)[:160]}")
             csrf = placers.bplay_csrf_from_response(resp) or csrf
 
             status, resp = await self._t.fetch(
@@ -294,5 +294,5 @@ class BplayLegPlacer:
             self._log.warning("leg_placer.transport_error", error=str(exc))
             return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
         if status >= 400:
-            return PlacementResult(accepted=False, detail=f"HTTP {status} (place)")
+            return PlacementResult(accepted=False, detail=f"HTTP {status} (place): {str(resp)[:160]}")
         return placers.parse_bplay(resp)

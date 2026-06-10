@@ -167,13 +167,13 @@ def test_build_bplay_stake_keyed_by_outcome() -> None:
     req = build_bplay_request(
         url_key="/eventos/123-a-b",
         outcome_id=6621121460,
-        stake_ars=1.0,
+        stake_ars=500.0,
         csrf_token="CSRF",
         date_ms=1780434223302,
     )
     bs = req["data"]["data"]["betslip"]
-    assert bs["stake"] == {"6621121460": 1000}  # thousandths of ARS (capture: 1.00 ↔ 1000)
-    assert bs["nb_bettingslip_totalStake"] == "1.00" and bs["accept"] is True
+    assert bs["stake"] == {"6621121460": 500}  # whole ARS ×1 (confirmed by live capture)
+    assert bs["nb_bettingslip_totalStake"] == "1.00" and bs["accept"] is True  # line count
     assert req["data"]["csrf_token"] == "CSRF"
     assert req["context"]["url_key"] == "/eventos/123-a-b"
 

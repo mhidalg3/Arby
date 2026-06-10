@@ -1,5 +1,27 @@
 # Project Ledger
 
+## 2026-06-10 — Bplay place contract corrected from capture (stake ×1, event-keyed togglebet)
+
+**Context:** Captured a COMPLETE Bplay bet (togglebet → update → accept → bettingslip). Pinned
+the real contract; operator confirmed the stake scale.
+
+**Findings (vs the old unvalidated builder):**
+- Stake map is WHOLE ARS **×1** (500-peso bet → `{id: 500}`), NOT ×1000. `nb_bettingslip_
+  totalStake:"1.00"` is the line count for a single bet (constant), NOT the amount.
+- `togglebet` must be keyed to the EVENT url_key (`/eventos/<id>-<slug>`), not "/".
+- CSRF does NOT rotate within a slip (same token across togglebet/update/accept/place).
+- The place body sends NO odds — Bplay places at its current odds, gated by `accept`
+  (accept-odds-changes; True for our place-at-current-after-reverify model).
+- Open: `context.clientIp` (a private 10.x IP) is in the app's body; we omit it (test risk).
+
+**Decision:** Fixed `build_bplay_request` (stake ×1, nb "1.00", `accept_odds_change` param) +
+`build_bplay_togglebet` (url_key param); `BplayLegPlacer` passes the event url_key + surfaces
+HTTP-error bodies. parse_bplay unchanged (return==OK + message success).
+
+**State:** branch `feat/bplay-contract`. 606 tests, mypy/ruff clean. NEXT: the bootstrap-CSRF
+reader (where the token lives on the page — discovery probe) + a standalone Bplay trial to
+validate, then detection wiring + readiness.
+
 ## 2026-06-10 — Bplay integration (5th platform): capture-first
 
 **Context:** Bplay is the final platform before real deployment AND the block-prone one

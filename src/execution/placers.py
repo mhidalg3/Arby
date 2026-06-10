@@ -112,37 +112,47 @@ def _bplay_context(url_key: str) -> dict[str, Any]:
     }
 
 
-def build_bplay_togglebet(outcome_id: int, csrf_token: str) -> dict[str, Any]:
-    """Bplay `/bettingslip/togglebet` — adds the selection to the server-side
-    slip. `csrf_token` is the current (bootstrap) token; the response returns a
-    fresh one under ``header.csrf_token`` for the next call."""
-    return {"context": _bplay_context("/"), "data": {"id": outcome_id, "csrf_token": csrf_token}}
+def build_bplay_togglebet(outcome_id: int, csrf_token: str, url_key: str = "/") -> dict[str, Any]:
+    """Bplay `/bettingslip/togglebet` — adds the selection to the server-side slip.
+    The live app keys the context to the EVENT url_key (not "/"); pass it. The CSRF
+    does NOT rotate within a slip (confirmed by capture) — the response echoes the
+    same token under ``header.csrf_token``."""
+    return {"context": _bplay_context(url_key), "data": {"id": outcome_id, "csrf_token": csrf_token}}
 
 
 def bplay_csrf_from_response(resp: dict[str, Any]) -> str:
-    """The rotated CSRF a slip response hands forward (``header.csrf_token``)."""
+    """The CSRF a slip response echoes (``header.csrf_token``) — same token, threaded
+    forward so a future rotation would be picked up transparently."""
     return str(_d(resp.get("header")).get("csrf_token", "") or "")
 
 
 def build_bplay_request(
-    *, url_key: str, outcome_id: int, stake_ars: float, csrf_token: str, date_ms: int
+    *,
+    url_key: str,
+    outcome_id: int,
+    stake_ars: float,
+    csrf_token: str,
+    date_ms: int,
+    accept_odds_change: bool = True,
 ) -> dict[str, Any]:
-    """Bplay SportNCO `/bettingslip` (place). `csrf_token` is the latest rotated
-    token (from the togglebet response). The per-outcome ``stake`` map is in
-    thousandths of ARS (capture: total ``"1.00"`` ↔ map ``1000``); ``date_ms`` is
-    the current epoch-ms."""
+    """Bplay SportNCO `/bettingslip` (place). Confirmed by a live placement capture:
+    the per-outcome ``stake`` map is WHOLE ARS (×1 — a 500-peso bet → ``{id: 500}``);
+    ``nb_bettingslip_totalStake`` is the line count for a single bet (constant
+    ``"1.00"``), NOT the amount; no odds are sent (Bplay places at its current odds,
+    gated by ``accept``). ``accept`` True = take the book's current odds (we re-verify
+    first); ``date_ms`` is the current epoch-ms."""
     return {
         "context": _bplay_context(url_key),
         "data": {
             "data": {
                 "date": date_ms,
                 "betslip": {
-                    "nb_bettingslip_totalStake": f"{stake_ars:.2f}",
+                    "nb_bettingslip_totalStake": "1.00",
                     "freebet": None,
                     "formule": "single",
                     "combiboost_id": None,
-                    "accept": True,
-                    "stake": {str(outcome_id): round(stake_ars * 1000)},
+                    "accept": accept_odds_change,
+                    "stake": {str(outcome_id): round(stake_ars)},
                 },
             },
             "csrf_token": csrf_token,

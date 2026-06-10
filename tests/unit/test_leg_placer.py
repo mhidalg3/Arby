@@ -210,7 +210,7 @@ async def test_betano_runs_slip_sequence_and_places_with_refreshed_hash() -> Non
     assert place_body["oddschanges"] == "0"
 
 
-async def test_bplay_threads_rotated_csrf_and_scales_stake() -> None:
+async def test_bplay_threads_csrf_and_uses_whole_ars_stake() -> None:
     togglebet = {"header": {"csrf_token": "C1"}, "body": {}, "footer": {}}
     place = {"return": "OK", "message": {"type": "success", "message": "Apuesta colocada"}}
     t = SeqTransport([(200, togglebet), (200, place)])
@@ -220,13 +220,16 @@ async def test_bplay_threads_rotated_csrf_and_scales_stake() -> None:
 
     res = await BplayLegPlacer(
         t, event_url_key="/eventos/10595536-francia-senegal", bootstrap_csrf=bootstrap
-    ).place(_leg("bplay-pba", "6621121460", 1.0, 1.5))
+    ).place(_leg("bplay-pba", "6621121460", 500.0, 1.5))
     assert res.accepted
     toggle_body = t.calls[0]["json"]
     assert toggle_body["data"] == {"id": 6621121460, "csrf_token": "C0"}  # bootstrap token
+    assert toggle_body["context"]["url_key"] == "/eventos/10595536-francia-senegal"  # event-keyed
     place_body = t.calls[1]["json"]
-    assert place_body["data"]["csrf_token"] == "C1"  # rotated forward from togglebet response
-    assert place_body["data"]["data"]["betslip"]["stake"] == {"6621121460": 1000}  # ×1000
+    assert place_body["data"]["csrf_token"] == "C1"  # threaded from togglebet response
+    slip = place_body["data"]["data"]["betslip"]
+    assert slip["stake"] == {"6621121460": 500}  # ×1 (whole ARS — confirmed by capture)
+    assert slip["nb_bettingslip_totalStake"] == "1.00"  # line count, not the amount
     assert place_body["context"]["url_key"] == "/eventos/10595536-francia-senegal"
 
 
