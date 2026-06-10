@@ -1,5 +1,25 @@
 # Project Ledger
 
+## 2026-06-10 — Armed deploy: Betsson WAF 403 from overlap volume → throttle
+
+**Symptom (live armed run):** clean start, but Betsson 403'd the accordion endpoint and the
+rate-limit circuit opened (600s). Bot kept running on Betano+BetWarrior (never-halt + circuit
+breaker working), but Betsson effectively down.
+
+**Cause (flagged earlier when wiring BetWarrior):** BetWarrior's broad slate (bulk_fixtures
+216) widened the overlap target set → the Betsson overlap ballooned to **136 events/cycle**,
+fetched in a fast burst every 20s → looks like a scraper → Betsson WAF 403.
+
+**Fix:** Bound Betsson's footprint in `OverlapQuoteSource`:
+- `max_linker_events: int = 50` — hard cap on linker per-event fetches per cycle.
+- `max_concurrent_linker_fetches` 8 → 4 — softer burst.
+- `run_hot_loop` POLL default 20 → 45 — fewer bursts, room to recover, still inside staleness.
+
+**State:** branch `fix/betsson-overlap-throttle`. 606 tests, mypy/ruff clean. Note: a fresh
+process resets the circuit, but if Betsson's WAF already flagged the IP it may 403 again
+immediately — wait ~15-30 min then restart. Follow-ups: prioritize the cap toward
+betano-overlaps (liquid) + a per-event TTL cache to cover all events sustainably.
+
 ## 2026-06-10 — Fix armed-deploy crash: readiness probe must fail-safe
 
 **Bug:** The first armed `run_hot_loop` crashed at startup — `check_betwarrior_ready` did an

@@ -68,7 +68,9 @@ async def main() -> int:
         raise SystemExit("REFUSED: --arm requires --yes-real-money")
 
     budget = float(os.environ.get("BUDGET", "200"))
-    poll = float(os.environ.get("POLL", "20"))
+    # 45s default: with the multi-book overlap, a faster poll bursts the linker (Betsson)
+    # into a WAF 403. Gives the per-event fetches room + keeps odds within staleness.
+    poll = float(os.environ.get("POLL", "45"))
     betano_cap = float(os.environ.get("BETANO_CAP_ARS", "300"))
 
     guard = Guardrails(

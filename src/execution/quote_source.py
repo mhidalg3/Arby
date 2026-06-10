@@ -119,10 +119,14 @@ class OverlapQuoteSource:
     match_threshold: float = 0.80
     staleness_sec: float = 45.0
     now_fn: Callable[[], float] = field(default=time.time)
-    # Per-event linker fetches run concurrently up to this many — the overlap set
-    # grows with bulk coverage (more books ⇒ more matched linker events), so the
-    # fetches must parallelize or the cycle blows the staleness window.
-    max_concurrent_linker_fetches: int = 8
+    # Per-event linker fetches run concurrently up to this many. Kept modest so the
+    # per-cycle burst doesn't look like a scraper to the linker's WAF (Betsson 403s +
+    # circuit-breaks under a large fast burst — the multi-book overlap can be 100+).
+    max_concurrent_linker_fetches: int = 4
+    # Hard cap on linker (Betsson) per-event fetches PER CYCLE. With several bulk books
+    # the raw overlap balloons (200+ bulk fixtures ⇒ 130+ matched Betsson events); a
+    # burst that size trips Betsson's WAF. Cap it so the footprint stays sustainable.
+    max_linker_events: int = 50
 
     async def fetch(self) -> dict[str, list[OddsQuote]]:
         by_market: dict[str, list[CanonicalQuote]] = defaultdict(list)
@@ -162,6 +166,13 @@ class OverlapQuoteSource:
                     for t in targets
                 )
             ]
+            if len(overlap) > self.max_linker_events:
+                log.warning(
+                    "quote_source.linker_overlap_capped",
+                    matched=len(overlap),
+                    cap=self.max_linker_events,
+                )
+                overlap = overlap[: self.max_linker_events]
             overlap_events += len(overlap)
             # Fetch the matched events concurrently (bounded) — sequential here is what
             # blew the staleness window once the overlap set grew with multi-book bulk.
