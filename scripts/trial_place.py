@@ -418,6 +418,79 @@ async def _arm_betano(args: argparse.Namespace) -> None:
     )
 
 
+async def _capture_betwarrior_ui(args: argparse.Namespace) -> None:
+    """Operator places ONE bet through the BetWarrior app UI; we intercept the exact
+    `coupon.json` request the app sends — ground truth for the odds scale, the
+    allowOddsChange value, and every field — so the deterministic builder can be
+    reconciled instead of guessed. The body is printed and saved (bearer redacted)."""
+    import time as _time  # noqa: PLC0415
+
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from scripts.recon.stealth import apply_stealth  # noqa: PLC0415
+
+    print(f"⚠️  CAPTURE MODE on betwarrior — you place via the app; I record it.\n  {_BASE_URL['betwarrior']}")
+    cap: dict[str, object] = {}
+
+    def on_request(req: object) -> None:
+        r = req
+        # The place is `.../bwargbap/coupon.json`; the pre-check is `.../coupon/validate.json`
+        # (which does NOT contain "/coupon.json"), so this matches only the real placement.
+        if r.method == "POST" and "/coupon.json" in r.url:  # type: ignore[attr-defined]
+            cap["req_url"] = r.url  # type: ignore[attr-defined]
+            cap["req_headers"] = dict(r.headers)  # type: ignore[attr-defined]
+            cap["req_body"] = r.post_data  # type: ignore[attr-defined]
+
+    async def on_response(resp: object) -> None:
+        r = resp
+        if "/coupon.json" in r.url and r.request.method == "POST":  # type: ignore[attr-defined]
+            with contextlib.suppress(Exception):
+                cap["resp"] = (r.status, await r.text())  # type: ignore[attr-defined]
+
+    pw = await async_playwright().start()
+    ctx = await pw.chromium.launch_persistent_context(
+        user_data_dir="recon/profile/betwarrior",
+        headless=False,
+        channel="chrome",
+        locale="es-AR",
+        timezone_id="America/Argentina/Buenos_Aires",
+        permissions=["geolocation"],
+        geolocation={"latitude": -34.9215, "longitude": -57.9545},
+    )
+    try:
+        await apply_stealth(ctx)
+        ctx.on("request", on_request)
+        ctx.on("response", on_response)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(_BASE_URL["betwarrior"], wait_until="networkidle", timeout=60000)
+        print(
+            "\n  ▶ In the app: log in, open a match, add a selection, enter a tiny stake, and "
+            "place the bet.\n  Waiting up to 5 min for your coupon POST…"
+        )
+        for _ in range(150):
+            if "resp" in cap:
+                break
+            await asyncio.sleep(2)
+        if "req_body" not in cap:
+            print("\n=== RESULT ===\nno coupon.json POST observed (no bet placed in the window)")
+            return
+        status, text = cap.get("resp", (0, ""))  # type: ignore[misc]
+        print(f"\n=== CAPTURED coupon.json (HTTP {status}) ===\n  url: {cap.get('req_url')}")
+        print("  BODY (this is what we must replicate):")
+        print(cap.get("req_body"))
+        hdrs = dict(cap.get("req_headers", {}))  # type: ignore[arg-type]
+        if "authorization" in hdrs:
+            hdrs["authorization"] = "[REDACTED]"
+        out = REPO_ROOT_ARTIFACTS / f"betwarrior_coupon_capture_{int(_time.time())}.json"
+        out.write_text(json.dumps({"headers": hdrs, "body": cap.get("req_body")}, indent=2))
+        print(f"\n  saved → {out}")
+        print("  Paste the BODY here and I'll reconcile build_betwarrior_request (odds scale,")
+        print("  allowOddsChange value, fields) to match it exactly.")
+    finally:
+        await ctx.close()
+        await pw.stop()
+
+
 async def _betwarrior_live_odds(event_id: str, outcome_id: str) -> float | None:
     """Re-fetch BetWarrior's CURRENT odds for one outcome via the public Kambi per-event
     endpoint — the live re-verify primitive (so placement uses fresh odds, not a stale
@@ -575,6 +648,9 @@ async def _arm_and_send(args: argparse.Namespace) -> None:
     if args.capture_ui and args.platform == "betsson":
         await _capture_betsson_ui(args)
         return
+    if args.capture_ui and args.platform == "betwarrior":
+        await _capture_betwarrior_ui(args)
+        return
     if args.via_placer and args.platform == "betsson":
         await _revalidate_betsson(args)
         return
@@ -665,8 +741,10 @@ def main() -> None:
         if not args.yes_real_money:
             sys.exit("REFUSED: --arm requires --yes-real-money")
         if args.capture_ui:
-            if args.platform != "betsson" or not args.slug:
-                sys.exit("REFUSED: --capture-ui is betsson-only and needs --slug")
+            if args.platform not in ("betsson", "betwarrior"):
+                sys.exit("REFUSED: --capture-ui supports betsson / betwarrior")
+            if args.platform == "betsson" and not args.slug:
+                sys.exit("REFUSED: betsson --capture-ui needs --slug")
         else:
             if not args.selection or not args.odds:
                 sys.exit("REFUSED: --arm needs --selection and --odds")

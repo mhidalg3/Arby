@@ -1,5 +1,22 @@
 # Project Ledger
 
+## 2026-06-10 — BetWarrior: capture-ui (coupon.json contract is wrong, suspected odds scale)
+
+**Context:** The BetWarrior trial 400s `{"message":"Invalid odds specified"}` even on a
+ROCK-STABLE prematch favorite (1.14 = live 1.14, exact, allowOddsChange:YES). So it is NOT
+drift — our `coupon.json` request itself is wrong. Prime suspect: ODDS SCALE. The Kambi
+offering API (our scraper) uses ×1000 (`KAMBI_ODDS_SCALE`), but `build_betwarrior_request`
+sends odds ×100 (a recon note never validated by a real placement) → we send 114, Kambi's
+outcome is 1140 → "invalid". allowOddsChange="YES" was also inferred (recon only saw "NO").
+
+**Decision:** Rather than burn more real bets guessing, wired `--capture-ui` for BetWarrior
+(`_capture_betwarrior_ui`, mirroring the Betsson one): operator places ONE bet via the app,
+we intercept the exact `coupon.json` body (odds scale + allowOddsChange value + every field)
+and print/save it (bearer redacted). Then reconcile `build_betwarrior_request` to match.
+
+**State:** branch `chore/betwarrior-capture-ui`. ruff clean. Next: operator runs capture-ui,
+pastes the body; fix the builder; re-run the deterministic trial.
+
 ## 2026-06-10 — BetWarrior trial: dynamic odds re-verify (capture-at-placement + threshold)
 
 **Context (operator clarification):** the right model is NOT "place at the exact discovery
