@@ -1,5 +1,31 @@
 # Project Ledger
 
+## 2026-06-10 — Stage 1: live odds re-verify wired into execution (place-at-current)
+
+**Context:** Every arb leg must re-read its CURRENT odds at placement and place only if the
+arb still holds within tolerance, at the current price (the model the operator clarified;
+BetWarrior strictly requires exact-current odds). The Executor already had the `reverify` seam
++ `odds_still_acceptable`, but it was a no-op; Tier-2 refreshers existed for Betsson/BetWarrior
+(redis-free) — only wired to a dry-run analysis daemon.
+
+**Decisions:**
+- New `BetanoQuoteRefresher` (Betano has no per-event endpoint → re-scrape the bulk
+  top-events-v2 feed, match by outcome id). Betsson/BetWarrior refreshers reused as-is.
+- New `src/execution/reverify.py::LiveOddsReverifier` — a redis-free dispatcher bridging the
+  executor `Leg` to the per-platform `QuoteRefresher`s. FAIL-CLOSED: no refresher / fetch
+  error / market gone → returns 0.0, which fails `odds_still_acceptable` → executor aborts
+  (never place on unverified odds). (The redis-coupled `QuoteVerifier`/`MultiPlatformRefresher`
+  is for the daemon architecture; the self-contained hot loop uses the Tier-2 refreshers only.)
+- Executor now re-verifies EVERY leg right before placing it and places AT the re-verified
+  odds (`replace(leg, odds=current)`), not the stale detection odds. Before any leg is live a
+  drift/unverifiable aborts; once ≥1 leg is live it's NAKED EXPOSURE.
+- Wired the reverifier into `run_hot_loop` (betano/betsson-pba/betwarrior-pba refreshers on
+  the shared client).
+
+**State:** branch `feat/live-reverify`. 604 tests (+8), mypy/ruff clean. Stage 2 next:
+per-platform session readiness checks (BetWarrior validate.json, Betano session, alongside
+Betsson context) into the hot-session heartbeat.
+
 ## 2026-06-10 — BetWarrior VALIDATED end-to-end (+ parse odds-scale fix)
 
 **Milestone:** BetWarrior placed a real bet via the production path — `accepted=True`,

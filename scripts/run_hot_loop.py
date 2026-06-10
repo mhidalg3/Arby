@@ -30,13 +30,19 @@ from src.execution.notify import build_notifier
 from src.execution.orchestrator import ArbOrchestrator
 from src.execution.quote_source import OverlapQuoteSource
 from src.execution.recovery import HumanRecoveryHandler
+from src.execution.reverify import LiveOddsReverifier
 from src.execution.session import InSessionTransport
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
-from src.ingestion.scrapers.betwarrior import BetWarriorPbaScraper
+from src.ingestion.scrapers.betwarrior import BetWarriorPbaDepthScraper, BetWarriorPbaScraper
 from src.logging_setup import configure_logging
 from src.risk.evaluator import RiskEvaluator
 from src.risk.policy import RiskPolicy
+from src.risk.refreshers import (
+    BetanoQuoteRefresher,
+    BetssonQuoteRefresher,
+    BetWarriorQuoteRefresher,
+)
 from src.semantic.canonicalizer import Canonicalizer
 from src.semantic.fixture_resolver import FixtureResolver
 
@@ -140,11 +146,26 @@ async def main() -> int:
                     "betwarrior-pba": DryRunPlacer(),
                 }
             )
+            # Live re-verify: before placing each leg, re-fetch its current odds and
+            # place only if the arb still holds within tolerance, AT the current odds.
+            # Fail-closed if a leg's odds can't be confirmed.
+            reverify = LiveOddsReverifier(
+                refreshers={
+                    "betano": BetanoQuoteRefresher(
+                        BetanoScraper(http_client=client, mode="prematch")
+                    ),
+                    "betsson-pba": BetssonQuoteRefresher(BetssonScraper(http_client=client)),
+                    "betwarrior-pba": BetWarriorQuoteRefresher(
+                        BetWarriorPbaDepthScraper(http_client=client)
+                    ),
+                }
+            )
             executor = Executor(
                 guardrails=guard,
                 notifier=notifier,
                 recovery=HumanRecoveryHandler(notifier),
                 placers=placers,
+                reverify=reverify,
                 dry_run=not live,
             )
             orch = ArbOrchestrator(

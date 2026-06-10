@@ -27,7 +27,7 @@ placer slots in once the placement contract is captured.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
@@ -209,18 +209,20 @@ class Executor:
                     f"leg {self._label(i)} odds drifted {leg.odds}→{current} beyond tolerance",
                 )
 
-        # 2) Place sequentially. Re-verify each leg AGAIN right before placing it
-        #    (odds drift accrues while earlier legs are placed). Once ≥1 leg is live,
-        #    any failure is NAKED EXPOSURE (not abort) — the hedge is incomplete.
+        # 2) Place sequentially. Re-verify each leg's LIVE odds right before placing it
+        #    (drift accrues while earlier legs are placed) and place AT the re-verified
+        #    odds — within tolerance the arb still holds; beyond it (or unverifiable →
+        #    0.0) we stop. Before any leg is live that's an abort; once ≥1 leg is live,
+        #    it's NAKED EXPOSURE (the hedge is incomplete).
         placed: list[PlacementResult] = []
         for i, (leg, placer) in enumerate(zip(legs, placers, strict=True)):
-            if i > 0:  # leg 0 was just re-verified in the pre-check loop
-                current = await self._reverify(leg)
-                if not self._guardrails.odds_still_acceptable(leg.odds, current):
-                    return await self._naked(
-                        opp_id, f"leg {self._label(i)} odds drifted {leg.odds}→{current}", placed
-                    )
-            res = await placer.place(leg)
+            current = await self._reverify(leg)
+            if not self._guardrails.odds_still_acceptable(leg.odds, current):
+                reason = f"leg {self._label(i)} odds drifted {leg.odds}→{current} beyond tolerance"
+                if placed:  # earlier legs already live → unhedged
+                    return await self._naked(opp_id, reason, placed)
+                return await self._abort(opp_id, reason)
+            res = await placer.place(replace(leg, odds=current))  # place AT the re-verified odds
             if not res.accepted:
                 reason = f"leg {self._label(i)} rejected: {res.detail}"
                 if placed:  # earlier legs already live → unhedged

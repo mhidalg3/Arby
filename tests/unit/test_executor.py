@@ -197,14 +197,42 @@ async def test_leg_b_drift_after_leg_a_is_naked_exposure() -> None:
 
     async def reverify(leg: Leg) -> float:
         state["n"] += 1
-        # calls 1,2 = pre-check A,B (no drift); call 3 = re-verify B after A placed (drift)
-        return leg.odds * 0.9 if state["n"] == 3 else leg.odds
+        # calls 1,2 = pre-check A,B; 3 = placement A (ok); 4 = placement B drifts (A already live)
+        return leg.odds * 0.9 if state["n"] == 4 else leg.odds
 
     res = await _executor(
         g, _FakeNotifier(), _FakeRecovery(), DryRunPlacer(), reverify
     ).execute_two_leg("o", *_legs())
     assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
     assert g.total_exposure_ars == 100.0
+
+
+async def test_places_at_reverified_current_odds() -> None:
+    """The leg is placed at the LIVE re-verified odds (within tolerance), not the
+    stale detection odds — required for books that demand exact-current odds."""
+    g, n = _guard(odds_tolerance_pct=5.0), _FakeNotifier()  # allow a small move
+
+    async def reverify(leg: Leg) -> float:
+        return leg.odds * 0.98  # 2% drift, within the 5% tolerance
+
+    placer = _CountingPlacer()
+    res = await _executor(g, n, _FakeRecovery(), placer, reverify).execute_two_leg("o", *_legs())
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert res.legs[0].odds_filled == _legs()[0].odds * 0.98  # placed at current, not detection
+
+
+async def test_unverifiable_odds_aborts_before_placing() -> None:
+    """A leg whose odds can't be confirmed (reverify → 0.0) fails acceptance → abort,
+    nothing placed (fail-closed)."""
+    g, n = _guard(), _FakeNotifier()
+
+    async def reverify(leg: Leg) -> float:
+        return 0.0  # unverifiable (no refresher / fetch error / market gone)
+
+    placer = _CountingPlacer()
+    res = await _executor(g, n, _FakeRecovery(), placer, reverify).execute_two_leg("o", *_legs())
+    assert res.outcome is ExecutionOutcome.ABORTED
+    assert placer.calls == 0  # never placed
 
 
 async def test_unexpected_error_freezes_and_trips_kill_switch() -> None:

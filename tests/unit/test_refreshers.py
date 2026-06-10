@@ -18,6 +18,7 @@ from src.ingestion.scrapers.betsson import BetssonContractError
 from src.ingestion.scrapers.betwarrior import BetWarriorContractError
 from src.ingestion.scrapers.bplay import BplayContractError
 from src.risk.refreshers import (
+    BetanoQuoteRefresher,
     BetssonQuoteRefresher,
     BetWarriorQuoteRefresher,
     BplayXMLQuoteRefresher,
@@ -117,6 +118,36 @@ class TestBetssonQuoteRefresher:
         leg = _leg("betsson-pba", "f-evt", "out-1")
         with pytest.raises(BetssonContractError):
             await refresher.refresh(leg)
+
+
+# ---- BetanoQuoteRefresher (bulk-feed scan) ----
+
+
+class _FakeBetanoScraper:
+    def __init__(self, snaps: list[RawOddsSnapshot]) -> None:
+        self._snaps = snaps
+
+    async def fetch_live_soccer(self):  # type: ignore[no-untyped-def]
+        for s in self._snaps:
+            yield s
+
+
+class TestBetanoQuoteRefresher:
+    async def test_finds_matching_outcome_in_bulk_feed(self) -> None:
+        scraper = _FakeBetanoScraper(
+            [_snap("betano", "85", "sel-1", 2.37), _snap("betano", "85", "sel-2", 3.40)]
+        )
+        fq = await BetanoQuoteRefresher(scraper=scraper).refresh(  # type: ignore[arg-type]
+            _leg("betano", "85", "sel-2")
+        )
+        assert fq.decimal_odds == pytest.approx(3.40) and fq.tier == 2
+
+    async def test_outcome_not_in_feed_returns_none(self) -> None:
+        scraper = _FakeBetanoScraper([_snap("betano", "85", "sel-1", 2.37)])
+        fq = await BetanoQuoteRefresher(scraper=scraper).refresh(  # type: ignore[arg-type]
+            _leg("betano", "85", "sel-missing")
+        )
+        assert fq.decimal_odds is None and fq.tier == 2
 
 
 # ---- BetWarriorQuoteRefresher ----

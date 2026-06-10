@@ -41,6 +41,7 @@ import structlog
 
 from src.arbitrage.quotes import OddsQuote
 from src.ingestion.scrapers.base import RawOddsSnapshot
+from src.ingestion.scrapers.betano import BetanoContractError, BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonContractError, BetssonScraper
 from src.ingestion.scrapers.betwarrior import (
     BetWarriorContractError,
@@ -150,6 +151,35 @@ class BetWarriorQuoteRefresher:
                     observed_at=snap.timestamp,
                     tier=2,
                 )
+        return _not_found_quote(leg)
+
+
+@dataclass
+class BetanoQuoteRefresher:
+    """Betano exposes no per-event read endpoint, so refresh re-scrapes the bulk feed
+    (one ``top-events-v2`` / live call) and finds the leg's outcome — one HTTP
+    round-trip, just larger than a per-event call. Matches the leg by
+    ``platform_outcome_id`` (no event id needed)."""
+
+    scraper: BetanoScraper
+    platform_name: str = "betano"
+
+    async def refresh(self, leg: OddsQuote) -> FreshQuote:
+        if not leg.platform_outcome_id:
+            return _no_ids_sentinel(leg)
+        try:
+            async for snap in self.scraper.fetch_live_soccer():
+                if snap.platform_outcome_id == leg.platform_outcome_id:
+                    return FreshQuote(
+                        platform=snap.platform,
+                        platform_outcome_id=snap.platform_outcome_id,
+                        decimal_odds=snap.decimal_odds,
+                        observed_at=snap.timestamp,
+                        tier=2,
+                    )
+        except BetanoContractError as exc:
+            log.warning("refresher.betano.fetch_failed", error=str(exc))
+            raise
         return _not_found_quote(leg)
 
 
