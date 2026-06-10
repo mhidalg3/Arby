@@ -1,5 +1,41 @@
 # Project Ledger
 
+## 2026-06-09 — Fix fixture-matching false positive (the 72% phantom arb)
+
+**Context:** The dry-run hot loop surfaced a persistent phantom arb
+(`fx-…|1x2 realized_roi_pct≈72%`) every cycle. Root cause: Betsson (non-anchor)
+linked to a canonical fixture using only its SINGLE outcome label (one team name),
+matching home OR away. An event sharing ONE team with a registered fixture (e.g.
+Betsson *Boca vs Defensa* → registered *Boca vs River*) mis-linked, cross-attributing
+its odds → impossible combined margin. The risk 25% ceiling rejected it, but a
+sub-25% mispair would have passed → real loss.
+
+**Decision:** Link Betsson on its SLUG (which carries BOTH team names, e.g.
+"gimnasia jujuy belgrano") instead of the single outcome label. `_resolve_non_anchor`
+now requires BOTH of a candidate fixture's teams to appear in the slug — tries every
+token-boundary split and matches the halves against (home, away) in either order, each
+≥ ANCHOR_MATCH_THRESHOLD (0.85). This makes Betsson linking exactly as strict as the
+existing cross-anchor dedup (which already requires both teams). Removed the obsolete
+single-label finder and the "Empate alone drops" guard (the slug identifies the match
+without the outcome label, so draw/BTTS/OU snapshots now resolve in the same cycle →
+more complete partitions, faster).
+
+**Tradeoff:** Stricter — if a real overlap has one team whose Betsson slug spelling
+diverges >15% from the anchor's, it now DROPS rather than mis-links. Correct failure
+direction (missed arb = 0 loss; mispair = potential loss). Betsson URL slugs are
+conventionally full display names, so this should be rare; if we observe legit drops,
+add token-containment tolerance to `_slug_matches_both_teams`.
+
+**State:** fix on `fix/fixture-match-both-teams`. Regression test
+`test_betsson_sharing_one_team_does_not_mislink` captures the exact failure mode. 580
+tests, mypy/ruff clean. Next: merge, then this clears the top pre-armed blocker — an
+armed run on a verified real arb is the remaining step.
+
+**Errors:** Updated two now-obsolete tests whose premises the fix invalidated
+(`test_betsson_with_empate_outcome_alone_returns_none` → links via slug;
+`test_betsson_btts_without_1x2_anchor_drops` → anchors on slug regardless of market order).
+
+
 ## 2026-06-09 — #2 hot sessions DRY-RUN VALIDATED live (+ fixture-match false-positive found)
 
 **Dry-run hot loop ran ~1h15m live** (run_hot_loop, no bets). Validated end-to-end:

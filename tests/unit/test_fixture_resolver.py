@@ -200,13 +200,26 @@ class TestBetssonAnchoring:
         assert f.home_team == "gimnasia jujuy"
         assert f.away_team == "belgrano"
 
-    async def test_betsson_with_empate_outcome_alone_returns_none(self) -> None:
-        """Empate doesn't disambiguate WHICH fixture — the resolver
-        waits for a non-Empate Betsson snapshot from the same event."""
+    async def test_betsson_empate_outcome_links_via_slug(self) -> None:
+        """The slug carries BOTH teams, so a draw ("Empate") snapshot resolves
+        the fixture without needing the outcome label — the draw cell completes
+        the partition in the same cycle instead of waiting for a non-draw snap."""
         r = FixtureResolver()
         await r.resolve(_snap("betwarrior-pba", "k-1", "Gimnasia Jujuy - Belgrano", timestamp=1000.0))
         bet = _snap("betsson-pba", "f-bet", "gimnasia jujuy belgrano", "Empate", timestamp=1002.0)
-        assert await r.resolve(bet) is None
+        f = await r.resolve(bet)
+        assert f is not None
+        assert f.home_team == "gimnasia jujuy" and f.away_team == "belgrano"
+
+    async def test_betsson_sharing_one_team_does_not_mislink(self) -> None:
+        """Regression for the live 72% phantom arb: a Betsson event that shares
+        only ONE team with a registered fixture must NOT link to it. The slug
+        ("boca defensa") covers only 'boca' of Boca-River — 'defensa' ≠ 'river'
+        — so requiring both teams drops it rather than cross-attributing odds."""
+        r = FixtureResolver()
+        await r.resolve(_snap("betano", "k-1", "Boca vs River", timestamp=1000.0))
+        other = _snap("betsson-pba", "f-x", "boca defensa", "Boca", timestamp=1002.0)
+        assert await r.resolve(other) is None
 
     async def test_betsson_cached_after_first_link(self) -> None:
         """After Betsson is linked once via outcome anchoring, repeat

@@ -254,22 +254,23 @@ class TestCrossPlatformCanonicalization:
         result = await c.canonicalize(push_snap)
         assert result is None
 
-    async def test_betsson_btts_without_1x2_anchor_drops(self) -> None:
-        """Document the precondition: Betsson BTTS/OU outcomes
-        (`Si`/`No`/`Más`/`Menos`) can't anchor a fixture on their
-        own (they're not team names). Realistic snapshot order has
-        1X2 arriving first; out-of-order ingestion drops the BTTS
-        snapshot until 1X2 cycles in."""
+    async def test_betsson_btts_anchors_on_slug_regardless_of_market_order(self) -> None:
+        """The Betsson slug carries both team names, so a BTTS/OU snapshot
+        anchors its fixture on the slug — it does NOT need a 1X2 snapshot to
+        arrive first (the outcome label `Si`/`No` isn't a team name, but the
+        slug is enough). Out-of-order ingestion resolves immediately."""
         c = Canonicalizer(fixture_resolver=FixtureResolver())
         # BetWarrior anchor exists, but Betsson event_id isn't linked yet.
         await c.canonicalize(
             _snap("betwarrior-pba", "k-1", "Boca - River", "Resultado Final", "1", 2.0,
                   timestamp=1000.0)
         )
-        # Betsson BTTS arrives WITHOUT a prior 1X2 anchor on f-1.
+        # Betsson BTTS arrives WITHOUT a prior 1X2 anchor on f-1 — still resolves.
         btts = _snap("betsson-pba", "f-1", "boca river",
                      "Ambos equipos anotan", "Si", 1.85, timestamp=1001.0)
-        assert await c.canonicalize(btts) is None
+        cq = await c.canonicalize(btts)
+        assert cq is not None
+        assert cq.odds_quote.market_id.endswith("|btts")
 
 
 # ---- Defensive: non-v1 markets drop, unresolvable fixtures drop ----

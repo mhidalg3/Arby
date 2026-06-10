@@ -14,15 +14,20 @@ Three platforms, three strategies:
 - **Bplay** (`raw_event_name = "Home vs Away"`) — split on
   `" vs "`, normalize, register or link.
 - **Betsson** — `raw_event_name` is a flat lowercase slug (e.g.
-  `"gimnasia jujuy belgrano"`) that does NOT preserve home/away
-  split. We CANNOT create a canonical fixture from a Betsson
-  snapshot alone. The strategy: anchor against existing canonical
-  fixtures (created by Bplay or BetWarrior) using the outcome
-  label, which IS a team name on Betsson. If the outcome label
-  fuzzy-matches one of an existing fixture's teams within the
-  observation window, link the Betsson event to it. Otherwise
-  defer — the next snapshot from an anchor platform will register
-  the fixture, and a later Betsson cycle will pick it up.
+  `"gimnasia jujuy belgrano"`) that carries BOTH team names but
+  does NOT preserve the home/away order or a reliable split point
+  (hyphens fall both between and within names). We CANNOT create a
+  canonical fixture from a Betsson snapshot alone. The strategy:
+  anchor against existing canonical fixtures (created by an anchor
+  platform) by requiring BOTH of a fixture's teams to appear in the
+  slug — we try every token-boundary split and match the two halves
+  against (home, away) in either order, both clearing the threshold.
+  Requiring both teams (not just the single outcome label) is what
+  stops a Betsson event that merely SHARES ONE TEAM with a registered
+  fixture from mis-linking to it and cross-attributing its odds — the
+  cause of phantom (impossible-margin) arbs. If no fixture matches,
+  defer — the next anchor-platform snapshot registers the fixture and
+  a later Betsson cycle picks it up.
 
 Dedup key: `(home_team_normalized, away_team_normalized)`, with a
 recent-observation-window filter. Two anchor-platform snapshots
@@ -172,18 +177,19 @@ class FixtureResolver:
     async def _resolve_non_anchor(
         self, snapshot: RawOddsSnapshot
     ) -> CanonicalFixture | None:
-        """Betsson and any other platform without a parsable home/away
-        in raw_event_name. Use the outcome label as a team hint."""
-        label = snapshot.raw_outcome_name.strip()
-        if not label or label.lower() == "empate":
-            # Empate alone doesn't disambiguate; wait for a non-draw
-            # snapshot from the same Betsson event in a future cycle.
-            return None
-        label_n = normalize_team_name(label)
-        if not label_n:
+        """Betsson and any other platform without a parsable home/away in
+        raw_event_name. Its slug carries BOTH team names (no reliable order
+        or split), so we link by requiring both of a candidate fixture's
+        teams to appear in the slug — strict enough that an event sharing
+        only one team can't mis-link. The outcome label is NOT used here
+        (it's a single team → ambiguous); the downstream outcome resolver
+        still uses it to pick the cell."""
+        slug_n = normalize_team_name(snapshot.raw_event_name)
+        if not slug_n or " " not in slug_n:
+            # Need at least two tokens to carry two team names.
             return None
 
-        candidates = self._find_candidates_by_team_anchor(label_n, snapshot.timestamp)
+        candidates = self._find_candidates_by_slug(slug_n, snapshot.timestamp)
         if len(candidates) == 1:
             return self._link(snapshot, candidates[0].fixture_id)
         if len(candidates) > 1:
@@ -234,18 +240,39 @@ class FixtureResolver:
             and self._within_window(fid, observed_at)
         ]
 
-    def _find_candidates_by_team_anchor(
-        self, label_n: str, observed_at: float
+    def _find_candidates_by_slug(
+        self, slug_n: str, observed_at: float
     ) -> list[CanonicalFixture]:
+        """Fixtures (within window) whose BOTH teams appear in the slug."""
         return [
             fx
             for fid, fx in self._fixtures.items()
             if self._within_window(fid, observed_at)
-            and (
-                team_similarity(label_n, fx.home_team) >= ANCHOR_MATCH_THRESHOLD
-                or team_similarity(label_n, fx.away_team) >= ANCHOR_MATCH_THRESHOLD
-            )
+            and self._slug_matches_both_teams(slug_n, fx)
         ]
+
+    @staticmethod
+    def _slug_matches_both_teams(slug_n: str, fx: CanonicalFixture) -> bool:
+        """True iff BOTH of the fixture's teams are present in the normalized
+        Betsson slug. The slug ("gimnasia jujuy belgrano") concatenates both
+        names with no reliable split point, so we try every token-boundary
+        split and require the two halves to match (home, away) in EITHER
+        order, each clearing ANCHOR_MATCH_THRESHOLD. Requiring both — not a
+        single team — is what prevents an event sharing only one team from
+        mis-linking (the phantom-arb cause)."""
+        tokens = slug_n.split()
+        for i in range(1, len(tokens)):
+            left = " ".join(tokens[:i])
+            right = " ".join(tokens[i:])
+            if (
+                team_similarity(left, fx.home_team) >= ANCHOR_MATCH_THRESHOLD
+                and team_similarity(right, fx.away_team) >= ANCHOR_MATCH_THRESHOLD
+            ) or (
+                team_similarity(left, fx.away_team) >= ANCHOR_MATCH_THRESHOLD
+                and team_similarity(right, fx.home_team) >= ANCHOR_MATCH_THRESHOLD
+            ):
+                return True
+        return False
 
     def _within_window(self, fixture_id: str, observed_at: float) -> bool:
         last = self._last_seen.get(fixture_id)
