@@ -319,6 +319,7 @@ class BetssonScraper(BaseScraper):
 
         observed_at = time.time()
         raw_event_name = self._event_name_from_slug(fx.slug)
+        raw_competition = self._competition_from_slug(fx.slug)
 
         for market_code, group in accordions.items():
             if not isinstance(group, dict):
@@ -366,6 +367,7 @@ class BetssonScraper(BaseScraper):
                         decimal_odds=float(odds),
                         max_stake=None,  # not in public response; bet-slip only
                         timestamp=observed_at,
+                        raw_competition=raw_competition,
                     )
 
     @staticmethod
@@ -381,6 +383,16 @@ class BetssonScraper(BaseScraper):
         if len(parts) < SLUG_MATCH_LEVEL_SEGMENTS:
             return slug
         return parts[SLUG_MATCH_LEVEL_SEGMENTS - 1].replace("-", " ")
+
+    @staticmethod
+    def _competition_from_slug(slug: str) -> str:
+        """The league segment of a fixture slug (e.g.
+        ``"argentina-liga-profesional-de-reserva"``). The semantic layer reads it
+        to detect a reserve division when the team names come through bare."""
+        parts = slug.split("/")
+        if len(parts) < SLUG_MATCH_LEVEL_SEGMENTS:
+            return ""
+        return parts[SLUG_MATCH_LEVEL_SEGMENTS - 2].replace("-", " ")
 
     async def _get_json(self, url: str, params: dict[str, str] | None = None) -> Any:
         """GET <url> as JSON. Wraps network/HTTP/parse errors uniformly."""

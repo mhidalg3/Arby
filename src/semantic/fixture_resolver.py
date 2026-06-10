@@ -51,7 +51,12 @@ from typing import Final, Protocol
 
 from src.ingestion.scrapers.base import RawOddsSnapshot
 from src.semantic.canonical import CanonicalFixture
-from src.semantic.team_normalize import normalize_team_name, team_similarity
+from src.semantic.team_normalize import (
+    competition_is_reserve,
+    normalize_team_name,
+    strip_reserve,
+    team_similarity,
+)
 
 # Two anchor-platform snapshots within this many seconds of each
 # other are candidates for the same canonical fixture. Beyond it,
@@ -155,13 +160,17 @@ class FixtureResolver:
         parts = self._split_event_name(snapshot)
         if parts is None:
             return None
-        home_n = normalize_team_name(parts[0])
-        away_n = normalize_team_name(parts[1])
+        # Store BASE names (reserve markers stripped) + a reserve flag, so a team's
+        # reserve side compares cleanly across platforms while staying distinct from
+        # its senior side. Reserve-ness comes from a name marker OR the competition.
+        home_n, home_res = strip_reserve(normalize_team_name(parts[0]))
+        away_n, away_res = strip_reserve(normalize_team_name(parts[1]))
         if not home_n or not away_n:
             return None
+        is_reserve = home_res or away_res or competition_is_reserve(snapshot.raw_competition)
 
         candidates = self._find_candidates_by_team_match(
-            home_n, away_n, snapshot.timestamp
+            home_n, away_n, is_reserve, snapshot.timestamp
         )
         if len(candidates) == 1:
             return self._link(snapshot, candidates[0].fixture_id)
@@ -172,7 +181,7 @@ class FixtureResolver:
             return None
 
         # No match — create a new canonical fixture.
-        return self._register_new(snapshot, home_n, away_n)
+        return self._register_new(snapshot, home_n, away_n, is_reserve)
 
     async def _resolve_non_anchor(
         self, snapshot: RawOddsSnapshot
@@ -188,8 +197,11 @@ class FixtureResolver:
         if not slug_n or " " not in slug_n:
             # Need at least two tokens to carry two team names.
             return None
+        # Reserve-ness: the competition (Betsson's reserve league) or a marker in
+        # the slug itself. Must agree with the candidate fixture's flag to link.
+        is_reserve = competition_is_reserve(snapshot.raw_competition) or strip_reserve(slug_n)[1]
 
-        candidates = self._find_candidates_by_slug(slug_n, snapshot.timestamp)
+        candidates = self._find_candidates_by_slug(slug_n, is_reserve, snapshot.timestamp)
         if len(candidates) == 1:
             return self._link(snapshot, candidates[0].fixture_id)
         if len(candidates) > 1:
@@ -221,46 +233,48 @@ class FixtureResolver:
         return home, away
 
     def _find_candidates_by_team_match(
-        self, home_n: str, away_n: str, observed_at: float
+        self, home_n: str, away_n: str, is_reserve: bool, observed_at: float
     ) -> list[CanonicalFixture]:
-        """Find canonical fixtures whose home AND away teams both
-        clear ANCHOR_MATCH_THRESHOLD similarity against the parsed
-        pair. Fuzzy match (not exact) is required because two
-        platforms can canonicalize the same team differently
-        (Bplay 'Mirassol FC SP' vs BetWarrior 'Mirassol-SP' →
-        normalized 'mirassol fc sp' vs 'mirassol sp', sim ≈0.94).
-        The threshold is the same as the outcome-resolver's, by
-        design — `Belgrano` vs `Belgrano Reserves` stays at ≈0.79
-        and correctly does NOT link."""
+        """Find canonical fixtures whose home AND away BASE teams both clear
+        ANCHOR_MATCH_THRESHOLD similarity AND whose reserve flag agrees. Fuzzy
+        match (not exact) is required because platforms canonicalize a team
+        differently (Bplay 'Mirassol FC SP' vs BetWarrior 'Mirassol-SP' →
+        'mirassol fc sp' vs 'mirassol sp', ≈0.94). The reserve-flag gate (not a
+        similarity gap) is what keeps a team's reserve side distinct from its
+        senior side — both compare as the same base name now."""
         return [
             fx
             for fid, fx in self._fixtures.items()
-            if team_similarity(home_n, fx.home_team) >= ANCHOR_MATCH_THRESHOLD
+            if fx.is_reserve == is_reserve
+            and team_similarity(home_n, fx.home_team) >= ANCHOR_MATCH_THRESHOLD
             and team_similarity(away_n, fx.away_team) >= ANCHOR_MATCH_THRESHOLD
             and self._within_window(fid, observed_at)
         ]
 
     def _find_candidates_by_slug(
-        self, slug_n: str, observed_at: float
+        self, slug_n: str, is_reserve: bool, observed_at: float
     ) -> list[CanonicalFixture]:
-        """Fixtures (within window) whose BOTH teams appear in the slug."""
+        """Fixtures (within window, matching reserve flag) whose BOTH base teams
+        appear in the slug."""
         return [
             fx
             for fid, fx in self._fixtures.items()
-            if self._within_window(fid, observed_at)
+            if fx.is_reserve == is_reserve
+            and self._within_window(fid, observed_at)
             and self._slug_matches_both_teams(slug_n, fx)
         ]
 
     @staticmethod
     def _slug_matches_both_teams(slug_n: str, fx: CanonicalFixture) -> bool:
-        """True iff BOTH of the fixture's teams are present in the normalized
-        Betsson slug. The slug ("gimnasia jujuy belgrano") concatenates both
-        names with no reliable split point, so we try every token-boundary
-        split and require the two halves to match (home, away) in EITHER
-        order, each clearing ANCHOR_MATCH_THRESHOLD. Requiring both — not a
-        single team — is what prevents an event sharing only one team from
-        mis-linking (the phantom-arb cause)."""
-        tokens = slug_n.split()
+        """True iff BOTH of the fixture's (base) teams are present in the
+        normalized slug. The slug ("gimnasia jujuy belgrano") concatenates both
+        names with no reliable split point, so we strip any reserve marker, then
+        try every token-boundary split and require the two halves to match
+        (home, away) in EITHER order, each clearing ANCHOR_MATCH_THRESHOLD.
+        Requiring both — not a single team — is what prevents an event sharing
+        only one team from mis-linking (the phantom-arb cause)."""
+        base_slug, _ = strip_reserve(slug_n)
+        tokens = base_slug.split()
         for i in range(1, len(tokens)):
             left = " ".join(tokens[:i])
             right = " ".join(tokens[i:])
@@ -290,13 +304,14 @@ class FixtureResolver:
         return self._fixtures[fixture_id]
 
     def _register_new(
-        self, snapshot: RawOddsSnapshot, home_n: str, away_n: str
+        self, snapshot: RawOddsSnapshot, home_n: str, away_n: str, is_reserve: bool
     ) -> CanonicalFixture:
         fixture_id = f"fx-{uuid.uuid4().hex[:12]}"
         fixture = CanonicalFixture(
             fixture_id=fixture_id,
             home_team=home_n,
             away_team=away_n,
+            is_reserve=is_reserve,
         )
         self._fixtures[fixture_id] = fixture
         self._by_platform_key[(snapshot.platform, snapshot.platform_event_id)] = (

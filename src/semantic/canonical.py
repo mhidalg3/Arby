@@ -132,6 +132,12 @@ class CanonicalFixture:
     fixture_id: str
     home_team: str
     away_team: str
+    # Reserve (segunda / youth) match flag. `home_team`/`away_team` are stored as
+    # BASE names (reserve markers stripped) so cross-platform names compare cleanly;
+    # this boolean keeps reserve matches distinct from their senior side. Two
+    # fixtures with the same base teams but different `is_reserve` are NOT the same
+    # match — never conflate them.
+    is_reserve: bool = False
     kickoff_utc: datetime | None = None
     competition_slug: str | None = None
 

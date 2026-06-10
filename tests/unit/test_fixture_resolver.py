@@ -27,6 +27,7 @@ def _snap(
     raw_event_name: str,
     raw_outcome_name: str = "1",
     timestamp: float = 1748287200.0,
+    raw_competition: str = "",
 ) -> RawOddsSnapshot:
     return RawOddsSnapshot(
         platform=platform,
@@ -39,6 +40,7 @@ def _snap(
         decimal_odds=2.0,
         max_stake=None,
         timestamp=timestamp,
+        raw_competition=raw_competition,
     )
 
 
@@ -302,6 +304,49 @@ class TestLLMFallback:
         result = await r.resolve(snap)
         assert result is not None
         assert result.fixture_id == "fx-pick"
+
+
+class TestReserveAwareMatching:
+    """Reserve matches link across platforms despite divergent reserve markers
+    (Betano '… ii' vs Betsson's reserve-league competition with bare names), while
+    a reserve match is NEVER conflated with its senior side."""
+
+    async def test_reserve_links_across_marker_styles(self) -> None:
+        r = FixtureResolver()
+        # Betano marks reserves in the team name ('ii').
+        ban = await r.resolve(
+            _snap("betano", "k-1", "Huracan II vs Estudiantes II", timestamp=1000.0)
+        )
+        # Betsson leaves the names bare; reserve-ness is in the competition slug.
+        bet = await r.resolve(
+            _snap("betsson-pba", "f-1", "huracan estudiantes", "Huracan", timestamp=1002.0,
+                  raw_competition="liga profesional de reserva")
+        )
+        assert ban is not None and bet is not None
+        assert ban.fixture_id == bet.fixture_id  # same reserve match, linked
+        assert ban.is_reserve is True
+        assert ban.home_team == "huracan" and ban.away_team == "estudiantes"  # BASE names stored
+
+    async def test_reserve_and_senior_same_teams_stay_distinct(self) -> None:
+        r = FixtureResolver()
+        senior = await r.resolve(_snap("betano", "k-1", "Huracan vs Estudiantes", timestamp=1000.0))
+        reserve = await r.resolve(
+            _snap("betano", "k-2", "Huracan II vs Estudiantes II", timestamp=1001.0)
+        )
+        assert senior is not None and reserve is not None
+        assert senior.fixture_id != reserve.fixture_id  # flag keeps them apart
+        assert senior.is_reserve is False and reserve.is_reserve is True
+
+    async def test_betsson_reserve_does_not_link_to_senior_fixture(self) -> None:
+        """A Betsson reserve event must not attach to a registered SENIOR fixture of
+        the same teams — the reserve-flag gate blocks the conflation."""
+        r = FixtureResolver()
+        await r.resolve(_snap("betano", "k-1", "Huracan vs Estudiantes", timestamp=1000.0))  # senior
+        reserve_event = _snap(
+            "betsson-pba", "f-1", "huracan estudiantes", "Huracan", timestamp=1002.0,
+            raw_competition="liga profesional de reserva",
+        )
+        assert await r.resolve(reserve_event) is None  # no SENIOR match for a reserve event
 
 
 class TestBetanoAnchor:

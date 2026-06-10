@@ -111,6 +111,16 @@ class TestTeamLabelHomeAway:
         assert result is not None
         assert result.cell == CELL_AWAY
 
+    def test_reserve_outcome_label_resolves_against_base_fixture(self) -> None:
+        """Fixtures store BASE names, so a reserve outcome label ('Huracán II' /
+        'Huracán Reserves') strips its marker to match — reserve-ness was already
+        settled when the fixture was linked, so the cell mapping is unambiguous."""
+        for label in ("Huracan II", "Huracán Reserves"):
+            result = resolve_outcome(
+                _snap("bplay-pba", label), _H2H, _fixture(home="huracan", away="estudiantes")
+            )
+            assert result is not None and result.cell == CELL_HOME
+
     def test_below_threshold_returns_none(self) -> None:
         """The discriminator: `Belgrano` against canonical
         `Belgrano Reserves` is below 0.85. The resolver returns None

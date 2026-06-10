@@ -1,5 +1,38 @@
 # Project Ledger
 
+## 2026-06-10 — Reserve-aware fixture matching (cross-platform reserve coverage)
+
+**Context:** On reserve-heavy AR slates, cross-platform linking dropped 3 of 4 overlaps:
+Betano marks reserves `"… ii"`, Betsson via the reserve-LEAGUE (team names bare), so the
+both-teams matcher saw `huracan` vs `huracan ii` (0.79) etc. and dropped them. But the fix
+had to stay SAFE: `team_normalize` deliberately never strips suffixes because `Belgrano` ≠
+`Belgrano Reserves` — conflating a reserve with its senior side would place unhedged bets.
+
+**Decision:** Reserve-ness is a distinguishing ATTRIBUTE, not a name to silently drop.
+- `team_normalize`: `strip_reserve(name)->(base, is_reserve)` (tokens ii/reserve(s)/reserva)
+  and `competition_is_reserve(comp)` (the `reserv` stem). `normalize_team_name`/
+  `team_similarity` left pure.
+- `RawOddsSnapshot.raw_competition` (default ""); Betsson scraper populates it from the
+  slug LEAGUE segment (its team names come bare). Betano/Bplay/BetWarrior carry the marker
+  in the team name, so they don't need it.
+- `CanonicalFixture.is_reserve`; fixtures store BASE team names. Identity is
+  (base_home, base_away, is_reserve).
+- `fixture_resolver`: compute is_reserve = name-marker OR competition; match on BASE names
+  + REQUIRE reserve-flag agreement (anchor match + slug both-teams). Senior never links to
+  reserve.
+- `outcome_resolver`: strip the marker off team-name labels (fixture stores base; the
+  reserve distinction was already settled at link time).
+
+**Verified live: cross_platform 1 → 4** on the reserve slate (all overlaps linked, both
+books; detector ran, no arb — efficient). Safety covered by tests: senior+reserve of the
+same teams stay distinct; a Betsson reserve event won't attach to a senior fixture.
+
+**Open:** location-qualifier divergence (Betsson `"ca sarmiento de junin"` vs Betano
+`"ca sarmiento"`, `"estudiantes de rio cuarto"` vs `"estudiantes rio cuarto"`) is a
+SEPARATE naming gap, not reserve-related — some still drop on it. Future work if needed.
+
+**State:** branch `feat/reserve-aware-matching`. 594 tests (+4), mypy/ruff clean.
+
 ## 2026-06-10 — Integration test for the scraper↔canonicalizer seam
 
 **Context:** The `cross_platform: 0` regression (empty `raw_event_name` from

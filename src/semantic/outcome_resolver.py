@@ -43,7 +43,7 @@ from src.semantic.canonical import (
     CanonicalMarketCode,
     CanonicalOutcome,
 )
-from src.semantic.team_normalize import normalize_team_name, team_similarity
+from src.semantic.team_normalize import normalize_team_name, strip_reserve, team_similarity
 
 # 1X2 — platforms using position labels.
 _POSITION_LABEL_PLATFORMS: Final[frozenset[str]] = frozenset({"betwarrior-pba"})
@@ -104,7 +104,10 @@ def _resolve_h2h_3way(
     if label.lower() == _DRAW_LABEL_NORMALIZED:
         return CanonicalOutcome(market=market, cell=CELL_DRAW)
 
-    normalized = normalize_team_name(label)
+    # Strip reserve markers — the fixture stores BASE names, so a reserve outcome
+    # label ("Huracán Reserves" / "Huracán II") must compare on its base ("huracan").
+    # The fixture's reserve-ness was already settled when it was linked.
+    normalized, _ = strip_reserve(normalize_team_name(label))
     if not normalized:
         return None
 

@@ -40,6 +40,11 @@ class RawOddsSnapshot:
     decimal_odds: float
     max_stake: float | None
     timestamp: float  # unix epoch seconds
+    # Optional league/competition label (e.g. Betsson's slug league segment).
+    # The fixture resolver reads it to detect a RESERVE division when a platform
+    # leaves the team names bare. Default "" — platforms that mark reserves in the
+    # team name itself (Betano "… ii", Bplay "… Reserves") need not populate it.
+    raw_competition: str = ""
 
 
 class BaseScraper(ABC):
