@@ -141,8 +141,11 @@ class BetWarriorLegPlacer:
 
     platform = "betwarrior-pba"
 
-    def __init__(self, transport: BetWarriorTransport) -> None:
+    def __init__(self, transport: BetWarriorTransport, *, allow_odds_change: bool = False) -> None:
         self._t = transport
+        # Production default NO (the exact odds are the arb edge). The trial sets YES to
+        # validate placement on fast-moving lines; live re-verify is the production path.
+        self._allow_odds_change = allow_odds_change
         self._log = log.bind(component="leg_placer", platform=self.platform)
 
     async def place(self, leg: Leg) -> PlacementResult:
@@ -159,6 +162,7 @@ class BetWarriorLegPlacer:
             outcome_id=int(leg.platform_outcome_id),
             odds_x100=round(leg.odds * 100),
             stake_thousandths=round(leg.stake_ars * 1000),
+            allow_odds_change=self._allow_odds_change,
         )
         headers = {"content-type": "application/json", "authorization": f"Bearer {bearer}"}
         try:

@@ -437,7 +437,10 @@ async def _arm_betwarrior(args: argparse.Namespace) -> None:
             "(that fires the authenticated call whose bearer we capture). Then press ENTER "
             "to place… ",
         )
-        res = await BetWarriorLegPlacer(transport).place(leg)
+        # Trial accepts the book's current odds (reserve lines move faster than the
+        # discover→arm gap, else Kambi rejects "Invalid odds specified"). This validates
+        # the mechanics; production keeps odds fixed (the arb edge) + live re-verify.
+        res = await BetWarriorLegPlacer(transport, allow_odds_change=True).place(leg)
     print(
         f"\n=== RESULT (betwarrior) ===\naccepted={res.accepted}  ref={res.ref!r}  "
         f"stake_filled={res.stake_filled}  odds_filled={res.odds_filled}\ndetail: {res.detail}"

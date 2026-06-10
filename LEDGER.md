@@ -1,5 +1,25 @@
 # Project Ledger
 
+## 2026-06-10 — BetWarrior trial: odds-change handling (400 "Invalid odds specified")
+
+**Context:** The standalone BetWarrior trial reached Kambi (bearer capture + coupon contract
+both confirmed working) but returned HTTP 400 `{"message":"Invalid odds specified"}` — the
+reserve line moved between `--discover` and `--arm`, and `allowOddsChange: NO` rejects it.
+Manual re-discovery can't win the race (reserve odds move too fast).
+
+**Decision:** `build_betwarrior_request` + `BetWarriorLegPlacer` gain `allow_odds_change`
+(default **False/"NO"** — production keeps the exact odds, which are the arb edge). The trial
+(`_arm_betwarrior`) sets **True/"YES"** so it places at the book's current odds and validates
+the mechanics regardless of drift. HTTP-error body now surfaced in the detail.
+
+**Production note (follow-up):** with NO, a BetWarrior leg on a fast-moving line REJECTS —
+fine as a first leg (clean abort) but a later-leg reject = naked exposure. The real fix is a
+live re-verify (re-fetch odds right before placing, abort beyond tolerance) + accept-current,
+the same guard the other platforms need; tracked separately.
+
+**State:** branch `fix/betwarrior-trial-odds`. Tests cover NO (default) + YES. Operator
+re-runs the trial; if it places (couponRef), BetWarrior placement is mechanically validated.
+
 ## 2026-06-10 — Wire BetWarrior into trial_place.py (standalone validation tool)
 
 **Context:** BetWarrior execution is wired but has NEVER fired a real bet; the safety rule

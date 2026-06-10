@@ -157,6 +157,15 @@ async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
     assert call["json"]["couponRows"][0]["outcomeId"] == 4206111729
     assert call["json"]["couponRows"][0]["odds"] == 141  # 1.41 ×100
     assert call["json"]["bets"][0]["stake"] == 500000  # 500.0 ×1000
+    assert call["json"]["allowOddsChange"] == "NO"  # production default: exact odds = the edge
+
+
+async def test_betwarrior_accept_odds_change_sets_yes() -> None:
+    t = FakeTransport(200, {"status": "SUCCESS", "couponRef": 1, "coupon": {"bets": [{}]}})
+    await BetWarriorLegPlacer(t, allow_odds_change=True).place(
+        _leg("betwarrior-pba", "42", 50.0, 1.41)
+    )
+    assert t.calls[0]["json"]["allowOddsChange"] == "YES"  # trial: accept the book's current odds
 
 
 async def test_betwarrior_fails_closed_when_bearer_not_captured() -> None:
