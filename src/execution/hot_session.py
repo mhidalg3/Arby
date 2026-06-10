@@ -36,9 +36,9 @@ from src.execution.notify import Notifier, NullNotifier
 log = structlog.get_logger(__name__)
 
 # The kill-switch reason the manager owns. The heartbeat auto-resets ONLY this
-# trip when the session recovers — a hard trip (freeze / daily loss) carries a
+# trip when a session recovers — a hard trip (freeze / daily loss) carries a
 # different reason and is left alone.
-_COLD_REASON = "betsson session went cold"
+_NOT_READY_REASON = "session not ready"
 
 
 class WarmTransport(Protocol):
@@ -50,7 +50,18 @@ class WarmTransport(Protocol):
 
 
 class BetssonWarmTransport(WarmTransport, Protocol):
+    # Readiness = re-establish + verify the placeable betting context (ctx-).
     async def establish_betsson_context(self) -> bool: ...
+
+
+class BetanoWarmTransport(WarmTransport, Protocol):
+    # Readiness = the cookie-auth /api/balance probe returns a logged-in customer.
+    async def check_betano_ready(self) -> bool: ...
+
+
+class BetWarriorWarmTransport(WarmTransport, Protocol):
+    # Readiness = the PAM checkSessionAlive probe ({"alive":"true"}).
+    async def check_betwarrior_ready(self) -> bool: ...
 
 
 class HotSessionManager:
@@ -59,14 +70,14 @@ class HotSessionManager:
     def __init__(
         self,
         *,
-        betano: WarmTransport,
+        betano: BetanoWarmTransport,
         betsson: BetssonWarmTransport,
         guardrails: Guardrails,
         heartbeat_sec: float = 300.0,
         login_gate: Callable[[], Awaitable[None]] | None = None,
         arm: bool = True,
         notifier: Notifier | None = None,
-        betwarrior: WarmTransport | None = None,
+        betwarrior: BetWarriorWarmTransport | None = None,
     ) -> None:
         self._betano = betano
         self._betsson = betsson
@@ -100,10 +111,10 @@ class HotSessionManager:
                 self._betwarrior.arm()
         if self._login_gate is not None:
             await self._login_gate()
-        # Can't reach a placeable Betsson state at startup → suspend auto-placement
-        # and alert, but DON'T halt: the heartbeat keeps probing and resumes once the
-        # operator finishes logging in. Detection upstream runs regardless.
-        await self._apply_health(await self._betsson.establish_betsson_context())
+        # Can't reach a placeable state on any platform at startup → suspend
+        # auto-placement and alert, but DON'T halt: the heartbeat keeps probing and
+        # resumes once the operator finishes logging in. Detection runs regardless.
+        await self._apply_health(await self._probe_readiness())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._log.info("hot_sessions.started", heartbeat_sec=self._heartbeat_sec)
         return self
@@ -128,44 +139,56 @@ class HotSessionManager:
             placers["betwarrior-pba"] = BetWarriorLegPlacer(self._betwarrior)  # type: ignore[arg-type]
         return placers
 
+    async def _probe_readiness(self) -> str | None:
+        """Probe every wired platform's session-readiness (the API equivalent of
+        "is the place button green"): Betsson re-establishes + verifies its betting
+        context; Betano hits /api/balance; BetWarrior hits checkSessionAlive. Returns
+        the name of the FIRST not-ready platform, or None if all are placeable."""
+        if not await self._betsson.establish_betsson_context():
+            return "betsson"
+        if not await self._betano.check_betano_ready():
+            return "betano"
+        if self._betwarrior is not None and not await self._betwarrior.check_betwarrior_ready():
+            return "betwarrior"
+        return None
+
     async def heartbeat(self) -> bool:
-        """Re-warm the sessions once: re-establish the Betsson betting context
-        (which also re-captures a fresh ctx-). Returns False if Betsson can't be
-        re-warmed (the caller / loop trips the kill switch)."""
-        ok = await self._betsson.establish_betsson_context()
-        self._log.info("hot_sessions.heartbeat", betsson_ok=ok)
-        return ok
+        """Probe all sessions once. Returns True iff every wired platform is placeable."""
+        not_ready = await self._probe_readiness()
+        self._log.info("hot_sessions.heartbeat", not_ready=not_ready)
+        return not_ready is None
 
     async def _heartbeat_loop(self) -> None:
-        """Probe forever. A cold session suspends auto-placement + alerts; recovery
+        """Probe forever. A not-ready session suspends auto-placement + alerts; recovery
         resumes it. The loop never returns on a fault — detection must not stop."""
         while True:
             await asyncio.sleep(self._heartbeat_sec)
             try:
-                ok = await self.heartbeat()
+                not_ready = await self._probe_readiness()
             except Exception as exc:  # noqa: BLE001 — a fault suspends, never kills the loop
                 self._log.error("hot_sessions.heartbeat_error", error=str(exc))
-                ok = False
-            await self._apply_health(ok)
+                not_ready = "unknown"
+            await self._apply_health(not_ready)
 
-    async def _apply_health(self, ok: bool) -> None:
-        """Reconcile session health with the kill switch + alerts on transitions
-        only (so we don't spam an alert every heartbeat while a session stays cold)."""
-        if not ok and not self._suspended_for_cold:
+    async def _apply_health(self, not_ready: str | None) -> None:
+        """Reconcile session readiness with the kill switch + alerts on transitions
+        only (so we don't spam an alert every heartbeat while a session stays cold).
+        ``not_ready`` is the name of an un-placeable platform, or None if all ready."""
+        if not_ready is not None and not self._suspended_for_cold:
             self._suspended_for_cold = True
-            self._guardrails.trip_kill_switch(_COLD_REASON)
+            self._guardrails.trip_kill_switch(_NOT_READY_REASON)
             await self._notifier.send(
-                "🔌 Betsson session went COLD — auto-placement suspended. Re-log into the "
-                "Betsson window; I'll resume automatically. Detection keeps running."
+                f"🔌 {not_ready} session NOT READY — auto-placement suspended. Re-log into the "
+                f"{not_ready} window; I'll resume automatically. Detection keeps running."
             )
-        elif ok and self._suspended_for_cold:
+        elif not_ready is None and self._suspended_for_cold:
             self._suspended_for_cold = False
             # Reset only OUR trip — leave a hard freeze / daily-loss stop in place.
-            if self._guardrails.kill_switch_reason == _COLD_REASON:
+            if self._guardrails.kill_switch_reason == _NOT_READY_REASON:
                 self._guardrails.reset_kill_switch()
-                await self._notifier.send("✅ Betsson session restored — auto-placement resumed.")
+                await self._notifier.send("✅ Sessions ready again — auto-placement resumed.")
             else:
                 await self._notifier.send(
-                    "✅ Betsson session restored, but auto-placement stays suspended "
+                    "✅ Sessions ready, but auto-placement stays suspended "
                     f"({self._guardrails.kill_switch_reason}) — resolve + restart to resume."
                 )

@@ -35,6 +35,13 @@ _BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
 # BetWarrior (Kambi) sends its session bearer on calls to the authenticated player
 # API host; we capture it from those outgoing requests (no nav, no storage probing).
 _KAMBI_PLAYER_API = "kambicdn.com/player/"
+# BetWarrior's Shapegames PAM host carries a `sessionKey` query token on every
+# account call — the input to the `checkSessionAlive` readiness probe.
+_BETWARRIOR_PAM_HOST = "betwarriorpam.com"
+_BETWARRIOR_ALIVE_URL = (
+    "https://ps.bwp.split.betwarriorpam.com/ps/ips/checkSessionAlive?brandId=7&sessionKey={key}"
+)
+_BETANO_BALANCE_URL = "https://www.betano.bet.ar/api/balance"
 
 
 class Transport(Protocol):
@@ -87,6 +94,7 @@ class InSessionTransport:
         self._pw: Any = None
         self._captured_ctx: dict[str, str] | None = None  # Betsson authenticated header set
         self._captured_bearer: str | None = None  # BetWarrior (Kambi) session bearer token
+        self._betwarrior_session_key: str | None = None  # BetWarrior PAM sessionKey
         # Serializes page-mutating ops (the heartbeat's establish-nav vs a placement
         # fetch) so a re-navigation can't abort an in-flight in-page fetch.
         self._page_lock = asyncio.Lock()
@@ -149,6 +157,9 @@ class InSessionTransport:
             auth = req.headers.get("authorization", "")
             if auth.lower().startswith("bearer "):
                 self._captured_bearer = auth.split(" ", 1)[1].strip()
+        # BetWarrior PAM sessionKey (query param) — drives the checkSessionAlive probe.
+        if _BETWARRIOR_PAM_HOST in req.url and "sessionKey=" in req.url:
+            self._betwarrior_session_key = req.url.split("sessionKey=", 1)[1].split("&", 1)[0]
 
     async def __aexit__(self, *exc: object) -> None:
         if self._context is not None:
@@ -210,6 +221,56 @@ class InSessionTransport:
                 break
             await asyncio.sleep(1)
         return self._captured_bearer
+
+    async def _read_json(self, url: str) -> tuple[int, dict[str, Any]]:
+        """Ungated in-page GET for READS (readiness probes, balance) — NOT placement,
+        so it does not require :meth:`arm`. Returns ``(status, parsed_json)``; ``(0, {})``
+        if no page is open."""
+        if self._page is None:
+            return 0, {}
+        async with self._page_lock:
+            result = await self._page.evaluate(
+                """async (url) => {
+                    const resp = await fetch(url, {method: 'GET', credentials: 'include'});
+                    return {status: resp.status, text: await resp.text()};
+                }""",
+                url,
+            )
+        status = int(result["status"])
+        try:
+            parsed = json.loads(result["text"]) if result["text"] else {}
+        except ValueError:
+            return status, {}
+        return status, parsed if isinstance(parsed, dict) else {}
+
+    async def check_betwarrior_ready(self, timeout_s: int = 10) -> bool:
+        """Readiness probe: is the BetWarrior session placeable? Hits the PAM
+        ``checkSessionAlive`` endpoint (``{"alive":"true"}``) using the sessionKey
+        captured from the SPA's account calls. False if no key or not alive."""
+        if self._dry_run:
+            return False
+        for _ in range(timeout_s):
+            if self._betwarrior_session_key is not None:
+                break
+            await asyncio.sleep(1)
+        if not self._betwarrior_session_key:
+            return False
+        status, resp = await self._read_json(
+            _BETWARRIOR_ALIVE_URL.format(key=self._betwarrior_session_key)
+        )
+        return status == 200 and str(resp.get("alive")).lower() == "true"
+
+    async def check_betano_ready(self) -> bool:
+        """Readiness probe: is the Betano session authorized? Hits the cookie-auth
+        ``/api/balance`` endpoint — a logged-in session returns ``data.customerCode``;
+        an expired one fails."""
+        if self._dry_run:
+            return False
+        status, resp = await self._read_json(_BETANO_BALANCE_URL)
+        data = resp.get("data")
+        if not isinstance(data, dict):
+            return False
+        return status == 200 and bool(data.get("customerCode"))
 
     async def establish_betsson_context(self, timeout_s: int = 30) -> bool:
         """Drive the SPA into the placeable state and confirm the authenticated

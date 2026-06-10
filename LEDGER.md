@@ -1,5 +1,34 @@
 # Project Ledger
 
+## 2026-06-10 — Stage 2: per-platform session readiness checks (the "green button")
+
+**Context:** Generalize the hot-session readiness model (was Betsson-only) to every platform —
+the API equivalent of "is the place button green / am I still authorized". Built against
+REAL contracts captured via `--capture-session` (no guessing).
+
+**Captured readiness contracts:**
+- **BetWarrior:** PAM `GET .../ps/ips/checkSessionAlive?sessionKey=<KEY>` → `{"alive":"true"}`.
+  The `sessionKey` is a query token on the betwarriorpam.com host — now captured in
+  `_on_request` alongside the Kambi bearer. (Also saw `coupon/validate.json` → validSession,
+  but checkSessionAlive is a lighter heartbeat — no coupon needed.)
+- **Betano:** cookie-auth `GET /api/balance` → `{"data":{"customerCode":…,balances:[…]}}`;
+  logged-out fails. (Also `/api/user/sessiontimer/status`.)
+- **Betsson:** `establish_betsson_context` (already built).
+
+**Decisions:**
+- `InSessionTransport`: capture the BetWarrior PAM sessionKey; `_read_json` (an UNGATED
+  in-page GET for reads — not placement, so no `arm` needed); `check_betwarrior_ready`
+  (checkSessionAlive) + `check_betano_ready` (/api/balance customerCode).
+- `HotSessionManager._probe_readiness()` returns the first not-ready platform (Betsson
+  context → Betano balance → BetWarrior alive). The heartbeat + startup use it; a not-ready
+  session SUSPENDS auto-placement + alerts NAMING the platform, and AUTO-RESUMES when all
+  ready (the same kill-switch model as before, now multi-platform). New protocols
+  Betano/BetWarriorWarmTransport.
+
+**State:** branch `feat/session-readiness`. 605 tests (+1), mypy/ruff clean. Both operator
+asks done: Stage 1 (live re-verify, every leg) + Stage 2 (per-platform readiness). A stale /
+unauthorized session on ANY platform now surfaces as alert + suspend BEFORE it can misplace.
+
 ## 2026-06-10 — Stage 2 prep: --capture-session (readiness contracts, capture-first)
 
 **Context:** Stage 2 (per-platform session readiness — the "is the place button green" check)

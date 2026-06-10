@@ -9,11 +9,12 @@ from src.execution.hot_session import HotSessionManager
 
 
 class _FakeTransport:
-    def __init__(self, *, context_ok: bool = True) -> None:
+    def __init__(self, *, context_ok: bool = True, ready: bool = True) -> None:
         self.entered = False
         self.exited = False
         self.armed = False
-        self.context_ok = context_ok
+        self.context_ok = context_ok  # Betsson readiness (establish context)
+        self.ready = ready  # Betano / BetWarrior readiness probes
         self.establish_calls = 0
 
     async def __aenter__(self) -> _FakeTransport:
@@ -29,6 +30,12 @@ class _FakeTransport:
     async def establish_betsson_context(self) -> bool:
         self.establish_calls += 1
         return self.context_ok
+
+    async def check_betano_ready(self) -> bool:
+        return self.ready
+
+    async def check_betwarrior_ready(self) -> bool:
+        return self.ready
 
 
 def _guard() -> Guardrails:
@@ -117,11 +124,28 @@ async def test_cold_session_suspends_then_auto_resumes_on_recovery() -> None:
         bsn.context_ok = False  # goes cold
         await asyncio.sleep(0.04)
         assert g.kill_switch_tripped  # auto-placement suspended
-        assert any("COLD" in s for s in note.sent)
+        assert any("NOT READY" in s for s in note.sent)
         bsn.context_ok = True  # operator re-logs in
         await asyncio.sleep(0.04)
         assert not g.kill_switch_tripped  # auto-resumed
-        assert any("restored" in s for s in note.sent)
+        assert any("ready again" in s for s in note.sent)
+
+
+async def test_not_ready_platform_other_than_betsson_suspends_and_is_named() -> None:
+    """Readiness now covers Betano + BetWarrior, not just Betsson — a not-ready Betano
+    session suspends auto-placement at startup and the alert names the platform."""
+    bano = _FakeTransport(ready=False)  # /api/balance probe fails
+    bsn, g, note = _FakeTransport(), _guard(), _RecordingNotifier()
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=3600.0,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        assert g.kill_switch_tripped  # suspended because Betano isn't placeable
+        assert any("betano" in s and "NOT READY" in s for s in note.sent)
 
 
 async def test_cold_recovery_does_not_clear_a_hard_trip() -> None:
