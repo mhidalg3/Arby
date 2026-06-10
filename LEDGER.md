@@ -1,5 +1,25 @@
 # Project Ledger
 
+## 2026-06-10 — Wire BetWarrior into trial_place.py (standalone validation tool)
+
+**Context:** BetWarrior execution is wired but has NEVER fired a real bet; the safety rule
+requires a standalone tiny trial before it rides any arb. `trial_place.py` was Betsson/Betano
+only.
+
+**Decision:** Added a BetWarrior path mirroring the Betano production-placer flow:
+`--platform betwarrior` for `--discover` (lists Kambi events + outcome ids), `--preview`
+(prints the coupon.json request, sends nothing), and `--arm` (`_arm_betwarrior`: opens the
+logged-in profile, operator logs in + makes balance visible to trigger the authenticated
+call whose bearer the transport captures, then the production `BetWarriorLegPlacer` posts).
+Same 300-ARS hard cap + `--arm`/`--yes-real-money` gating as the other platforms.
+
+**Verified read-only:** `--discover` returns 217 BetWarrior events with real selection ids.
+The actual armed trial is operator-run (login + real money).
+
+**State:** branch `chore/betwarrior-trial`. 596 tests, ruff clean. Next: operator runs the
+armed BetWarrior trial; if it places (couponRef), BetWarrior is execution-validated and may
+ride arbs.
+
 ## 2026-06-10 — BetWarrior full participation (execution + detection)
 
 **Context:** Wire BetWarrior into both execution and detection so its prices ride arbs

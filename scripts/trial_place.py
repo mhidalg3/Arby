@@ -18,6 +18,10 @@ Usage:
     uv run python scripts/trial_place.py --platform betano \
         --selection 9698869897 --event-id 86489358 --odds 3.65 \
         --stake 50 --arm --yes-real-money                            # SENDS
+    uv run python scripts/trial_place.py --platform betwarrior --discover
+    uv run python scripts/trial_place.py --platform betwarrior \
+        --selection 4206111729 --odds 1.41 \
+        --stake 50 --arm --yes-real-money                            # SENDS
 """
 
 from __future__ import annotations
@@ -34,10 +38,11 @@ import httpx
 
 from src.execution import placers
 from src.execution.executor import Leg
-from src.execution.leg_placer import BetanoLegPlacer, BetssonLegPlacer
+from src.execution.leg_placer import BetanoLegPlacer, BetssonLegPlacer, BetWarriorLegPlacer
 from src.execution.session import InSessionTransport
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
+from src.ingestion.scrapers.betwarrior import BetWarriorPbaScraper
 
 TRIAL_HARD_CAP_ARS = 300.0  # a bug cannot bet more than this in trial mode
 REPO_ROOT_ARTIFACTS = Path(__file__).resolve().parent.parent / "recon" / "artifacts"
@@ -49,6 +54,7 @@ _BROWSER_UA = (
 _BASE_URL = {
     "betsson": "https://pba.betsson.bet.ar/apuestas-deportivas",
     "betano": "https://www.betano.bet.ar/",
+    "betwarrior": "https://pba.betwarrior.bet.ar/",
 }
 
 
@@ -61,10 +67,12 @@ async def _discover(platform: str) -> None:
     async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
         if platform == "betsson":
             bsc = BetssonScraper(http_client=client)
-            scraper: BetssonScraper | BetanoScraper = bsc
+            scraper: BetssonScraper | BetanoScraper | BetWarriorPbaScraper = bsc
             slug_by_event = {fx.event_id: fx.slug for fx in await bsc._discover_soccer_fixtures()}
         elif platform == "betano":
             scraper = BetanoScraper(http_client=client, mode="prematch")
+        elif platform == "betwarrior":
+            scraper = BetWarriorPbaScraper(http_client=client)
         else:
             print(f"discovery not wired for {platform}", file=sys.stderr)
             return
@@ -109,6 +117,13 @@ def _preview(args: argparse.Namespace) -> None:
     elif args.platform == "betano":
         req = placers.build_betano_plain_leg(args.selection, args.event_id)
         print("POST https://www.betano.bet.ar/api/betslip/v3/plain-leg/  (step 1 of 3)")
+    elif args.platform == "betwarrior":
+        req = placers.build_betwarrior_request(
+            outcome_id=int(args.selection),
+            odds_x100=round(args.odds * 100),
+            stake_thousandths=round(args.stake * 1000),
+        )
+        print("POST https://cf-al-auth-api.kambicdn.com/player/api/v2019/bwargbap/coupon.json")
     else:
         print(f"preview not wired for {args.platform}", file=sys.stderr)
         return
@@ -403,6 +418,32 @@ async def _arm_betano(args: argparse.Namespace) -> None:
     )
 
 
+async def _arm_betwarrior(args: argparse.Namespace) -> None:
+    """BetWarrior (Kambi) place via the production BetWarriorLegPlacer + transport.
+    The placer reads the live Kambi session bearer the transport captures from the
+    SPA's authenticated player-API calls — so the operator must be logged in AND have
+    triggered such a call (the balance/account view does it) before placing."""
+    leg = _build_leg(args)  # platform_outcome_id=selection (the Kambi outcome id)
+    print(f"⚠️  LIVE (BetWarrior, production placer): real {args.stake} ARS — watch the browser.")
+    transport = InSessionTransport("betwarrior", dry_run=False)
+    async with transport:
+        transport.arm()
+        await transport.goto(_BASE_URL["betwarrior"])
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            input,
+            "\n  ▶ LOG IN to BetWarrior in the window. Make sure your BALANCE is visible "
+            "(that fires the authenticated call whose bearer we capture). Then press ENTER "
+            "to place… ",
+        )
+        res = await BetWarriorLegPlacer(transport).place(leg)
+    print(
+        f"\n=== RESULT (betwarrior) ===\naccepted={res.accepted}  ref={res.ref!r}  "
+        f"stake_filled={res.stake_filled}  odds_filled={res.odds_filled}\ndetail: {res.detail}"
+    )
+
+
 class _PrintNotifier:
     """Prints the executor's play-by-play to the console (trial visibility)."""
 
@@ -503,12 +544,15 @@ async def _arm_and_send(args: argparse.Namespace) -> None:
     if args.platform == "betano":
         await _arm_betano(args)
         return
+    if args.platform == "betwarrior":
+        await _arm_betwarrior(args)
+        return
     sys.exit(f"arm not wired for {args.platform}")
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--platform", choices=["betsson", "betano"])
+    p.add_argument("--platform", choices=["betsson", "betano", "betwarrior"])
     p.add_argument("--discover", action="store_true")
     p.add_argument("--selection", default="", help="platform_outcome_id from --discover")
     p.add_argument("--event-id", default="", help="Betano eventId (from --discover)")
