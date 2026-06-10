@@ -470,16 +470,26 @@ async def _capture_bplay_ui(args: argparse.Namespace) -> None:
         await page.goto(_BASE_URL["bplay"], wait_until="networkidle", timeout=60000)
         print(
             "\n  ▶ In the app: log in, open a match, add a selection, enter a tiny stake, and "
-            "place the bet.\n  Waiting up to 5 min for your bettingslip POSTs…"
+            "PLACE the bet.\n  Waiting up to 8 min — the window stays open until you actually "
+            "place (togglebet/update don't end it)…"
         )
-        for _ in range(150):
-            if any("/bettingslip" in str(c["url"]) and "togglebet" not in str(c["url"]) for c in calls):
+
+        def _placed() -> bool:
+            # The PLACE call is `.../bettingslip` exactly; togglebet/update are sub-paths.
+            return any(
+                str(c["url"]).split("?")[0].rstrip("/").endswith("/bettingslip") for c in calls
+            )
+
+        for _ in range(240):
+            if _placed():
                 break
             await asyncio.sleep(2)
         if not calls:
             print("\n=== RESULT ===\nno bettingslip POST observed (no bet placed in the window)")
             return
-        print(f"\n=== CAPTURED bettingslip flow on bplay ({len(calls)} calls) ===")
+        complete = _placed()
+        tag = "COMPLETE" if complete else "INCOMPLETE — the PLACE call (.../bettingslip) was NOT seen"
+        print(f"\n=== CAPTURED bettingslip flow on bplay ({len(calls)} calls) — {tag} ===")
         for c in calls:
             print(f"\n  POST {c['url']}")
             if c["body"]:
@@ -490,8 +500,8 @@ async def _capture_bplay_ui(args: argparse.Namespace) -> None:
         out = REPO_ROOT_ARTIFACTS / f"bplay_betslip_capture_{int(_time.time())}.json"
         out.write_text(json.dumps({"calls": calls, "responses": {k: list(v) for k, v in resps.items()}}, indent=2))
         print(f"\n  saved → {out}")
-        print("  Paste the bodies (togglebet + place) + the csrf_token values and I'll build")
-        print("  the deterministic placer + bootstrap-CSRF reader against them.")
+        if not complete:
+            print("  ⚠️  Re-run and actually PLACE the bet — I need the .../bettingslip POST.")
     finally:
         await ctx.close()
         await pw.stop()
