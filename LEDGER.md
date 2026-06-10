@@ -1,5 +1,26 @@
 # Project Ledger
 
+## 2026-06-10 — Integration test for the scraper↔canonicalizer seam
+
+**Context:** The `cross_platform: 0` regression (empty `raw_event_name` from
+`fetch_event_quotes` → every Betsson leg dropped) lived undetected for a day because
+per-component unit tests feed SYNTHETIC snapshots (name pre-filled) or a STUB
+canonicalizer — nothing exercised real-scraper-output meeting the real canonicalizer.
+
+**Decision:** Add `tests/unit/test_overlap_pipeline_wiring.py` — wires the REAL
+`BetanoScraper` + `BetssonScraper` (canned API payloads via `httpx.MockTransport`, no
+network) → real `Canonicalizer`/`FixtureResolver` → `OverlapQuoteSource` →
+`detect_arbitrage`, both books on one match (Gimnasia Jujuy vs Belgrano), and asserts a
+cross-platform 1X2 market forms with BOTH platforms' legs + a 3-leg arb. Kept in
+tests/unit (no infra) so it runs in the default suite — the `integration` marker is
+reserved for infra-needing tests and would exclude it from the normal run.
+
+**Verified discriminating:** same seam with the slug omitted (the bug) yields
+cross-platform = ∅; with the slug passed, {betano, betsson-pba}. So it fails on the
+regression and passes on the fix.
+
+**State:** branch `test/scraper-canonicalizer-seam`. 590 tests (+1), mypy/ruff clean.
+
 ## 2026-06-10 — N-leg executor (place 1X2 / 3-outcome arbs), sequential + re-verify
 
 **Context:** The detector already emits N-outcome opportunities (a 1X2 is 3 legs), but
