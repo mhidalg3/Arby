@@ -141,11 +141,8 @@ class BetWarriorLegPlacer:
 
     platform = "betwarrior-pba"
 
-    def __init__(self, transport: BetWarriorTransport, *, allow_odds_change: bool = False) -> None:
+    def __init__(self, transport: BetWarriorTransport) -> None:
         self._t = transport
-        # Production default NO (the exact odds are the arb edge). The trial sets YES to
-        # validate placement on fast-moving lines; live re-verify is the production path.
-        self._allow_odds_change = allow_odds_change
         self._log = log.bind(component="leg_placer", platform=self.platform)
 
     async def place(self, leg: Leg) -> PlacementResult:
@@ -158,11 +155,12 @@ class BetWarriorLegPlacer:
             return PlacementResult(
                 accepted=False, detail="betwarrior: session bearer not captured (logged in?)"
             )
+        # leg.odds must be the live-re-verified current odds (allowOddsChange is NO) —
+        # Kambi rejects "Invalid odds specified" if it doesn't match the book's current.
         request = placers.build_betwarrior_request(
             outcome_id=int(leg.platform_outcome_id),
-            odds_x100=round(leg.odds * 100),
+            odds_x1000=round(leg.odds * 1000),
             stake_thousandths=round(leg.stake_ars * 1000),
-            allow_odds_change=self._allow_odds_change,
         )
         headers = {"content-type": "application/json", "authorization": f"Bearer {bearer}"}
         try:

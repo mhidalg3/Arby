@@ -120,7 +120,7 @@ def _preview(args: argparse.Namespace) -> None:
     elif args.platform == "betwarrior":
         req = placers.build_betwarrior_request(
             outcome_id=int(args.selection),
-            odds_x100=round(args.odds * 100),
+            odds_x1000=round(args.odds * 1000),
             stake_thousandths=round(args.stake * 1000),
         )
         print("POST https://cf-al-auth-api.kambicdn.com/player/api/v2019/bwargbap/coupon.json")
@@ -543,14 +543,14 @@ async def _arm_betwarrior(args: argparse.Namespace) -> None:
                 "— drifted past tolerance, the arb would not hold. Nothing placed."
             )
             return
-        # Place AT the verified current odds (allow_odds_change so Kambi honors the residual
-        # sub-second move between this read and the POST).
+        # Place AT the verified current odds — Kambi wants the EXACT current odds with
+        # allowOddsChange:NO (as the app does); a sub-second move just 400s and we retry.
         leg = Leg(
             platform="betwarrior-pba", match_id=args.event_id, market="1X2",
             outcome=args.outcome, stake_ars=args.stake, odds=current,
             platform_outcome_id=args.selection,
         )
-        res = await BetWarriorLegPlacer(transport, allow_odds_change=True).place(leg)
+        res = await BetWarriorLegPlacer(transport).place(leg)
     print(
         f"\n=== RESULT (betwarrior) ===\naccepted={res.accepted}  ref={res.ref!r}  "
         f"stake_filled={res.stake_filled}  odds_filled={res.odds_filled}\ndetail: {res.detail}"

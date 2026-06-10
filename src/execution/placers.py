@@ -83,25 +83,18 @@ def build_betsson_request(selections: list[tuple[str, str]], stake_ars: float) -
 
 
 def build_betwarrior_request(
-    *,
-    outcome_id: int,
-    odds_x100: int,
-    stake_thousandths: int,
-    allow_odds_change: bool = False,
-    request_id: str | None = None,
+    *, outcome_id: int, odds_x1000: int, stake_thousandths: int, request_id: str | None = None
 ) -> dict[str, Any]:
-    """Kambi `/coupon.json`. Odds are ×100, stake ×1000 (Kambi minor units).
-
-    `allow_odds_change` "NO" (default) rejects the bet if the line moved since we read
-    it ("Invalid odds specified") — correct for an arb, where the exact odds are the
-    edge. "YES" accepts the book's current odds; used for the mechanics trial (and the
-    seam for a future live-re-verify path) on fast-moving lines."""
-    flag = "YES" if allow_odds_change else "NO"
+    """Kambi `/coupon.json`. Odds AND stake are Kambi minor units ×1000 (confirmed by
+    capturing the app's real request: a 1.13 line places as ``odds: 1130``, 50 ARS as
+    ``stake: 50000``). ``allowOddsChange: "NO"`` matches the app — it places with the
+    EXACT current odds (a live re-verify must supply them), so a moved line is rejected
+    ("Invalid odds specified") rather than silently placed at a worse price."""
     return {
-        "couponRows": [{"index": 0, "odds": odds_x100, "outcomeId": outcome_id, "type": "SIMPLE"}],
-        "allowOddsChange": flag,
-        "allowOddsChangeLive": flag,
-        "allowOddsChangePreMatch": flag,
+        "couponRows": [{"index": 0, "odds": odds_x1000, "outcomeId": outcome_id, "type": "SIMPLE"}],
+        "allowOddsChange": "NO",
+        "allowOddsChangeLive": "NO",
+        "allowOddsChangePreMatch": "NO",
         "bets": [{"couponRowIndexes": [0], "eachWay": False, "stake": stake_thousandths}],
         "requestId": request_id or str(uuid.uuid4()),
         "channel": "WEB",

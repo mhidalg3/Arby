@@ -1,5 +1,24 @@
 # Project Ledger
 
+## 2026-06-10 — BetWarrior coupon.json: fix odds scale ×100 → ×1000 (from capture)
+
+**Root cause (capture-ui ground truth):** the app's real `coupon.json` sends odds at Kambi
+minor units **×1000** (a 1.13 line → `odds: 1130`), not ×100 as an unvalidated recon note
+claimed. Our builder sent ×100 → a 10× mismatch → 400 `Invalid odds specified` on every
+attempt, even a stable favorite. The captured body also confirmed: `stake` ×1000 (already
+right), `allowOddsChange: "NO"` (the app places with the EXACT current odds — my earlier
+"YES" guess was wrong and is removed), and `trackingData` is optional analytics (our request
+reached odds-validation without it).
+
+**Fix:** `build_betwarrior_request` now takes `odds_x1000` and always `allowOddsChange:"NO"`;
+`BetWarriorLegPlacer` sends `round(leg.odds*1000)`. The placer requires `leg.odds` to be the
+LIVE-re-verified current odds (the trial already re-fetches them at ENTER). Removed the
+disproven `allow_odds_change` param.
+
+**State:** branch `fix/betwarrior-odds-scale`. 596 tests, mypy/ruff clean. Operator re-runs
+the deterministic trial on a stable prematch favorite — expected to place now (correct scale
++ exact current odds + NO). That validates BetWarrior end-to-end.
+
 ## 2026-06-10 — BetWarrior: capture-ui (coupon.json contract is wrong, suspected odds scale)
 
 **Context:** The BetWarrior trial 400s `{"message":"Invalid odds specified"}` even on a

@@ -141,22 +141,23 @@ def test_build_betsson_single_leg() -> None:
 
 def test_build_betwarrior_units_and_generated_request_id() -> None:
     req = build_betwarrior_request(
-        outcome_id=4206111729, odds_x100=1400, stake_thousandths=1_000_000
+        outcome_id=4206111729, odds_x1000=14000, stake_thousandths=1_000_000
     )
     assert req["couponRows"][0] == {
         "index": 0,
-        "odds": 1400,
+        "odds": 14000,
         "outcomeId": 4206111729,
         "type": "SIMPLE",
     }
     assert req["bets"][0]["stake"] == 1_000_000 and req["channel"] == "WEB"
+    assert req["allowOddsChange"] == "NO"
     uuid.UUID(req["requestId"])  # a valid uuid was generated
 
 
 def test_build_betwarrior_explicit_request_id() -> None:
     assert (
         build_betwarrior_request(
-            outcome_id=1, odds_x100=200, stake_thousandths=1000, request_id="fixed"
+            outcome_id=1, odds_x1000=2000, stake_thousandths=1000, request_id="fixed"
         )["requestId"]
         == "fixed"
     )
