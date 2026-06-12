@@ -71,6 +71,7 @@ class ArbOrchestrator:
         dynamic_stake_cap_ars: float | None = None,
         notifier: Notifier | None = None,
         empty_alert_after: int = 5,
+        platform_stale_after_sec: float = 180.0,
     ) -> None:
         self._quotes = quote_source
         self._risk = risk_evaluator
@@ -86,6 +87,11 @@ class ArbOrchestrator:
         # cycles (ingestion stalled/blocked) — without halting; detection retries.
         self._empty_alert_after = empty_alert_after
         self._empty_cycles = 0
+        # Per-platform ingestion liveness: a single book can go dark (WAF 403 / block)
+        # while the others still overlap — invisible in the aggregate count above. If the
+        # quote source reports per-book freshness, alert when one is stale this long.
+        self._platform_stale_after_sec = platform_stale_after_sec
+        self._stale_alerted: set[str] = set()  # books currently in a stale-alert state
         self._executed: set[str] = set()  # market_ids already acted on (dedup)
         self._last_error: str | None = None  # de-dup repeated loop-error alerts
         self._stop = False  # operator stop; the kill switch never stops detection
@@ -103,6 +109,7 @@ class ArbOrchestrator:
         results: list[ExecutionResult] = []
         by_market = await self._quotes.fetch()
         await self._track_ingestion(len(by_market))
+        await self._track_platform_freshness()
         for market_id, quotes in by_market.items():
             if market_id in self._executed or len(quotes) < 2:
                 continue
@@ -153,6 +160,28 @@ class ArbOrchestrator:
                 f"⚠️ No market data for {self._empty_cycles} cycles — ingestion may be "
                 "stalled/blocked. Detection is still running; check the scrapers."
             )
+
+    async def _track_platform_freshness(self) -> None:
+        """Per-book ingestion liveness. If the quote source exposes `stale_platforms`,
+        alert (once) when a single book's scrape goes dark and again when it recovers —
+        the gap the aggregate ingestion check can't see, since the surviving books keep
+        completing partitions. Detection never halts; this only makes the block visible."""
+        reporter = getattr(self._quotes, "stale_platforms", None)
+        if reporter is None:
+            return
+        stale: dict[str, float] = reporter(self._platform_stale_after_sec)
+        for platform, age in stale.items():
+            if platform not in self._stale_alerted:
+                self._stale_alerted.add(platform)
+                self._log.warning("orchestrator.platform_stale", platform=platform, age_sec=age)
+                await self._notifier.send(
+                    f"⚠️ {platform} ingestion stale ({age:.0f}s with no fresh odds) — that book "
+                    "may be blocked. Detection continues on the others; check the scraper."
+                )
+        for platform in list(self._stale_alerted):
+            if platform not in stale:
+                self._stale_alerted.discard(platform)
+                await self._notifier.send(f"✅ {platform} ingestion recovered.")
 
     async def run_forever(self, poll_interval_sec: float = 5.0) -> None:
         """Poll until the operator calls :meth:`stop` (or cancels). Per-cycle errors

@@ -1,5 +1,54 @@
 # Project Ledger
 
+## 2026-06-12 — Detect site down: RG lockout popups + per-platform ingestion liveness
+
+**Context (operator-found, live):** After an extended deployment all three Chrome
+windows showed a responsible-gambling LOCKOUT popup ("TOMATE UN DESCANSO — 12h de
+descanso de apostar y jugar") that blocks the betting UI — and NOTHING alerted. Root
+cause is two blind spots: (1) the modal is a UI overlay over a still-authenticated
+session, so every readiness probe (Betano balance GET, Betsson ctx-, BetWarrior bearer
+exp) stayed green; (2) ingestion monitoring only alerted on the POST-JOIN aggregate
+market count hitting zero — a single book going dark is invisible because the other two
+still overlap. Detection itself was unaffected (public JSON APIs over httpx don't render
+the page), which is why odds kept flowing while the windows were unusable.
+
+**Decisions:**
+- **Modal detection over guessed schedule.** Operator picked "curfew-aware scheduling,"
+  but the trigger is unknown and the wording is a session-duration reality-check, which a
+  wall-clock schedule would predict wrong. Built a DOM detector instead — deterministic,
+  fires the instant the block appears, and its occurrence log (`hot_sessions.rg_block`
+  with platform + uptime + wall-clock) is the DATA that will reveal the trigger
+  (wall-clock cluster ⇒ curfew; constant uptime ⇒ play-time limit). Scheduling is a
+  grounded follow-up, not a guess.
+- `InSessionTransport.check_session_blocked()` scans visible `innerText` for LOCKOUT
+  phrases (`_RG_BLOCK_PHRASES`) — deliberately the break text, NOT generic "juego
+  responsable" (footer boilerplate on every page) and NOT bare "tiempo de juego" (a live
+  match shows elapsed time). Fail-OPEN on a read fault (heartbeat must never crash).
+- Heartbeat readiness is now `ready AND not blocked`; a block suspends auto-placement with
+  a popup-specific alert (`🚫 … LOCKOUT …`, distinct from the cold-session `🔌 NOT READY`)
+  and auto-resumes when it clears. Status line marks a blocked book 🚫.
+- **Per-platform ingestion freshness.** `OverlapQuoteSource` tracks each book's last fresh
+  scrape (bulk = ≥1 raw snapshot; linker = fixture-list call succeeds) and exposes
+  `stale_platforms(max_age)`. Orchestrator alerts per-book (`⚠️ betano ingestion stale …`)
+  on a single book going dark — the gap the aggregate couldn't see — and on recovery.
+- `--capture-popup` (trial_place.py): read-only watcher that leaves a window open, polls
+  the DOM, and dumps the overlay HTML + screenshot + elapsed when a popup fires — to
+  ground the exact selectors (interim is a heuristic) and learn the trigger.
+
+**State:** main (not yet committed). 621 tests (was 610; +11), mypy/ruff clean. New:
+`tests/unit/test_session_blocked.py`, lockout + freshness tests in test_hot_session /
+test_quote_source / test_orchestrator. Caveat: `_RG_BLOCK_PHRASES` is a HEURISTIC grounded
+only in the Betano lockout string — run `--capture-popup` on each platform to pin exact
+selectors. Open: when ALL bulk books die the linker can't be re-probed (we bail before
+linking) so it may read stale — acceptable, the aggregate empty-ingestion alert covers a
+total outage. NEXT: capture real popup DOM on all three → tighten phrases; decide whether
+a logout/login resets the play-time counter (per-session) or not (per-account server-side)
+before automating any reset.
+
+**Errors:** First `stale_platforms` test wrongly assumed a single dead bulk book still
+lets the linker be probed; the source bails (`return {}`) before linking when no targets
+remain, so the linker can't refresh. Fixed the test to keep a second bulk book alive.
+
 ## 2026-06-10 — BetWarrior inactivity logout now detected + alerted
 
 **Gap (operator-found, live):** BetWarrior logged out from inactivity but nothing caught

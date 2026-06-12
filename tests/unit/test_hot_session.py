@@ -9,12 +9,15 @@ from src.execution.hot_session import HotSessionManager
 
 
 class _FakeTransport:
-    def __init__(self, *, context_ok: bool = True, ready: bool = True) -> None:
+    def __init__(
+        self, *, context_ok: bool = True, ready: bool = True, blocked: str | None = None
+    ) -> None:
         self.entered = False
         self.exited = False
         self.armed = False
         self.context_ok = context_ok  # Betsson readiness (establish context)
         self.ready = ready  # Betano / BetWarrior readiness probes
+        self.blocked = blocked  # an RG lockout phrase, or None when the window is usable
         self.establish_calls = 0
 
     async def __aenter__(self) -> _FakeTransport:
@@ -36,6 +39,9 @@ class _FakeTransport:
 
     async def check_betwarrior_ready(self) -> bool:
         return self.ready
+
+    async def check_session_blocked(self) -> str | None:
+        return self.blocked
 
 
 def _guard() -> Guardrails:
@@ -165,6 +171,45 @@ async def test_not_ready_platform_other_than_betsson_suspends_and_is_named() -> 
     async with m:
         assert g.kill_switch_tripped  # suspended because Betano isn't placeable
         assert any("betano" in s and "NOT READY" in s for s in note.sent)
+
+
+async def test_rg_lockout_suspends_with_popup_specific_alert_then_resumes() -> None:
+    """An RG lockout overlay blocks the window while the readiness probe stays green
+    (the session is still authenticated). The manager must suspend on it anyway, name
+    the platform with a POPUP-specific message (not 'NOT READY'/re-login), and resume
+    when it clears."""
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = "tomate un descanso"  # lockout overlay appears; context_ok stays True
+        await asyncio.sleep(0.04)
+        assert g.kill_switch_tripped  # suspended even though establish_betsson_context==True
+        alert = next(s for s in note.sent if "betsson" in s and "LOCKOUT" in s)
+        assert "tomate un descanso" in alert
+        assert "NOT READY" not in alert  # popup-specific, not the cold-session message
+        bsn.blocked = None  # operator clears the break
+        await asyncio.sleep(0.04)
+        assert not g.kill_switch_tripped  # auto-resumed
+        assert any("ready again" in s for s in note.sent)
+
+
+async def test_rg_lockout_logs_an_occurrence_for_trigger_learning() -> None:
+    """Each new lockout is logged with platform + uptime so the trigger pattern is
+    learnable. We assert the readiness state reflects the block (states[betano] False)
+    even with the balance probe green."""
+    bano, bsn, g = _FakeTransport(blocked="12h de descanso"), _FakeTransport(), _guard()
+    m = _mgr(bano, bsn, g)
+    async with m:
+        # heartbeat_sec is large; probe directly. Betano is "ready" but blocked → not placeable.
+        assert await m.heartbeat() is False
+        assert m._readiness["betano"] is False
+        assert m._blocks["betano"] == "12h de descanso"
 
 
 async def test_cold_recovery_does_not_clear_a_hard_trip() -> None:

@@ -576,6 +576,108 @@ async def _capture_session(platform: str) -> None:
         await pw.stop()
 
 
+async def _capture_popup(platform: str, minutes: float) -> None:
+    """Leave a logged-in window open and WATCH for the responsible-gambling LOCKOUT
+    overlay (the "TOMATE UN DESCANSO — 12h de descanso" mandatory-break popup that
+    blocked all three sessions during the long deployment). Read-only; never places.
+
+    Polls the DOM on an interval; when a lockout phrase OR a visible modal/overlay
+    appears it dumps the element HTML + a full-page screenshot + the elapsed watch
+    time, so we can (a) ground the EXACT selector for `check_session_blocked` and
+    (b) learn the trigger — how long until it fires, and at what wall-clock time."""
+    import time as _time  # noqa: PLC0415
+
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from scripts.recon.stealth import apply_stealth  # noqa: PLC0415
+    from src.execution.session import _RG_BLOCK_PHRASES  # noqa: PLC0415
+
+    poll_sec = 15.0
+    started = _time.time()
+    deadline = started + minutes * 60.0
+    print(
+        f"⚠️  WATCH POPUP on {platform} (read-only; no bet). Watching {minutes:.0f} min.\n"
+        f"  {_BASE_URL[platform]}\n  Log in, then leave the window open — Ctrl-C to stop early."
+    )
+    pw = await async_playwright().start()
+    ctx = await pw.chromium.launch_persistent_context(
+        user_data_dir=f"recon/profile/{platform}",
+        headless=False,
+        channel="chrome",
+        locale="es-AR",
+        timezone_id="America/Argentina/Buenos_Aires",
+        permissions=["geolocation"],
+        geolocation={"latitude": -34.9215, "longitude": -57.9545},
+    )
+    try:
+        await apply_stealth(ctx)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(_BASE_URL[platform], wait_until="networkidle", timeout=60000)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, input, "\n  ▶ Log in, then press ENTER to start watching… "
+        )
+        fired = False
+        while _time.time() < deadline:
+            try:
+                found = await page.evaluate(
+                    """(phrases) => {
+                        const body = (document.body && document.body.innerText || '').toLowerCase();
+                        const hits = phrases.filter(p => body.includes(p));
+                        const sel = '[role=dialog],[aria-modal=true],.modal,.overlay,.modal-overlay';
+                        const dialogs = [...document.querySelectorAll(sel)]
+                            .filter(el => el.offsetParent !== null
+                                && el.getBoundingClientRect().width > 0)
+                            .map(el => ({tag: el.tagName, cls: String(el.className),
+                                         html: el.outerHTML.slice(0, 6000)}));
+                        return {hits, dialogs};
+                    }""",
+                    list(_RG_BLOCK_PHRASES),
+                )
+            except Exception as exc:  # noqa: BLE001 — keep watching through a transient read fault
+                print(f"  (read fault: {exc})")
+                await asyncio.sleep(poll_sec)
+                continue
+            elapsed_min = (_time.time() - started) / 60.0
+            if found["hits"] or found["dialogs"]:
+                ts = int(_time.time())
+                out = REPO_ROOT_ARTIFACTS / f"{platform}_popup_capture_{ts}.json"
+                out.write_text(
+                    json.dumps(
+                        {
+                            "platform": platform,
+                            "elapsed_min": round(elapsed_min, 1),
+                            "wall_clock": _time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "url": page.url,
+                            "phrase_hits": found["hits"],
+                            "dialogs": found["dialogs"],
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+                with contextlib.suppress(Exception):
+                    await page.screenshot(
+                        path=str(REPO_ROOT_ARTIFACTS / f"{platform}_popup_{ts}.png"), full_page=True
+                    )
+                tag = "LOCKOUT PHRASE" if found["hits"] else "modal/overlay"
+                print(
+                    f"\n  🚫 {tag} after {elapsed_min:.1f} min "
+                    f"(hits={found['hits']}) → saved {out.name}"
+                )
+                fired = True
+                # Keep watching (in case it clears + recurs) but back off so we don't
+                # spam identical dumps every poll.
+                await asyncio.sleep(60.0)
+                continue
+            print(f"  …{elapsed_min:.0f} min: clear")
+            await asyncio.sleep(poll_sec)
+        print(f"\n  watch ended ({'a popup fired' if fired else 'no popup seen'}).")
+    finally:
+        await ctx.close()
+        await pw.stop()
+
+
 async def _capture_betwarrior_ui(args: argparse.Namespace) -> None:
     """Operator places ONE bet through the BetWarrior app UI; we intercept the exact
     `coupon.json` request the app sends — ground truth for the odds scale, the
@@ -856,6 +958,17 @@ def main() -> None:
         help="betsson: place through the production BetssonLegPlacer + transport",
     )
     p.add_argument(
+        "--capture-popup",
+        action="store_true",
+        help="watch a logged-in window for the responsible-gambling lockout overlay (read-only)",
+    )
+    p.add_argument(
+        "--watch-minutes",
+        type=float,
+        default=720.0,
+        help="how long --capture-popup watches before exiting (default 720 = 12h)",
+    )
+    p.add_argument(
         "--capture-session",
         action="store_true",
         help="read-only: record the session/readiness API calls (validate/balance) — no bet",
@@ -901,6 +1014,9 @@ def main() -> None:
         return
     if not args.platform:
         sys.exit("--platform is required (or use --two-leg)")
+    if args.capture_popup:
+        asyncio.run(_capture_popup(args.platform, args.watch_minutes))  # read-only, no bet
+        return
     if args.capture_session:
         asyncio.run(_capture_session(args.platform))  # read-only, no bet
         return

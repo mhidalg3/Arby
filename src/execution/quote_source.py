@@ -127,10 +127,37 @@ class OverlapQuoteSource:
     # the raw overlap balloons (200+ bulk fixtures ⇒ 130+ matched Betsson events); a
     # burst that size trips Betsson's WAF. Cap it so the footprint stays sustainable.
     max_linker_events: int = 50
+    # Per-platform ingestion liveness: wall-clock of each configured book's last fresh
+    # scrape (a bulk source yielded ≥1 snapshot; a linker's fixture-list call succeeded).
+    # A single book going dark (WAF 403 / a block that also kills its public feed) is
+    # INVISIBLE in the post-JOIN market count — the other books still overlap — so we
+    # track each independently. `stale_platforms` reports the laggards to the orchestrator.
+    _platform_last_fresh: dict[str, float] = field(init=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Seed each configured book at "now" so it isn't flagged stale before its first
+        # poll; a book that's down from the start ages past the threshold and is flagged.
+        for src in (*self.bulk_sources, *self.linkers):
+            name = getattr(src, "platform_name", None)
+            if isinstance(name, str) and name:
+                self._platform_last_fresh.setdefault(name, self.now_fn())
+
+    def stale_platforms(self, max_age_sec: float) -> dict[str, float]:
+        """Configured books whose last fresh scrape is older than `max_age_sec`, mapped
+        to their staleness (seconds). Empty ⇒ every book is live. The orchestrator uses
+        this to alert per-platform when ONE book's ingestion dies — which the aggregate
+        market count can't surface, since the surviving books still complete partitions."""
+        now = self.now_fn()
+        return {
+            p: round(now - last, 1)
+            for p, last in self._platform_last_fresh.items()
+            if now - last > max_age_sec
+        }
 
     async def fetch(self) -> dict[str, list[OddsQuote]]:
         by_market: dict[str, list[CanonicalQuote]] = defaultdict(list)
         targets: set[str] = set()  # canonical "home away" of every bulk fixture
+        fresh: set[str] = set()  # books that produced data this cycle (raw liveness)
 
         # 1) Bulk sources: full fetch + canonicalize (registers/links fixtures). Build
         #    overlap targets from the CANONICAL fixture names — separator-agnostic
@@ -138,6 +165,7 @@ class OverlapQuoteSource:
         for source in self.bulk_sources:
             try:
                 async for snap in source.fetch_live_soccer():
+                    fresh.add(snap.platform)  # raw snapshot = the scrape reached the book
                     cq = await self.canonicalizer.canonicalize(snap)
                     if cq is not None:
                         by_market[cq.odds_quote.market_id].append(cq)
@@ -145,6 +173,7 @@ class OverlapQuoteSource:
             except Exception as exc:  # noqa: BLE001 — one source must not sink the cycle
                 log.warning("quote_source.bulk_error", error=str(exc))
         if not targets:
+            self._mark_fresh(fresh)  # record whoever DID respond before bailing
             return {}  # no bulk data → nothing to link against
 
         # 2) Each linker: list fixtures (one cheap call), fetch odds ONLY for events a
@@ -157,6 +186,13 @@ class OverlapQuoteSource:
             except Exception as exc:  # noqa: BLE001
                 log.warning("quote_source.linker_list_error", error=str(exc))
                 continue
+            # The cheap fixture-list call succeeding = the linker reached the book (a
+            # WAF 403 / block would raise here). That's its liveness signal; the
+            # per-event odds fetches below are gated by overlap, so a quiet linker with
+            # no overlap is NOT a block.
+            linker_name = getattr(linker, "platform_name", None)
+            if isinstance(linker_name, str) and linker_name:
+                fresh.add(linker_name)
             overlap = [
                 (event_id, slug)
                 for event_id, slug in refs
@@ -202,4 +238,13 @@ class OverlapQuoteSource:
         log.info(
             "overlap_quote_source.fetched", bulk_fixtures=len(targets), overlap_events=overlap_events
         )
+        self._mark_fresh(fresh)
         return assemble_partitions(by_market, self.now_fn(), self.staleness_sec)
+
+    def _mark_fresh(self, platforms: set[str]) -> None:
+        """Stamp each book that produced data this cycle with the current time, so its
+        staleness clock resets. Books absent from the set keep their old timestamp and
+        age toward the `stale_platforms` threshold."""
+        now = self.now_fn()
+        for p in platforms:
+            self._platform_last_fresh[p] = now

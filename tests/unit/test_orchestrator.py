@@ -35,6 +35,21 @@ class _FakeQuoteSource:
         return self.by_market
 
 
+class _FreshnessSource:
+    """Quote source that also reports per-platform ingestion staleness (the optional
+    `stale_platforms` seam the orchestrator duck-types)."""
+
+    def __init__(self) -> None:
+        self.by_market: dict[str, list[OddsQuote]] = {}
+        self.stale: dict[str, float] = {}
+
+    async def fetch(self) -> dict[str, list[OddsQuote]]:
+        return self.by_market
+
+    def stale_platforms(self, max_age_sec: float) -> dict[str, float]:
+        return dict(self.stale)
+
+
 class _Placer:
     def __init__(self) -> None:
         self.calls = 0
@@ -191,3 +206,22 @@ async def test_ingestion_stall_alerts_once_then_recovers() -> None:
     empty.by_market = _arb_market()
     await orch.run_once()  # data returns → recovery alert
     assert any("recovered" in m for m in note.sent)
+
+
+async def test_per_platform_ingestion_stall_alerts_once_then_recovers() -> None:
+    """A single book going dark (here betsson-pba) is alerted per-platform — the gap
+    the aggregate market-count check can't see, since the surviving books still
+    complete partitions — then a recovery alert when its scrape returns."""
+    g, note = _guard(), _Notifier()
+    src = _FreshnessSource()
+    orch = _orch(src, g, {"betsson": _Placer(), "betano": _Placer()}, notifier=note)  # type: ignore[arg-type]
+    await orch.run_once()  # all books live
+    assert not any("ingestion stale" in m for m in note.sent)
+    src.stale = {"betsson-pba": 200.0}
+    await orch.run_once()  # betsson goes dark → alert
+    await orch.run_once()  # still dark → no repeat
+    stalls = [m for m in note.sent if "betsson-pba ingestion stale" in m]
+    assert len(stalls) == 1
+    src.stale = {}
+    await orch.run_once()  # scrape returns → recovery alert
+    assert any("betsson-pba ingestion recovered" in m for m in note.sent)

@@ -21,7 +21,7 @@ import binascii
 import json
 import time
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 import structlog
 
@@ -40,6 +40,26 @@ _BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
 _KAMBI_PLAYER_API = "kambicdn.com/player/"
 # Clock skew tolerance when judging a captured JWT bearer expired (seconds).
 _BEARER_EXP_SKEW_SEC = 30.0
+
+# Responsible-gambling LOCKOUT phrases (lowercased). These strings appear only when a
+# PBA platform has BLOCKED the betting UI behind a mandatory-break / accumulated-play-
+# time-limit overlay — the session stays authenticated (so the balance / ctx- / bearer
+# readiness probes all keep passing), and this overlay is the ONLY signal that the
+# window is actually unusable. Deliberately the LOCKOUT text, NOT the generic "juego
+# responsable" footer link that sits on every page (which would false-positive). Avoid
+# bare "tiempo de juego" — a live match shows elapsed match time. Grounded in the live
+# Betano lockout: "TOMATE UN DESCANSO — 12h de descanso de apostar y jugar". Extend
+# from captures (scripts/trial_place.py --capture-popup) as other platforms' wording
+# is grounded.
+_RG_BLOCK_PHRASES: Final[tuple[str, ...]] = (
+    "tomate un descanso",
+    "tomá un descanso",
+    "descanso de apostar",
+    "12h de descanso",
+    "límite de tiempo de juego",
+    "llevás jugando",
+    "cuánto tiempo llevás",
+)
 
 
 def _jwt_exp(token: str) -> float | None:
@@ -288,6 +308,35 @@ class InSessionTransport:
             self._log.warning("transport.betwarrior_bearer_expired", exp=self._bearer_exp)
             return False
         return True
+
+    async def check_session_blocked(self) -> str | None:
+        """Detect a responsible-gambling LOCKOUT overlay blocking the betting UI.
+
+        PBA platforms enforce an accumulated-play-time limit that, once hit, replaces
+        the betting UI with a mandatory-break notice ("TOMATE UN DESCANSO — 12h de
+        descanso de apostar y jugar"). The underlying session stays authenticated, so
+        every readiness probe (balance, ``ctx-``, bearer ``exp``) keeps passing — this
+        overlay is the ONLY signal that the window is actually unusable. Scans the
+        page's VISIBLE text (``innerText`` excludes hidden nodes) for a lockout phrase
+        and returns the matched phrase (for the alert + the trigger-learning log), or
+        ``None`` if the page is usable. Dry-run / no page ⇒ ``None``.
+
+        Fail-OPEN on a probe fault (return ``None``): the real readiness probes already
+        suspend a genuinely broken page, and a flaky DOM read must never crash the
+        heartbeat (the hard-won startup-crash lesson)."""
+        if self._dry_run or self._page is None:
+            return None
+        try:
+            async with self._page_lock:
+                text = await self._page.evaluate(
+                    "() => (document.body && document.body.innerText || '').toLowerCase()"
+                )
+        except Exception as exc:  # noqa: BLE001 — a read must never crash the heartbeat
+            self._log.warning("transport.block_probe_error", error=str(exc))
+            return None
+        if not isinstance(text, str):
+            return None
+        return next((p for p in _RG_BLOCK_PHRASES if p in text), None)
 
     async def check_betano_ready(self) -> bool:
         """Readiness probe: is the Betano session authorized? Hits the cookie-auth

@@ -239,6 +239,33 @@ async def test_overlap_source_multiple_bulk_sources_plus_linker_span_one_partiti
     assert {q.platform for q in quotes} == {"betano", "betwarrior-pba", "betsson-pba"}
 
 
+async def test_overlap_source_reports_per_platform_staleness() -> None:
+    """Per-book ingestion liveness: a bulk book that goes dark (yields nothing) ages
+    past the threshold and is reported by `stale_platforms`, while a linker whose
+    fixture-list call still succeeds stays fresh — the single-book-down signal the
+    post-JOIN market count can't surface."""
+    clock = {"t": 0.0}
+    betano = _FakeScraper([_snap("betano", CELL_HOME, 2.0)])
+    # A second bulk book stays alive, so targets is non-empty and the linker loop runs
+    # (when ALL bulk dies the source bails before linking — covered by the aggregate alert).
+    betwarrior = _FakeScraper([_snap("betwarrior-pba", CELL_HOME, 2.0)])
+    linker = _FakeLinker(refs=[("ev", "futbol/x/home-away")], snaps_by_event={})
+    linker.platform_name = "betsson-pba"  # so the linker's liveness is tracked too
+    src = OverlapQuoteSource(
+        bulk_sources=[betano, betwarrior], linkers=[linker],
+        canonicalizer=_StubCanonicalizer(), now_fn=lambda: clock["t"],
+    )
+    await src.fetch()  # t=0: both bulk produced data; linker listed refs
+    assert src.stale_platforms(10.0) == {}
+
+    betano._snaps = []  # betano goes dark (block); betwarrior + linker still live
+    clock["t"] = 100.0
+    await src.fetch()
+    stale = src.stale_platforms(10.0)
+    assert set(stale) == {"betano"}  # betano stale; betwarrior + betsson-pba refreshed at t=100
+    assert stale["betano"] == 100.0
+
+
 async def test_overlap_source_threads_slug_so_betsson_links_under_real_canonicalizer() -> None:
     """Regression: the linker's slug seeds raw_event_name, which the REAL fixture
     resolver parses for both team names to link a Betsson event. If the slug isn't

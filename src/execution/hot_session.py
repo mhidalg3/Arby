@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any, Protocol
 
 import structlog
@@ -47,6 +49,10 @@ class WarmTransport(Protocol):
     async def __aenter__(self) -> Any: ...
     async def __aexit__(self, *exc: object) -> None: ...
     def arm(self) -> None: ...
+    # Returns the matched responsible-gambling LOCKOUT phrase if a mandatory-break
+    # overlay is blocking the window (session stays authenticated, so the readiness
+    # probes can't see it), else None. See InSessionTransport.check_session_blocked.
+    async def check_session_blocked(self) -> str | None: ...
 
 
 class BetssonWarmTransport(WarmTransport, Protocol):
@@ -101,11 +107,14 @@ class HotSessionManager:
         self._notifier = notifier or NullNotifier()
         self._suspended_for_cold = False  # we tripped the switch for a cold session
         self._readiness: dict[str, bool] = {}  # last probed per-platform readiness
+        self._blocks: dict[str, str] = {}  # platforms behind an RG lockout → matched phrase
+        self._started_at = 0.0  # monotonic bot start (set in __aenter__), for block uptime
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._status_task: asyncio.Task[None] | None = None
         self._log = log.bind(component="hot_sessions")
 
     async def __aenter__(self) -> HotSessionManager:
+        self._started_at = time.monotonic()
         await self._betano.__aenter__()
         await self._betsson.__aenter__()
         if self._betwarrior is not None:
@@ -151,9 +160,13 @@ class HotSessionManager:
     async def _probe_readiness(self) -> str | None:
         """Probe every wired platform's session-readiness (the API equivalent of
         "is the place button green"): Betsson re-establishes + verifies its betting
-        context; Betano hits /api/balance; BetWarrior hits checkSessionAlive. Records
-        the per-platform result (for the status report) and returns the name of the
-        FIRST not-ready platform, or None if all are placeable."""
+        context; Betano hits /api/balance; BetWarrior checks its bearer exp. EACH is
+        then also checked for a responsible-gambling LOCKOUT overlay — the session can
+        be authenticated (probe green) yet blocked behind a mandatory-break popup, so
+        a platform is placeable only if it's ready AND not blocked. Records the
+        per-platform result (for the status report) and returns the name of a not-ready
+        platform (preferring a BLOCKED one — that's the actionable alert), or None if
+        all are placeable."""
         async def _safe(name: str, coro: Awaitable[bool]) -> bool:
             # A probe that raises (cross-origin fetch, nav fault) means NOT READY —
             # suspend + alert, never crash startup or the heartbeat loop.
@@ -163,22 +176,68 @@ class HotSessionManager:
                 self._log.warning("hot_sessions.probe_error", platform=name, error=str(exc))
                 return False
 
-        states: dict[str, bool] = {
-            "betsson": await _safe("betsson", self._betsson.establish_betsson_context()),
-            "betano": await _safe("betano", self._betano.check_betano_ready()),
-        }
+        async def _block(name: str, transport: WarmTransport) -> str | None:
+            try:
+                return await transport.check_session_blocked()
+            except Exception as exc:  # noqa: BLE001 — never crash the heartbeat
+                self._log.warning("hot_sessions.block_probe_error", platform=name, error=str(exc))
+                return None
+
+        probes: list[tuple[str, Awaitable[bool], WarmTransport]] = [
+            ("betsson", self._betsson.establish_betsson_context(), self._betsson),
+            ("betano", self._betano.check_betano_ready(), self._betano),
+        ]
         if self._betwarrior is not None:
-            states["betwarrior"] = await _safe(
-                "betwarrior", self._betwarrior.check_betwarrior_ready()
+            probes.append(
+                ("betwarrior", self._betwarrior.check_betwarrior_ready(), self._betwarrior)
             )
+
+        states: dict[str, bool] = {}
+        blocks: dict[str, str] = {}
+        for name, coro, transport in probes:
+            ready = await _safe(name, coro)
+            phrase = await _block(name, transport)
+            if phrase is not None:
+                blocks[name] = phrase
+            states[name] = ready and phrase is None
+
         self._readiness = states
+        self._record_new_blocks(blocks)  # log NEW lockouts (uses _blocks as prior state)
+        self._blocks = blocks
+        # Prefer naming a BLOCKED platform (actionable: dismiss/handle the popup) over a
+        # plain cold one; otherwise the first not-ready platform.
+        if blocks:
+            return next(iter(blocks))
         return next((p for p, ok in states.items() if not ok), None)
 
+    def _record_new_blocks(self, blocks: dict[str, str]) -> None:
+        """Log every NEWLY-detected RG lockout (a platform not blocked on the prior
+        probe) with bot uptime + wall-clock. This is the trigger-learning record:
+        lockouts clustered at a wall-clock hour ⇒ a curfew; at a ~constant uptime each
+        run ⇒ an accumulated play-time limit (logout/login may or may not reset it —
+        the data decides). ``self._blocks`` still holds the PRIOR probe's blocks here."""
+        for name, phrase in blocks.items():
+            if name not in self._blocks:
+                self._log.warning(
+                    "hot_sessions.rg_block",
+                    platform=name,
+                    phrase=phrase,
+                    uptime_sec=round(time.monotonic() - self._started_at, 1),
+                    wall_clock=datetime.now().astimezone().isoformat(timespec="seconds"),
+                )
+
     def _status_line(self) -> str:
-        """One-line live status: per-platform readiness + whether auto-placement is on."""
+        """One-line live status: per-platform readiness + whether auto-placement is on.
+        A platform behind an RG lockout shows 🚫 (distinct from a plain ❌ cold one)."""
         if not self._readiness:
             return "starting…"
-        parts = " · ".join(f"{p} {'✅' if ok else '❌'}" for p, ok in self._readiness.items())
+
+        def mark(p: str, ok: bool) -> str:
+            if p in self._blocks:
+                return f"{p} 🚫"
+            return f"{p} {'✅' if ok else '❌'}"
+
+        parts = " · ".join(mark(p, ok) for p, ok in self._readiness.items())
         placement = "SUSPENDED" if self._guardrails.kill_switch_tripped else "ON"
         return f"{parts} | auto-placement: {placement}"
 
@@ -215,10 +274,7 @@ class HotSessionManager:
         if not_ready is not None and not self._suspended_for_cold:
             self._suspended_for_cold = True
             self._guardrails.trip_kill_switch(_NOT_READY_REASON)
-            await self._notifier.send(
-                f"🔌 {not_ready} session NOT READY — auto-placement suspended. Re-log into the "
-                f"{not_ready} window; I'll resume automatically. Detection keeps running."
-            )
+            await self._notifier.send(self._suspend_alert(not_ready))
         elif not_ready is None and self._suspended_for_cold:
             self._suspended_for_cold = False
             # Reset only OUR trip — leave a hard freeze / daily-loss stop in place.
@@ -230,3 +286,20 @@ class HotSessionManager:
                     "✅ Sessions ready, but auto-placement stays suspended "
                     f"({self._guardrails.kill_switch_reason}) — resolve + restart to resume."
                 )
+
+    def _suspend_alert(self, not_ready: str) -> str:
+        """The operator alert for a suspend transition — popup-specific when the named
+        platform is behind an RG lockout (so the operator knows to handle the popup,
+        not re-login), else the generic cold-session message."""
+        if not_ready in self._blocks:
+            phrase = self._blocks[not_ready]
+            return (
+                f'🚫 {not_ready} — responsible-gambling LOCKOUT ("{phrase}") is blocking '
+                f"the window. Auto-placement suspended. Handle it in the {not_ready} window "
+                "(it may be a mandatory break — placement can't resume until it clears); "
+                "I'll resume automatically. Detection keeps running."
+            )
+        return (
+            f"🔌 {not_ready} session NOT READY — auto-placement suspended. Re-log into the "
+            f"{not_ready} window; I'll resume automatically. Detection keeps running."
+        )
