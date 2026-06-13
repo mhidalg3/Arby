@@ -21,6 +21,7 @@ import binascii
 import contextlib
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 
@@ -70,6 +71,35 @@ _RG_BLOCK_DIALOG_SELECTOR = "[role=dialog],[aria-modal=true],.modal,.overlay,.mo
 # Where the first production block dumps its DOM + screenshot, so the exact lockout
 # selector is grounded from the real event.
 _BLOCK_EVIDENCE_DIR = REPO_ROOT / "recon" / "artifacts" / "rg_blocks"
+
+# Returns the visible-overlay text and the full body text (both lowercased) so the
+# Python side can match RG phrases and classify overlay-vs-banner. Matching is kept in
+# Python (testable); the JS only extracts text.
+_BLOCK_SCAN_JS = """({sel}) => {
+    const vis = el => el.offsetParent !== null && el.getBoundingClientRect().width > 0;
+    let overlayText = '';
+    for (const el of document.querySelectorAll(sel)) {
+        if (vis(el)) overlayText += ' ' + (el.innerText || '');
+    }
+    return {
+        overlayText: overlayText.toLowerCase(),
+        bodyText: (document.body && document.body.innerText || '').toLowerCase(),
+    };
+}"""
+
+
+@dataclass(frozen=True)
+class SessionBlock:
+    """A responsible-gambling block detected on the betting window.
+
+    ``is_overlay`` True ⇒ the RG phrase sits inside a visible blocking modal/overlay — a
+    real LOCKOUT that suspends placement. False ⇒ the phrase is only in the page text with
+    no overlay — a non-blocking BANNER (e.g. Betano's "12h descanso", confirmed placeable),
+    which is logged + captured but does NOT suspend.
+    """
+
+    phrase: str
+    is_overlay: bool
 
 
 def _jwt_exp(token: str) -> float | None:
@@ -319,34 +349,50 @@ class InSessionTransport:
             return False
         return True
 
-    async def check_session_blocked(self) -> str | None:
-        """Detect a responsible-gambling LOCKOUT overlay blocking the betting UI.
+    async def check_session_blocked(self) -> SessionBlock | None:
+        """Detect a responsible-gambling block on the betting window.
 
-        PBA platforms enforce an accumulated-play-time limit that, once hit, replaces
+        PBA platforms enforce an accumulated-play-time limit that, once hit, can replace
         the betting UI with a mandatory-break notice ("TOMATE UN DESCANSO — 12h de
         descanso de apostar y jugar"). The underlying session stays authenticated, so
-        every readiness probe (balance, ``ctx-``, bearer ``exp``) keeps passing — this
-        overlay is the ONLY signal that the window is actually unusable. Scans the
-        page's VISIBLE text (``innerText`` excludes hidden nodes) for a lockout phrase
-        and returns the matched phrase (for the alert + the trigger-learning log), or
-        ``None`` if the page is usable. Dry-run / no page ⇒ ``None``.
+        every readiness probe (balance, ``ctx-``, bearer ``exp``) keeps passing — this is
+        the only signal the window is unusable. Returns a :class:`SessionBlock` or
+        ``None``: ``is_overlay=True`` when an RG phrase sits inside a visible blocking
+        modal (a true LOCKOUT → suspend); ``is_overlay=False`` when the phrase is only in
+        page text with no overlay (a non-blocking BANNER, e.g. Betano's "12h descanso",
+        confirmed placeable → logged/captured but NOT suspended). Dry-run / no page ⇒
+        ``None``.
 
-        Fail-OPEN on a probe fault (return ``None``): the real readiness probes already
-        suspend a genuinely broken page, and a flaky DOM read must never crash the
-        heartbeat (the hard-won startup-crash lesson)."""
+        Residual risk: if a real lockout's modal doesn't match ``_RG_BLOCK_DIALOG_
+        SELECTOR`` it reads as a banner and won't suspend — backstopped by the placer's
+        place-time fail-close, and the capture grounds the selector from the first real
+        event. Fail-OPEN on a probe fault (return ``None``): a flaky DOM read must never
+        crash the heartbeat (the hard-won startup-crash lesson)."""
         if self._dry_run or self._page is None:
             return None
         try:
             async with self._page_lock:
-                text = await self._page.evaluate(
-                    "() => (document.body && document.body.innerText || '').toLowerCase()"
+                res = await self._page.evaluate(
+                    _BLOCK_SCAN_JS, {"sel": _RG_BLOCK_DIALOG_SELECTOR}
                 )
         except Exception as exc:  # noqa: BLE001 — a read must never crash the heartbeat
             self._log.warning("transport.block_probe_error", error=str(exc))
             return None
-        if not isinstance(text, str):
+        if not isinstance(res, dict):
             return None
-        return next((p for p in _RG_BLOCK_PHRASES if p in text), None)
+        overlay_text = res.get("overlayText", "")
+        body_text = res.get("bodyText", "")
+        if not isinstance(overlay_text, str) or not isinstance(body_text, str):
+            return None
+        # An RG phrase inside a visible overlay = a real blocking lockout. The same phrase
+        # only in page text (no overlay) = a non-blocking banner.
+        for phrase in _RG_BLOCK_PHRASES:
+            if phrase in overlay_text:
+                return SessionBlock(phrase=phrase, is_overlay=True)
+        for phrase in _RG_BLOCK_PHRASES:
+            if phrase in body_text:
+                return SessionBlock(phrase=phrase, is_overlay=False)
+        return None
 
     async def capture_block_evidence(self, reason: str) -> str | None:
         """On the FIRST detection of a session block, dump the page's visible text + any

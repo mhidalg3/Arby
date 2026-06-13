@@ -34,6 +34,7 @@ from src.execution.executor import LegPlacer
 from src.execution.guardrails import Guardrails
 from src.execution.leg_placer import BetanoLegPlacer, BetssonLegPlacer, BetWarriorLegPlacer
 from src.execution.notify import Notifier, NullNotifier
+from src.execution.session import SessionBlock
 
 log = structlog.get_logger(__name__)
 
@@ -49,10 +50,10 @@ class WarmTransport(Protocol):
     async def __aenter__(self) -> Any: ...
     async def __aexit__(self, *exc: object) -> None: ...
     def arm(self) -> None: ...
-    # Returns the matched responsible-gambling LOCKOUT phrase if a mandatory-break
-    # overlay is blocking the window (session stays authenticated, so the readiness
-    # probes can't see it), else None. See InSessionTransport.check_session_blocked.
-    async def check_session_blocked(self) -> str | None: ...
+    # A SessionBlock if a responsible-gambling block is on the window (overlay lockout or
+    # non-blocking banner), else None. Only is_overlay=True suspends placement. See
+    # InSessionTransport.check_session_blocked.
+    async def check_session_blocked(self) -> SessionBlock | None: ...
     # On the FIRST detection of a block, dump the overlay DOM + screenshot to ground the
     # exact selector from the real event. Returns the artifact path or None. Never raises.
     async def capture_block_evidence(self, reason: str) -> str | None: ...
@@ -110,7 +111,7 @@ class HotSessionManager:
         self._notifier = notifier or NullNotifier()
         self._suspended_for_cold = False  # we tripped the switch for a cold session
         self._readiness: dict[str, bool] = {}  # last probed per-platform readiness
-        self._blocks: dict[str, str] = {}  # platforms behind an RG lockout → matched phrase
+        self._blocks: dict[str, SessionBlock] = {}  # platforms with an RG block (overlay/banner)
         self._started_at = 0.0  # monotonic bot start (set in __aenter__), for block uptime
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._status_task: asyncio.Task[None] | None = None
@@ -179,7 +180,7 @@ class HotSessionManager:
                 self._log.warning("hot_sessions.probe_error", platform=name, error=str(exc))
                 return False
 
-        async def _block(name: str, transport: WarmTransport) -> str | None:
+        async def _block(name: str, transport: WarmTransport) -> SessionBlock | None:
             try:
                 return await transport.check_session_blocked()
             except Exception as exc:  # noqa: BLE001 — never crash the heartbeat
@@ -196,45 +197,50 @@ class HotSessionManager:
             )
 
         states: dict[str, bool] = {}
-        blocks: dict[str, str] = {}
+        blocks: dict[str, SessionBlock] = {}
         for name, coro, transport in probes:
             ready = await _safe(name, coro)
-            phrase = await _block(name, transport)
-            if phrase is not None:
-                blocks[name] = phrase
-            states[name] = ready and phrase is None
+            block = await _block(name, transport)
+            if block is not None:
+                blocks[name] = block
+            # Only a true blocking OVERLAY makes a platform not-placeable; a non-blocking
+            # banner (Betano's "12h descanso", confirmed placeable) leaves it ready.
+            states[name] = ready and not (block is not None and block.is_overlay)
 
         self._readiness = states
         transports: dict[str, WarmTransport] = {name: t for name, _coro, t in probes}
         # log NEW lockouts + capture their DOM (uses _blocks as the prior state)
         await self._record_new_blocks(blocks, transports)
         self._blocks = blocks
-        # Prefer naming a BLOCKED platform (actionable: dismiss/handle the popup) over a
+        # Prefer naming an OVERLAY-blocked platform (actionable: handle the popup) over a
         # plain cold one; otherwise the first not-ready platform.
-        if blocks:
-            return next(iter(blocks))
+        overlay_blocked = next((p for p, b in blocks.items() if b.is_overlay), None)
+        if overlay_blocked is not None:
+            return overlay_blocked
         return next((p for p, ok in states.items() if not ok), None)
 
     async def _record_new_blocks(
-        self, blocks: dict[str, str], transports: dict[str, WarmTransport]
+        self, blocks: dict[str, SessionBlock], transports: dict[str, WarmTransport]
     ) -> None:
-        """For every NEWLY-detected RG lockout (a platform not blocked on the prior
-        probe): log it with bot uptime + wall-clock, AND capture the block's DOM (overlay
-        HTML + screenshot) so the first production event grounds the exact selector. The
-        log is the trigger-learning record: lockouts clustered at a wall-clock hour ⇒ a
-        curfew; at a ~constant uptime each run ⇒ an accumulated play-time limit. Captured
-        once per episode (only on the transition into blocked). ``self._blocks`` still
-        holds the PRIOR probe's blocks here."""
-        for name, phrase in blocks.items():
+        """For every NEWLY-detected RG block (a platform not blocked on the prior probe):
+        log it with bot uptime + wall-clock + whether it's an overlay, AND capture the
+        block's DOM (overlay HTML + screenshot) so the first production event grounds the
+        exact selector. Both overlays (suspend) and banners (placeable) are captured/logged
+        — we never go blind on a banner. The log is the trigger-learning record: blocks
+        clustered at a wall-clock hour ⇒ a curfew; at a ~constant uptime each run ⇒ an
+        accumulated play-time limit. Captured once per episode (only on the transition into
+        blocked). ``self._blocks`` still holds the PRIOR probe's blocks here."""
+        for name, block in blocks.items():
             if name not in self._blocks:
                 evidence: str | None = None
                 transport = transports.get(name)
                 if transport is not None:
-                    evidence = await transport.capture_block_evidence(f"{name}:{phrase}")
+                    evidence = await transport.capture_block_evidence(f"{name}:{block.phrase}")
                 self._log.warning(
                     "hot_sessions.rg_block",
                     platform=name,
-                    phrase=phrase,
+                    phrase=block.phrase,
+                    is_overlay=block.is_overlay,
                     uptime_sec=round(time.monotonic() - self._started_at, 1),
                     wall_clock=datetime.now().astimezone().isoformat(timespec="seconds"),
                     evidence=evidence,
@@ -247,8 +253,9 @@ class HotSessionManager:
             return "starting…"
 
         def mark(p: str, ok: bool) -> str:
-            if p in self._blocks:
-                return f"{p} 🚫"
+            block = self._blocks.get(p)
+            if block is not None and block.is_overlay:
+                return f"{p} 🚫"  # true lockout overlay; a banner leaves it placeable (✅)
             return f"{p} {'✅' if ok else '❌'}"
 
         parts = " · ".join(mark(p, ok) for p, ok in self._readiness.items())
@@ -305,10 +312,10 @@ class HotSessionManager:
         """The operator alert for a suspend transition — popup-specific when the named
         platform is behind an RG lockout (so the operator knows to handle the popup,
         not re-login), else the generic cold-session message."""
-        if not_ready in self._blocks:
-            phrase = self._blocks[not_ready]
+        block = self._blocks.get(not_ready)
+        if block is not None and block.is_overlay:
             return (
-                f'🚫 {not_ready} — responsible-gambling LOCKOUT ("{phrase}") is blocking '
+                f'🚫 {not_ready} — responsible-gambling LOCKOUT ("{block.phrase}") is blocking '
                 f"the window. Auto-placement suspended. Handle it in the {not_ready} window "
                 "(it may be a mandatory break — placement can't resume until it clears); "
                 "I'll resume automatically. Detection keeps running."

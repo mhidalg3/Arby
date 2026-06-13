@@ -1,5 +1,30 @@
 # Project Ledger
 
+## 2026-06-13 — RG detection: overlay-gated (kill the Betano banner false-positive)
+
+**Context:** Operator CONFIRMED Betano's "TOMATE UN DESCANSO / 12h descanso" text is a
+non-blocking BANNER (placed a bet through it). The phrase-only `check_session_blocked`
+therefore over-suspended Betano. Follow-up: only a true blocking OVERLAY should suspend.
+
+**Decision:** `check_session_blocked` now returns a `SessionBlock(phrase, is_overlay)`. The
+scan extracts visible-overlay text (`_RG_BLOCK_DIALOG_SELECTOR`) + body text; an RG phrase
+INSIDE a visible overlay ⇒ `is_overlay=True` (lockout → suspend); the same phrase only in
+page text ⇒ `is_overlay=False` (banner → placeable). `HotSessionManager`: only overlay
+blocks make a platform not-placeable; banners stay ready but are still captured + logged
+(`is_overlay` field) so we never go blind. Suspend alert / status 🚫 / not-ready selection
+all gated on `is_overlay`. Matching kept in Python (testable); JS only extracts text.
+
+**Residual risk (documented):** a real lockout whose modal doesn't match the generic
+overlay selector reads as a banner and won't suspend — backstopped by the placer's
+place-time fail-close, and the evidence capture grounds the exact selector from the first
+real event (then tighten the selector). Net: strictly better than the old always-suspend
+behavior for the known Betano case, with a well-backstopped tail risk.
+
+**State:** branch `feat/site-down-detection` → PR. 626 tests (+2), mypy/ruff clean. New
+tests: overlay=lockout vs page-text=banner (test_session_blocked); banner-does-not-suspend-
+but-is-captured (test_hot_session). NEXT: once a real overlay is captured in production,
+tighten `_RG_BLOCK_DIALOG_SELECTOR` to the exact markup.
+
 ## 2026-06-13 — RG block evidence capture + lab-monitoring negative result
 
 **Context:** The phrase heuristic (`_RG_BLOCK_PHRASES`) is grounded only in Betano's

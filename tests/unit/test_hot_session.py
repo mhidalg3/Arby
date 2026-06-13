@@ -6,18 +6,23 @@ import asyncio
 
 from src.execution.guardrails import Guardrails
 from src.execution.hot_session import HotSessionManager
+from src.execution.session import SessionBlock
+
+
+def _overlay(phrase: str) -> SessionBlock:
+    return SessionBlock(phrase=phrase, is_overlay=True)  # a true blocking lockout
 
 
 class _FakeTransport:
     def __init__(
-        self, *, context_ok: bool = True, ready: bool = True, blocked: str | None = None
+        self, *, context_ok: bool = True, ready: bool = True, blocked: SessionBlock | None = None
     ) -> None:
         self.entered = False
         self.exited = False
         self.armed = False
         self.context_ok = context_ok  # Betsson readiness (establish context)
         self.ready = ready  # Betano / BetWarrior readiness probes
-        self.blocked = blocked  # an RG lockout phrase, or None when the window is usable
+        self.blocked = blocked  # a SessionBlock (overlay/banner), or None when usable
         self.establish_calls = 0
         self.capture_calls: list[str] = []  # capture_block_evidence reasons
 
@@ -41,7 +46,7 @@ class _FakeTransport:
     async def check_betwarrior_ready(self) -> bool:
         return self.ready
 
-    async def check_session_blocked(self) -> str | None:
+    async def check_session_blocked(self) -> SessionBlock | None:
         return self.blocked
 
     async def capture_block_evidence(self, reason: str) -> str | None:
@@ -192,7 +197,7 @@ async def test_rg_lockout_suspends_with_popup_specific_alert_then_resumes() -> N
         notifier=note,  # type: ignore[arg-type]
     )
     async with m:
-        bsn.blocked = "tomate un descanso"  # lockout overlay appears; context_ok stays True
+        bsn.blocked = _overlay("tomate un descanso")  # lockout overlay; context_ok stays True
         await asyncio.sleep(0.04)
         assert g.kill_switch_tripped  # suspended even though establish_betsson_context==True
         alert = next(s for s in note.sent if "betsson" in s and "LOCKOUT" in s)
@@ -204,17 +209,30 @@ async def test_rg_lockout_suspends_with_popup_specific_alert_then_resumes() -> N
         assert any("ready again" in s for s in note.sent)
 
 
+async def test_rg_banner_does_not_suspend_but_is_captured() -> None:
+    """A non-blocking BANNER (phrase in page text, no overlay — Betano's confirmed case)
+    must NOT suspend auto-placement, yet is still captured/logged so we never go blind."""
+    bano, bsn, g = _FakeTransport(), _FakeTransport(), _guard()
+    m = _mgr(bano, bsn, g)
+    async with m:
+        bano.blocked = SessionBlock("tomate un descanso", is_overlay=False)  # banner
+        assert await m.heartbeat() is True  # banner ⇒ still placeable
+        assert not g.kill_switch_tripped  # NOT suspended (the false-positive fix)
+        assert m._readiness["betano"] is True
+        assert bano.capture_calls == ["betano:tomate un descanso"]  # but evidence captured
+
+
 async def test_rg_lockout_logs_an_occurrence_for_trigger_learning() -> None:
     """Each new lockout is logged with platform + uptime so the trigger pattern is
     learnable. We assert the readiness state reflects the block (states[betano] False)
     even with the balance probe green."""
-    bano, bsn, g = _FakeTransport(blocked="12h de descanso"), _FakeTransport(), _guard()
+    bano, bsn, g = _FakeTransport(blocked=_overlay("12h de descanso")), _FakeTransport(), _guard()
     m = _mgr(bano, bsn, g)
     async with m:
         # heartbeat_sec is large; probe directly. Betano is "ready" but blocked → not placeable.
         assert await m.heartbeat() is False
         assert m._readiness["betano"] is False
-        assert m._blocks["betano"] == "12h de descanso"
+        assert m._blocks["betano"].phrase == "12h de descanso"
 
 
 async def test_rg_lockout_captures_dom_evidence_once_per_episode() -> None:
@@ -225,13 +243,13 @@ async def test_rg_lockout_captures_dom_evidence_once_per_episode() -> None:
     m = _mgr(bano, bsn, g)  # heartbeat_sec large → drive probes manually
     async with m:
         assert bsn.capture_calls == []  # clean startup, no block
-        bsn.blocked = "12h de descanso"
+        bsn.blocked = _overlay("12h de descanso")
         await m.heartbeat()  # first detection → capture
         await m.heartbeat()  # still blocked → no re-capture
         assert bsn.capture_calls == ["betsson:12h de descanso"]
         bsn.blocked = None
         await m.heartbeat()  # clears
-        bsn.blocked = "12h de descanso"
+        bsn.blocked = _overlay("12h de descanso")
         await m.heartbeat()  # re-block → capture again
         assert len(bsn.capture_calls) == 2
 

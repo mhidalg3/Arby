@@ -17,17 +17,19 @@ from src.execution.session import InSessionTransport
 
 
 class _FakePage:
-    """Stands in for the Playwright page: `evaluate` returns canned innerText (or
-    raises, to exercise the fail-open path)."""
+    """Stands in for the Playwright page: `evaluate` returns the {overlayText, bodyText}
+    the scan JS would produce (or raises, to exercise the fail-open path). Both arrive
+    lowercased from the page."""
 
-    def __init__(self, text: str | None = None, *, raises: bool = False) -> None:
-        self._text = text
+    def __init__(self, *, body: str = "", overlay: str = "", raises: bool = False) -> None:
+        self._body = body.lower()
+        self._overlay = overlay.lower()
         self._raises = raises
 
     async def evaluate(self, expr: str, *args: Any) -> Any:
         if self._raises:
             raise RuntimeError("page detached")
-        return self._text
+        return {"overlayText": self._overlay, "bodyText": self._body}
 
 
 def _transport(page: _FakePage | None) -> InSessionTransport:
@@ -36,16 +38,27 @@ def _transport(page: _FakePage | None) -> InSessionTransport:
     return t
 
 
-async def test_blocked_returns_matched_lockout_phrase() -> None:
-    # innerText arrives lowercased from the page (the JS lowercases it).
-    page = _FakePage("apostar  tomate un descanso  12h de descanso de apostar y jugar")
-    assert await _transport(page).check_session_blocked() == "tomate un descanso"
+async def test_phrase_inside_an_overlay_is_a_lockout() -> None:
+    # An RG phrase inside a visible modal = a true blocking lockout → suspend.
+    page = _FakePage(overlay="su tiempo de juego — tomate un descanso", body="… tomate un descanso")
+    block = await _transport(page).check_session_blocked()
+    assert block is not None and block.is_overlay is True
+    assert block.phrase == "tomate un descanso"
+
+
+async def test_phrase_in_page_text_without_overlay_is_a_banner() -> None:
+    # Betano's CONFIRMED non-blocking banner: phrase in the page body, no overlay → the
+    # platform stays placeable (is_overlay False). This is the false-positive fix.
+    page = _FakePage(body="boca river  tomate un descanso  12h de descanso de apostar y jugar")
+    block = await _transport(page).check_session_blocked()
+    assert block is not None and block.is_overlay is False
+    assert block.phrase == "tomate un descanso"
 
 
 async def test_not_blocked_on_a_usable_page() -> None:
     # A normal sportsbook page — even with a "juego responsable" footer link, which is
     # deliberately NOT in the lockout set — is not a block.
-    page = _FakePage("boca river 2.10 empate 3.40 juego responsable ayuda")
+    page = _FakePage(body="boca river 2.10 empate 3.40 juego responsable ayuda")
     assert await _transport(page).check_session_blocked() is None
 
 
