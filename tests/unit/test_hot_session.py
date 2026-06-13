@@ -19,6 +19,7 @@ class _FakeTransport:
         self.ready = ready  # Betano / BetWarrior readiness probes
         self.blocked = blocked  # an RG lockout phrase, or None when the window is usable
         self.establish_calls = 0
+        self.capture_calls: list[str] = []  # capture_block_evidence reasons
 
     async def __aenter__(self) -> _FakeTransport:
         self.entered = True
@@ -42,6 +43,10 @@ class _FakeTransport:
 
     async def check_session_blocked(self) -> str | None:
         return self.blocked
+
+    async def capture_block_evidence(self, reason: str) -> str | None:
+        self.capture_calls.append(reason)
+        return f"fake/{reason}.json"
 
 
 def _guard() -> Guardrails:
@@ -210,6 +215,25 @@ async def test_rg_lockout_logs_an_occurrence_for_trigger_learning() -> None:
         assert await m.heartbeat() is False
         assert m._readiness["betano"] is False
         assert m._blocks["betano"] == "12h de descanso"
+
+
+async def test_rg_lockout_captures_dom_evidence_once_per_episode() -> None:
+    """The first detection of a block dumps its DOM (to ground the selector from the real
+    event); it is NOT re-captured every heartbeat while the block persists, but a fresh
+    block after a recovery captures again."""
+    bano, bsn, g = _FakeTransport(), _FakeTransport(), _guard()
+    m = _mgr(bano, bsn, g)  # heartbeat_sec large → drive probes manually
+    async with m:
+        assert bsn.capture_calls == []  # clean startup, no block
+        bsn.blocked = "12h de descanso"
+        await m.heartbeat()  # first detection → capture
+        await m.heartbeat()  # still blocked → no re-capture
+        assert bsn.capture_calls == ["betsson:12h de descanso"]
+        bsn.blocked = None
+        await m.heartbeat()  # clears
+        bsn.blocked = "12h de descanso"
+        await m.heartbeat()  # re-block → capture again
+        assert len(bsn.capture_calls) == 2
 
 
 async def test_cold_recovery_does_not_clear_a_hard_trip() -> None:

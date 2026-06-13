@@ -7,7 +7,11 @@ passing and this DOM scan is the only signal the window is actually unusable.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 from src.execution.session import InSessionTransport
 
@@ -58,3 +62,44 @@ async def test_fails_open_when_the_read_raises() -> None:
     # A flaky DOM read must never crash the heartbeat — degrade to "not blocked" and
     # let the real readiness probes decide a genuinely broken page.
     assert await _transport(_FakePage(raises=True)).check_session_blocked() is None
+
+
+class _FakeCapturePage:
+    """Page whose `evaluate` returns the block-evidence object and whose `screenshot`
+    records where it would write (no real file)."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = data
+        self.shot_path: str | None = None
+
+    async def evaluate(self, expr: str, *args: Any) -> Any:
+        return self._data
+
+    async def screenshot(self, path: str | None = None, full_page: bool = False) -> None:
+        self.shot_path = path
+
+
+async def test_capture_block_evidence_writes_overlay_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Ground the real lockout DOM: the saved artifact carries the overlay markup so we can
+    # pin the exact selector + distinguish a true overlay from a banner.
+    monkeypatch.setattr("src.execution.session._BLOCK_EVIDENCE_DIR", tmp_path)
+    data = {
+        "url": "https://www.betano.bet.ar/",
+        "text": "tomate un descanso 12h de descanso",
+        "dialogs": [{"tag": "DIV", "cls": "rg-lockout modal", "html": "<div class='modal'>…</div>"}],
+    }
+    t = InSessionTransport("betano", dry_run=False)
+    t._page = _FakeCapturePage(data)  # type: ignore[assignment]
+    out = await t.capture_block_evidence("betano:tomate un descanso")
+    assert out is not None
+    saved = json.loads(Path(out).read_text())  # noqa: ASYNC240 — tiny test artifact read
+    assert saved["platform"] == "betano"
+    assert saved["reason"] == "betano:tomate un descanso"
+    assert saved["dialogs"][0]["cls"] == "rg-lockout modal"  # true overlay grounded
+
+
+async def test_capture_block_evidence_none_in_dry_run() -> None:
+    t = InSessionTransport("betano", dry_run=True)  # no page
+    assert await t.capture_block_evidence("x") is None

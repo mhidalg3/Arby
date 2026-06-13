@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -60,6 +61,15 @@ _RG_BLOCK_PHRASES: Final[tuple[str, ...]] = (
     "llevás jugando",
     "cuánto tiempo llevás",
 )
+
+# Visible modal/overlay selector — used by capture_block_evidence to dump the block's
+# markup. A populated `dialogs` list means a true blocking OVERLAY; an empty one with a
+# phrase hit means a non-blocking BANNER (e.g. Betano's "12h descanso"). This is exactly
+# the distinction we need to ground but couldn't reproduce in the lab.
+_RG_BLOCK_DIALOG_SELECTOR = "[role=dialog],[aria-modal=true],.modal,.overlay,.modal-overlay"
+# Where the first production block dumps its DOM + screenshot, so the exact lockout
+# selector is grounded from the real event.
+_BLOCK_EVIDENCE_DIR = REPO_ROOT / "recon" / "artifacts" / "rg_blocks"
 
 
 def _jwt_exp(token: str) -> float | None:
@@ -337,6 +347,49 @@ class InSessionTransport:
         if not isinstance(text, str):
             return None
         return next((p for p in _RG_BLOCK_PHRASES if p in text), None)
+
+    async def capture_block_evidence(self, reason: str) -> str | None:
+        """On the FIRST detection of a session block, dump the page's visible text + any
+        modal/overlay markup + a screenshot to ``recon/artifacts/rg_blocks/`` — so the
+        real production lockout grounds the exact selector (the lab couldn't reproduce
+        it idly). The saved ``dialogs`` list distinguishes a true blocking OVERLAY (non-
+        empty) from a non-blocking BANNER (empty + a phrase hit, e.g. Betano's "12h
+        descanso"). Returns the JSON artifact path, or ``None`` (dry-run / no page /
+        fault). Never raises — evidence capture must not crash the heartbeat."""
+        if self._dry_run or self._page is None:
+            return None
+        ts = int(time.time())
+        base = _BLOCK_EVIDENCE_DIR / f"{self._platform}_{ts}"
+        try:
+            _BLOCK_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+            async with self._page_lock:
+                data = await self._page.evaluate(
+                    """(sel) => ({
+                        url: location.href,
+                        text: (document.body && document.body.innerText || '').slice(0, 4000),
+                        dialogs: [...document.querySelectorAll(sel)]
+                            .filter(el => el.offsetParent !== null
+                                && el.getBoundingClientRect().width > 0)
+                            .map(el => ({tag: el.tagName, cls: String(el.className),
+                                         html: el.outerHTML.slice(0, 8000)})),
+                    })""",
+                    _RG_BLOCK_DIALOG_SELECTOR,
+                )
+                with contextlib.suppress(Exception):
+                    await self._page.screenshot(path=f"{base}.png", full_page=False)
+            out = base.with_suffix(".json")
+            out.write_text(
+                json.dumps(
+                    {"platform": self._platform, "reason": reason, "ts": ts, **data},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            self._log.warning("transport.block_evidence_saved", path=str(out))
+            return str(out)
+        except Exception as exc:  # noqa: BLE001 — must never crash the heartbeat
+            self._log.warning("transport.block_evidence_error", error=str(exc))
+            return None
 
     async def check_betano_ready(self) -> bool:
         """Readiness probe: is the Betano session authorized? Hits the cookie-auth

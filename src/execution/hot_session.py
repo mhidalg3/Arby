@@ -53,6 +53,9 @@ class WarmTransport(Protocol):
     # overlay is blocking the window (session stays authenticated, so the readiness
     # probes can't see it), else None. See InSessionTransport.check_session_blocked.
     async def check_session_blocked(self) -> str | None: ...
+    # On the FIRST detection of a block, dump the overlay DOM + screenshot to ground the
+    # exact selector from the real event. Returns the artifact path or None. Never raises.
+    async def capture_block_evidence(self, reason: str) -> str | None: ...
 
 
 class BetssonWarmTransport(WarmTransport, Protocol):
@@ -202,7 +205,9 @@ class HotSessionManager:
             states[name] = ready and phrase is None
 
         self._readiness = states
-        self._record_new_blocks(blocks)  # log NEW lockouts (uses _blocks as prior state)
+        transports: dict[str, WarmTransport] = {name: t for name, _coro, t in probes}
+        # log NEW lockouts + capture their DOM (uses _blocks as the prior state)
+        await self._record_new_blocks(blocks, transports)
         self._blocks = blocks
         # Prefer naming a BLOCKED platform (actionable: dismiss/handle the popup) over a
         # plain cold one; otherwise the first not-ready platform.
@@ -210,20 +215,29 @@ class HotSessionManager:
             return next(iter(blocks))
         return next((p for p, ok in states.items() if not ok), None)
 
-    def _record_new_blocks(self, blocks: dict[str, str]) -> None:
-        """Log every NEWLY-detected RG lockout (a platform not blocked on the prior
-        probe) with bot uptime + wall-clock. This is the trigger-learning record:
-        lockouts clustered at a wall-clock hour ⇒ a curfew; at a ~constant uptime each
-        run ⇒ an accumulated play-time limit (logout/login may or may not reset it —
-        the data decides). ``self._blocks`` still holds the PRIOR probe's blocks here."""
+    async def _record_new_blocks(
+        self, blocks: dict[str, str], transports: dict[str, WarmTransport]
+    ) -> None:
+        """For every NEWLY-detected RG lockout (a platform not blocked on the prior
+        probe): log it with bot uptime + wall-clock, AND capture the block's DOM (overlay
+        HTML + screenshot) so the first production event grounds the exact selector. The
+        log is the trigger-learning record: lockouts clustered at a wall-clock hour ⇒ a
+        curfew; at a ~constant uptime each run ⇒ an accumulated play-time limit. Captured
+        once per episode (only on the transition into blocked). ``self._blocks`` still
+        holds the PRIOR probe's blocks here."""
         for name, phrase in blocks.items():
             if name not in self._blocks:
+                evidence: str | None = None
+                transport = transports.get(name)
+                if transport is not None:
+                    evidence = await transport.capture_block_evidence(f"{name}:{phrase}")
                 self._log.warning(
                     "hot_sessions.rg_block",
                     platform=name,
                     phrase=phrase,
                     uptime_sec=round(time.monotonic() - self._started_at, 1),
                     wall_clock=datetime.now().astimezone().isoformat(timespec="seconds"),
+                    evidence=evidence,
                 )
 
     def _status_line(self) -> str:

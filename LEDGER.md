@@ -1,5 +1,40 @@
 # Project Ledger
 
+## 2026-06-13 — RG block evidence capture + lab-monitoring negative result
+
+**Context:** The phrase heuristic (`_RG_BLOCK_PHRASES`) is grounded only in Betano's
+"TOMATE UN DESCANSO" string — which the operator CONFIRMED is a non-blocking BANNER (placed
+a bet through it). We need the REAL hard-lockout DOM to ground an exact selector and fix the
+Betano false-positive, but couldn't reproduce it.
+
+**Lab monitoring (negative result):** Ran `scripts/monitor_popups.py` ~10h overnight
+(idle, logged-in, +mouse/scroll keep-alive). The hard lockout did NOT reproduce; instead all
+three sessions logged out from INACTIVITY (Betsson: "sesión cerrada por falta de actividad").
+Machine stayed awake (caffeinate), so synthetic mouse/scroll keep-alive simply does NOT count
+as activity — inactivity detection is server-side (real API/betting), and the play-time
+counter almost certainly advances with ACTIVE BETTING, not idle time. Conclusion: idle
+monitoring is the wrong tool; the lockout will only recur during a real armed run.
+
+**Decision — capture in production instead of the lab:** Added
+`InSessionTransport.capture_block_evidence(reason)` — on the FIRST detection of a block, the
+heartbeat dumps the page's visible text + any modal/overlay markup (`_RG_BLOCK_DIALOG_
+SELECTOR`) + a screenshot to `recon/artifacts/rg_blocks/` (gitignored). The saved `dialogs`
+list distinguishes a true blocking OVERLAY (non-empty) from a BANNER (empty + phrase hit) —
+exactly the banner-vs-overlay distinction needed to fix the Betano false-positive. Wired into
+`HotSessionManager._record_new_blocks` (now async, captures once per episode on the
+transition into blocked, fail-soft). So the first real lockout grounds the selector with zero
+further lab effort.
+
+**State:** branch `feat/site-down-detection`. 624 tests (+3), mypy/ruff clean. New tests:
+capture writes the overlay artifact + dry-run None (test_session_blocked), capture-once-per-
+episode (test_hot_session). Open follow-ups (post-capture): refine `check_session_blocked` to
+require a real overlay (kill the Betano banner false-positive); the live bot's periodic
+readiness API calls (balance/context ~300s) are a better keep-alive than mouse moves if
+inactivity logout becomes a production problem between bets.
+
+**Errors:** ruff ASYNC240 flagged `Path(out).read_text()` in the async test (not the
+equivalent prod `write_text`, an inference quirk) — targeted noqa, it's a tiny test read.
+
 ## 2026-06-12 — Detect site down: RG lockout popups + per-platform ingestion liveness
 
 **Context (operator-found, live):** After an extended deployment all three Chrome
