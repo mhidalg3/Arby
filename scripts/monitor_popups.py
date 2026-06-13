@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,20 @@ async def _open(platform: str) -> tuple[Any, Any, Any]:
     return pw, ctx, page
 
 
+async def _keepalive(page: Any) -> None:
+    """Minimal human-like activity to defeat the inactivity logout (BetWarrior/Kambi
+    ends the session after a few idle minutes) WITHOUT navigating — a reload would
+    reset the play-time counter we're trying to observe AND is a bot signal. Just a
+    mouse move + a tiny scroll nudge that returns to where it was; no clicks, no keys,
+    no nav. Best-effort: a fault on one page must not stop the watch."""
+    with contextlib.suppress(Exception):
+        x, y = random.randint(150, 900), random.randint(150, 550)
+        await page.mouse.move(x, y, steps=4)
+        await page.mouse.wheel(0, 120)
+        await asyncio.sleep(0.3)
+        await page.mouse.wheel(0, -120)
+
+
 async def _sample(platform: str, page: Any, phrases: list[str], started: float) -> dict[str, Any]:
     """One observation of a window: screenshot + lockout/overlay scan. Best-effort —
     a fault on one window must not stop the watch."""
@@ -107,6 +122,12 @@ async def main() -> int:
     p.add_argument("--interval-min", type=float, default=30.0)
     p.add_argument("--hours", type=float, default=12.0)
     p.add_argument("--platforms", default="betano,betsson,betwarrior")
+    p.add_argument(
+        "--keepalive-sec",
+        type=float,
+        default=120.0,
+        help="minimal mouse/scroll activity this often, to defeat the inactivity logout",
+    )
     args = p.parse_args()
 
     platforms = [s.strip() for s in args.platforms.split(",") if s.strip()]
@@ -122,10 +143,10 @@ async def main() -> int:
 
     print(
         f"⚠️  POPUP MONITOR — {platforms}\n"
-        f"  cadence {args.interval_min:.0f} min · runs {args.hours:.0f} h · "
-        f"artifacts → {_ARTIFACTS}\n"
+        f"  screenshot {args.interval_min:.0f} min · keep-alive {args.keepalive_sec:.0f} s · "
+        f"runs {args.hours:.0f} h · artifacts → {_ARTIFACTS}\n"
         "  ▶ Log into ALL the windows that open; I screenshot + scan regardless of state.\n"
-        "  (Windows are NOT reloaded after opening — natural popup emergence is the point.)"
+        "  (Windows are NOT reloaded — only mouse/scroll keep-alive; natural popup emergence.)"
     )
 
     opened: list[tuple[str, Any, Any, Any]] = []
@@ -142,20 +163,29 @@ async def main() -> int:
 
     try:
         cycle = 0
+        interval_sec = args.interval_min * 60.0
+        last_shot = 0.0  # 0 ⇒ a screenshot fires on the first tick
         while time.time() < deadline:
-            cycle += 1
-            for platform, _pw, _ctx, page in opened:
-                rec = await _sample(platform, page, phrases, started)
-                with log_path.open("a") as fh:
-                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                flag = "🚫 LOCKOUT" if rec.get("blocked") else (
-                    "modal" if rec.get("dialogs") else "clear"
-                )
-                print(
-                    f"  [{rec['wall_clock']}] cycle {cycle} {platform}: {flag} "
-                    f"(+{rec['elapsed_min']:.0f}m){' ERR:' + rec['error'] if rec.get('error') else ''}"
-                )
-            await asyncio.sleep(args.interval_min * 60.0)
+            # Keep-alive every tick (defeats the inactivity logout).
+            for _platform, _pw, _ctx, page in opened:
+                await _keepalive(page)
+            # Screenshot + scan only every interval.
+            if time.time() - last_shot >= interval_sec:
+                last_shot = time.time()
+                cycle += 1
+                for platform, _pw, _ctx, page in opened:
+                    rec = await _sample(platform, page, phrases, started)
+                    with log_path.open("a") as fh:
+                        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    flag = "🚫 LOCKOUT" if rec.get("blocked") else (
+                        "modal" if rec.get("dialogs") else "clear"
+                    )
+                    err = f" ERR:{rec['error']}" if rec.get("error") else ""
+                    print(
+                        f"  [{rec['wall_clock']}] cycle {cycle} {platform}: {flag} "
+                        f"(+{rec['elapsed_min']:.0f}m){err}"
+                    )
+            await asyncio.sleep(args.keepalive_sec)
         print(f"\n  watch ended after {args.hours:.0f} h — log: {log_path.name}")
     finally:
         for _platform, pw, ctx, _page in opened:
