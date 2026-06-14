@@ -231,20 +231,29 @@ class HotSessionManager:
         accumulated play-time limit. Captured once per episode (only on the transition into
         blocked). ``self._blocks`` still holds the PRIOR probe's blocks here."""
         for name, block in blocks.items():
-            if name not in self._blocks:
-                evidence: str | None = None
-                transport = transports.get(name)
-                if transport is not None:
-                    evidence = await transport.capture_block_evidence(f"{name}:{block.phrase}")
-                self._log.warning(
-                    "hot_sessions.rg_block",
-                    platform=name,
-                    phrase=block.phrase,
-                    is_overlay=block.is_overlay,
-                    uptime_sec=round(time.monotonic() - self._started_at, 1),
-                    wall_clock=datetime.now().astimezone().isoformat(timespec="seconds"),
-                    evidence=evidence,
-                )
+            prev = self._blocks.get(name)
+            # Record on a NEW block, OR when a banner ESCALATES to a real overlay — the
+            # exact lockout we exist to ground. Betano shows its banner first, so without
+            # the escalation case the platform is already in _blocks and the transition to
+            # the real overlay would be silently skipped (no capture, no log). Stays
+            # once-per-episode: a persistent block (banner or overlay) is not re-recorded.
+            escalated = prev is not None and block.is_overlay and not prev.is_overlay
+            if prev is not None and not escalated:
+                continue
+            evidence: str | None = None
+            transport = transports.get(name)
+            if transport is not None:
+                evidence = await transport.capture_block_evidence(f"{name}:{block.phrase}")
+            self._log.warning(
+                "hot_sessions.rg_block",
+                platform=name,
+                phrase=block.phrase,
+                is_overlay=block.is_overlay,
+                escalated=escalated,
+                uptime_sec=round(time.monotonic() - self._started_at, 1),
+                wall_clock=datetime.now().astimezone().isoformat(timespec="seconds"),
+                evidence=evidence,
+            )
 
     def _status_line(self) -> str:
         """One-line live status: per-platform readiness + whether auto-placement is on.

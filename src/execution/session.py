@@ -364,10 +364,14 @@ class InSessionTransport:
         ``None``.
 
         Residual risk: if a real lockout's modal doesn't match ``_RG_BLOCK_DIALOG_
-        SELECTOR`` it reads as a banner and won't suspend — backstopped by the placer's
-        place-time fail-close, and the capture grounds the selector from the first real
-        event. Fail-OPEN on a probe fault (return ``None``): a flaky DOM read must never
-        crash the heartbeat (the hard-won startup-crash lesson)."""
+        SELECTOR`` it reads as a banner and won't suspend, so the bot may attempt to place
+        into a locked window. This is only PARTIALLY backstopped — there is no lockout-aware
+        check at place time; a leg only fails if the SERVER also rejects it (descanso
+        enforced server-side, unconfirmed) or a leg errors (generic naked-leg recovery). A
+        UI-only lockout would let the bet through. The evidence capture grounds the exact
+        selector from the first real event so this gap can be closed. Fail-OPEN on a probe
+        fault (return ``None``): a flaky DOM read must never crash the heartbeat (the
+        hard-won startup-crash lesson)."""
         if self._dry_run or self._page is None:
             return None
         try:

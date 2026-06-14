@@ -1,5 +1,35 @@
 # Project Ledger
 
+## 2026-06-13 — PR review fixes (high-effort review of feat/site-down-detection)
+
+**Context:** Ran a high-effort multi-angle review of the PR. Cross-file tracer clean (all
+callers of the new symbols handle the new types; mypy/626 tests green). Two substantive
+fixes + several documented findings.
+
+**Fixes:**
+- **(bug) Banner→overlay escalation was never captured.** `_record_new_blocks` keyed only on
+  `name not in self._blocks`, so once Betano's non-blocking BANNER put it in `_blocks`, a
+  later escalation to the real blocking OVERLAY — the exact event the capture exists to
+  ground — was silently skipped (no capture, no log). Now also records on a banner→overlay
+  escalation (`is_overlay` False→True), still once-per-episode. New test
+  `test_rg_banner_escalating_to_overlay_is_recaptured`.
+- **(accuracy) Over-claimed backstop.** Docstring said a missed overlay is "backstopped by
+  the placer's place-time fail-close" — but there is NO lockout-aware check at place time;
+  a leg only fails if the server rejects it (descanso enforced server-side, unconfirmed) or
+  via generic naked-leg recovery. A UI-only lockout would let the bet through. Wording
+  corrected to state the gap honestly.
+
+**Findings logged, not yet fixed (lower severity):** (a) already-cold→overlay transition
+doesn't re-alert (stale "re-login" message while suspended_for_cold is already True);
+(b) `_RG_BLOCK_DIALOG_SELECTOR` + scan JS hand-duplicated across session.py + the two recon
+scripts (drift risk for the grounding artifacts); (c) `stale_platforms` duck-typed via
+getattr in the orchestrator (mypy-invisible; a typo silently disables per-book alerting);
+(d) linker reads false-stale when ALL bulk books are empty (documented tradeoff; the
+aggregate alert covers it); (e) freshness key coupling (platform_name vs snap.platform)
+latent if a future bulk scraper's keys diverge.
+
+**State:** branch `feat/site-down-detection`. 627 tests (+1), mypy/ruff clean.
+
 ## 2026-06-13 — RG detection: overlay-gated (kill the Betano banner false-positive)
 
 **Context:** Operator CONFIRMED Betano's "TOMATE UN DESCANSO / 12h descanso" text is a

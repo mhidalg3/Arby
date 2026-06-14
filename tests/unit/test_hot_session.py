@@ -222,6 +222,26 @@ async def test_rg_banner_does_not_suspend_but_is_captured() -> None:
         assert bano.capture_calls == ["betano:tomate un descanso"]  # but evidence captured
 
 
+async def test_rg_banner_escalating_to_overlay_is_recaptured() -> None:
+    """Betano shows the non-blocking banner first; if it ESCALATES to a real overlay
+    lockout, we must re-capture + re-log — without this the platform is already in
+    _blocks from the banner and the exact event we exist to ground is silently skipped."""
+    bano, bsn, g = _FakeTransport(), _FakeTransport(), _guard()
+    m = _mgr(bano, bsn, g)
+    async with m:
+        bano.blocked = SessionBlock("tomate un descanso", is_overlay=False)  # banner first
+        await m.heartbeat()
+        assert bano.capture_calls == ["betano:tomate un descanso"]  # captured once
+        await m.heartbeat()  # banner persists → NOT re-captured
+        assert len(bano.capture_calls) == 1
+        bano.blocked = SessionBlock("tomate un descanso", is_overlay=True)  # escalates to lockout
+        await m.heartbeat()
+        assert len(bano.capture_calls) == 2  # the real overlay IS captured
+        assert m._readiness["betano"] is False  # and now not placeable
+        await m.heartbeat()  # overlay persists → NOT re-captured
+        assert len(bano.capture_calls) == 2
+
+
 async def test_rg_lockout_logs_an_occurrence_for_trigger_learning() -> None:
     """Each new lockout is logged with platform + uptime so the trigger pattern is
     learnable. We assert the readiness state reflects the block (states[betano] False)
