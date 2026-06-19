@@ -1,5 +1,162 @@
 # Project Ledger
 
+## 2026-06-18 — Live armed run: RG/session popup detection + auto-extend
+
+**Context:** First supervised live armed run (`scripts/run_hot_loop.py --arm --yes-real-money`)
+since the feat/site-down-detection branch landed. Goals: validate the existing RG detection
+under real load, and capture the first production overlay to ground `_RG_BLOCK_DIALOG_SELECTOR`.
+The run exposed THREE distinct popup categories the heuristic couldn't see, plus a structural
+bug in the readiness alerting that fired a wrong-platform alert.
+
+**Decisions:**
+- **CDP debug attach** (off by default). `ARBY_CDP_PORT_BASE=N` env var adds
+  `--remote-debugging-port=N+offset` to each platform's Playwright launch (betano +0, betsson
+  +1, betwarrior +2). Lets the assistant attach read-only via puppeteer (`tab.observe`,
+  `tab.screenshot`, read-only `tab.evaluate`) to the operator's logged-in windows. Single
+  surgical change at `session.py:launch_persistent_context`. No new deps. No behavior change
+  when unset.
+- **Multi-platform readiness reporting.** `_probe_readiness` returned ONE platform name (first
+  not-ready, overlay-preferred); when multiple platforms failed concurrently, only one was
+  named and a partial recovery could falsely fire 'ready again'. Now returns the LIST of
+  not-ready platforms; `_apply_health` and `_suspend_alert` updated. Production trigger: a
+  transient Betsson ctx- failure masked a BetWarrior inactivity logout — operator got told to
+  re-login to the wrong window.
+- **Three block categories** in `check_session_blocked` (was one). All share the overlay-vs-
+  banner classification; the `kind` field distinguishes operator action:
+  - `rg_lockout` (default, backward-compat) — mandatory break, operator waits it out.
+  - `session_expired` — already disconnected (BetWarrior 'Estabas desconectado', Betsson
+    'sesión cerrada por falta de actividad'). Backstops the JWT-exp-only readiness probe
+    that can't see a server-side kill before the captured bearer lapses.
+  - `session_timer_warning` — Betano 'Temporizador de sesión': session still alive, modal
+    occludes placement UI.
+  Selector broadened (`#session-timer,.modal-container`) and vis-check fixed (WebKit
+  `offsetParent===null` for `position:fixed` was hiding Betano's outer wrapper).
+- **Auto-extend session** (operator-authorized 2026-06-19). On a `session_timer_warning`
+  overlay, the transport clicks the platform's stable 'conserve session' button (Betano
+  `#st-maintain-button`, grounded from captured DOM). On success, re-probe clears the block
+  and no suspend fires (silent recovery). On failure, falls through to suspend + alert. This
+  is a real bookmaker interaction — the only one authorized so far; documented inline in
+  `InSessionTransport.attempt_session_extend` docstring.
+
+**State:** Gate green (644 passed, +14 from this session; mypy strict clean; ruff clean).
+Bot is live with all four fixes in production. Betsson was on `/maintenance` at relaunch
+(external outage, unrelated to fixes) — kill switch correctly tripped; will auto-reset on
+next heartbeat when Betsson returns. Evidence grounded in `recon/artifacts/rg_blocks/`:
+`betano_session_timer_2026-06-19.dom.html` (full modal DOM with stable IDs) + screenshot.
+Uncommitted on `feat/site-down-detection`.
+
+**Errors (all caught + fixed in-session):**
+- `git stash && ruff-check && git stash pop` chain broke: `ruff --check` exits 1, so the
+  `pop` never ran. Recovered via `git checkout` + `git stash pop`.
+- `#` (Python comment marker) used inside a JS template literal — would have been a syntax
+  error in `_BLOCK_SCAN_JS` at runtime. Fixed to `//`.
+- Duplicate `states`/`blocks` declarations in `_probe_readiness` after a SWAP body restated
+  context that wasn't in the SWAP range. Fixed.
+- Accidentally removed the `if extended: block = await _block(...)` re-probe line during a
+  SWAP to fix a `self._try_extend` typo; ruff F841 + test failures caught it. Restored.
+
+**Reviewer pass (independent, `openai-codex/gpt-5.5:high`, ~2.5 min):** verdict "incorrect"
+(0.91 confidence) — three findings, all valid:
+- **(blocking, regression)** The SWAP that fixed a `#`→`//` JS-comment typo silently ate the
+  `if (el.offsetParent !== null) return true;` fast-path from `_BLOCK_SCAN_JS.vis`. Result:
+  non-fixed overlays (the existing `[role=dialog]`/`.modal` style) would have been filtered
+  out and classified as banners — no suspend, bot would place bets through them. Tests
+  missed it because `_FakePage` doesn't exercise the JS. Restored, fast-path explicitly
+  commented as load-bearing.
+- **(blocking, scope-creep on operator authorization)** `attempt_session_extend` retried
+  every heartbeat (300s) when the click kept failing — exceeded the "single authorized click
+  per popup episode" scope. Added `HotSessionManager._extend_attempted: set[str]`, guarded
+  with one-attempt-per-episode, pruned when the block clears so a future episode re-attempts.
+- **(non-blocking, rule violation)** `ARBY_CDP_PORT_BASE` was read from `os.environ`
+  directly, violating the AGENTS.md config rule. Routed through `Settings.cdp_port_base`
+  (env: `CDP_PORT_BASE`, pydantic-validated `ge=1, le=65535`); dropped the `os` and
+  `Mapping` imports; `_cdp_debug_args` signature simplified to `(platform, port_base: int | None)`.
+
+Gate after reviewer fixes: 644 passed, mypy strict clean, ruff clean. Bot restarted with
+all seven fixes in production; clean startup, no kill switch trip.
+
+**Follow-up (2026-06-19): BetWarrior inactivity popup was being silently downgraded to
+banner.** Operator reported Telegram didn't communicate BetWarrior's "Estabas desconectado"
+popup. Investigation: the bot's heartbeat DID detect the phrase in body text at 01:47:56
+(evidence `recon/artifacts/rg_blocks/betwarrior_1781833676.json`), but classified it as
+`is_overlay=false` (banner, no suspend, no alert). Same root cause as the Betano
+session-timer popup: BetWarrior's modal uses stable IDs (`#sg-modal-backdrop`,
+`#sg-modal-wrapper`) with no `role=dialog`/`aria-modal`, so the existing selector missed it.
+The phrase was only in body text → downgraded to banner. Overnight trip/reset cycles in
+the log (02:19, 04:45, 06:33) were the JWT-exp-only readiness probe flip-flopping, NOT
+the popup being caught.
+
+Fix: added `#sg-modal-backdrop,#sg-modal-wrapper` to `_RG_BLOCK_DIALOG_SELECTOR`.
+Live-validated via CDP replay against the real popup (returned `session_expired,
+is_overlay=true, would_alert=true`; was `banner, no alert` before). Evidence grounded in
+`recon/artifacts/rg_blocks/betwarrior_inactivity_2026-06-19.{dom.html,png}`. Structural
+regression test `test_dialog_selector_includes_known_platform_modal_ids` locks the IDs in.
+
+End-to-end bot→Telegram validation still pending — Playwright's restart page-load
+dismissed the popup before the startup probe ran. Will validate on next natural recurrence.
+
+**Pattern emerging (third instance): every platform's popup uses a non-standard modal
+class/ID that the standard selector misses.** Captures so far: Betano `#session-timer` +
+`.modal-container`; BetWarrior `#sg-modal-backdrop` + `#sg-modal-wrapper`. Betsson's
+popup structure still unknown (next capture). After Betsson is grounded, consider
+rewriting the selector strategy from "enumerate known IDs/classes" to "any visible
+position:fixed/absolute element with text-content matching a known phrase" — broader,
+less capture-dependent.**
+
+**Next:** Live validation pending for three of the four behavioral fixes (multi-platform
+concurrent failure, session_expired, session_timer auto-extend) — they're unit-tested but
+haven't fired in production yet. Commit once you've seen at least one natural reset cycle.
+Consider adding Betsson/BetWarrior extend-button selectors to `_SESSION_EXTEND_BUTTON_SELECTORS`
+as their session-timer popups are captured.
+
+**Live validation update (2026-06-19 ~12:00 local): BetWarrior session_expired fix
+end-to-end-validated.** Natural recurrence of the inactivity-logout popup at 14:59:09 UTC.
+Bot detected it as `is_overlay=true` (the fix), saved evidence
+(`recon/artifacts/rg_blocks/betwarrior_1781881149.json`), alerted operator via Telegram,
+kill switch held through re-login, reset at 15:14:45 once the operator re-logged in AND
+clicked an odd (which fired `coupon/validate.json` → bearer captured). Two of four
+behavioral fixes now live-validated: BetWarrior session_expired + multi-platform readiness
+(suspend held correctly across the episode, reset on full recovery).
+
+**Open: BetWarrior bearer capture is reactive, not active.** `_KAMBI_PLAYER_API =
+"kambicdn.com/player/"` is correct for the placement URL but the SPA only fires
+authenticated player-API calls on user action (adding an odd to the slip →
+`coupon/validate.json`). After a passive login, no player-API call fires, the bearer is
+never captured, `check_betwarrior_ready` returns False indefinitely, kill switch stays
+tripped. Workaround: operator clicks any odd post-login. Real fix: bot actively triggers
+bearer capture (navigate to bet slip OR fetch the player API via `page.evaluate`) on
+startup. Separate commit — distinct from the popup-detection work.
+
+**Follow-up (2026-06-19 ~13:00 local): minimal inactivity-avoidance keepalive added.**
+BetWarrior kept dying because its readiness probe is PASSIVE (bearer-exp check only,
+no network call), so the heartbeat didn't register as server-side activity — unlike
+Betano (/api/balance) and Betsson (ctx- nav), whose heartbeat probes already keep their
+sessions alive. The 2026-06-13 lab result established mouse/scroll alone doesn't defeat
+BetWarrior's inactivity detection; the operator authorized an escalation to include
+occasional clicks. Added:
+- `InSessionTransport.keepalive()`: mouse move (random spot, 4 human-like steps) +
+  scroll nudge (down 120px, back) + 1-in-3 click on a non-interactive area (skips
+  clicks landing on button/a/input/select/textarea). Never raises.
+- `HotSessionManager._keepalive_loop`: dispatches `transport.keepalive()` on every
+  wired transport every `keepalive_sec` (default 90s). Fault-tolerant per transport.
+  Started/stopped alongside the heartbeat + status tasks in `__aenter__`/`__aexit__`.
+- `WarmTransport.keepalive` protocol method.
+- Test: `test_keepalive_loop_dispatches_to_every_wired_transport`.
+
+This is the minimal mechanism the operator asked for. If clicks prove insufficient
+(per the 2026-06-13 lab result for mouse alone, clicks were not tested), the next
+escalation is an active authenticated Kambi API call via `page.evaluate` — separate
+commit. Real-bookmaker-interaction authorization documented inline (operator-authorized
+2026-06-19).
+
+**Reviewer subagent pass validated this session's accumulated diff** (`openai-codex/
+gpt-5.5:high`, ~2.5 min). Three findings, all valid: (1) the JS-comment-typo SWAP had
+silently eaten the `offsetParent !== null` fast-path from `_BLOCK_SCAN_JS.vis` (would
+have downgraded non-fixed overlays to banners); (2) auto-extend retried every heartbeat
+(added `_extend_attempted` per-episode guard); (3) CDP port was read from `os.environ`
+(routed through `Settings.cdp_port_base`). All three fixed before this commit.
+
+
 ## 2026-06-13 — PR review fixes (high-effort review of feat/site-down-detection)
 
 **Context:** Ran a high-effort multi-angle review of the PR. Cross-file tracer clean (all

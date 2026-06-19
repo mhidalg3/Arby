@@ -57,6 +57,14 @@ class WarmTransport(Protocol):
     # On the FIRST detection of a block, dump the overlay DOM + screenshot to ground the
     # exact selector from the real event. Returns the artifact path or None. Never raises.
     async def capture_block_evidence(self, reason: str) -> str | None: ...
+    # Auto-extend a session-timer warning by clicking the platform's "conserve session"
+    # button. Returns True iff the popup dismissed; False → manager falls back to alert.
+    # Real bookmaker interaction — operator-authorized (see InSessionTransport.attempt_session_extend).
+    async def attempt_session_extend(self) -> bool: ...
+    # Minimal inactivity avoidance (mouse/scroll/occasional click). Best-effort;
+    # never raises. See InSessionTransport.keepalive for the operator authorization
+    # and the 2026-06-13 lab result on why mouse-alone isn't enough.
+    async def keepalive(self) -> None: ...
 
 
 class BetssonWarmTransport(WarmTransport, Protocol):
@@ -86,6 +94,11 @@ class HotSessionManager:
         guardrails: Guardrails,
         heartbeat_sec: float = 300.0,
         status_interval_sec: float = 3600.0,
+        # Minimal inactivity avoidance cadence. 90s strikes a balance: frequent enough
+        # that BetWarrior's server-side inactivity timer (a few minutes) resets, sparse
+        # enough not to look like a bot. Independent from the heartbeat (which is a
+        # readiness probe, not user-visible activity).
+        keepalive_sec: float = 90.0,
         login_gate: Callable[[], Awaitable[None]] | None = None,
         arm: bool = True,
         notifier: Notifier | None = None,
@@ -112,9 +125,17 @@ class HotSessionManager:
         self._suspended_for_cold = False  # we tripped the switch for a cold session
         self._readiness: dict[str, bool] = {}  # last probed per-platform readiness
         self._blocks: dict[str, SessionBlock] = {}  # platforms with an RG block (overlay/banner)
+        # Per-platform "we already clicked extend for this popup episode" — prevents
+        # retrying the auto-extend click on every heartbeat when the popup persists and
+        # the click keeps failing (each click is a real bookmaker interaction; the
+        # operator authorization is for ONE attempt per episode, then alert). Pruned
+        # when the block clears so a future popup episode on the same platform re-tries.
+        self._extend_attempted: set[str] = set()
         self._started_at = 0.0  # monotonic bot start (set in __aenter__), for block uptime
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._status_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
+        self._keepalive_sec = keepalive_sec
         self._log = log.bind(component="hot_sessions")
 
     async def __aenter__(self) -> HotSessionManager:
@@ -136,12 +157,17 @@ class HotSessionManager:
         await self._apply_health(await self._probe_readiness())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._status_task = asyncio.create_task(self._status_loop())
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         await self._notifier.send(f"🟢 Bot started — {self._status_line()}")
-        self._log.info("hot_sessions.started", heartbeat_sec=self._heartbeat_sec)
+        self._log.info(
+            "hot_sessions.started",
+            heartbeat_sec=self._heartbeat_sec,
+            keepalive_sec=self._keepalive_sec,
+        )
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        for task in (self._heartbeat_task, self._status_task):
+        for task in (self._heartbeat_task, self._status_task, self._keepalive_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -161,16 +187,21 @@ class HotSessionManager:
             placers["betwarrior-pba"] = BetWarriorLegPlacer(self._betwarrior)  # type: ignore[arg-type]
         return placers
 
-    async def _probe_readiness(self) -> str | None:
+    async def _probe_readiness(self) -> list[str]:
         """Probe every wired platform's session-readiness (the API equivalent of
         "is the place button green"): Betsson re-establishes + verifies its betting
         context; Betano hits /api/balance; BetWarrior checks its bearer exp. EACH is
-        then also checked for a responsible-gambling LOCKOUT overlay — the session can
-        be authenticated (probe green) yet blocked behind a mandatory-break popup, so
-        a platform is placeable only if it's ready AND not blocked. Records the
-        per-platform result (for the status report) and returns the name of a not-ready
-        platform (preferring a BLOCKED one — that's the actionable alert), or None if
-        all are placeable."""
+        then also checked for a responsible-gambling LOCKOUT overlay OR a session-expired
+        popup (inactivity logout) — the session can be authenticated (probe green) yet
+        blocked behind a mandatory-break / killed-session popup, so a platform is
+        placeable only if it's ready AND not overlay-blocked. Records the per-platform
+        result (for the status report) and returns the list of not-ready platform names
+        (overlay-blocked first — that's the actionable alert), empty if all are placeable.
+
+        Returning the FULL list (not just the first not-ready) means concurrent
+        failures all surface in the alert, and "ready again" only fires when EVERY
+        platform is placeable. Previously returned a single name, which masked
+        concurrent failures (one platform's recovery hid another's still-down state)."""
         async def _safe(name: str, coro: Awaitable[bool]) -> bool:
             # A probe that raises (cross-origin fetch, nav fault) means NOT READY —
             # suspend + alert, never crash startup or the heartbeat loop.
@@ -187,6 +218,19 @@ class HotSessionManager:
                 self._log.warning("hot_sessions.block_probe_error", platform=name, error=str(exc))
                 return None
 
+        async def _try_extend(name: str, transport: WarmTransport) -> bool:
+            # Operator-authorized auto-extend (2026-06-19). Logs the outcome; never raises.
+            try:
+                ok = await transport.attempt_session_extend()
+            except Exception as exc:  # noqa: BLE001 — never crash the heartbeat
+                self._log.warning("hot_sessions.extend_error", platform=name, error=str(exc))
+                return False
+            if ok:
+                self._log.info("hot_sessions.session_extended", platform=name)
+            else:
+                self._log.warning("hot_sessions.extend_failed", platform=name)
+            return ok
+
         probes: list[tuple[str, Awaitable[bool], WarmTransport]] = [
             ("betsson", self._betsson.establish_betsson_context(), self._betsson),
             ("betano", self._betano.check_betano_ready(), self._betano),
@@ -201,6 +245,26 @@ class HotSessionManager:
         for name, coro, transport in probes:
             ready = await _safe(name, coro)
             block = await _block(name, transport)
+            # Auto-extend path: if this is a session_timer_warning overlay, click the
+            # platform's "conserve session" button BEFORE deciding to suspend. If the
+            # extend succeeds (popup dismissed on re-probe), the platform stays placeable
+            # and no alert fires — silent recovery. On failure, fall through to the
+            # normal suspend + alert path with the original block. Only attempt for
+            # overlay blocks (a banner doesn't block placement, no extend needed).
+            if (
+                block is not None
+                and block.is_overlay
+                and block.kind == "session_timer_warning"
+                # Only ONE extend attempt per popup episode — the operator authorization
+                # is for a single click, not a retry loop. If the click fails, the suspend
+                # + alert path fires and the operator handles it. The guard is cleared
+                # when the block clears (below), so the next popup episode re-attempts.
+                and name not in self._extend_attempted
+            ):
+                self._extend_attempted.add(name)
+                extended = await _try_extend(name, transport)
+                if extended:
+                    block = await _block(name, transport)  # re-probe; expect None now
             if block is not None:
                 blocks[name] = block
             # Only a true blocking OVERLAY makes a platform not-placeable; a non-blocking
@@ -212,12 +276,16 @@ class HotSessionManager:
         # log NEW lockouts + capture their DOM (uses _blocks as the prior state)
         await self._record_new_blocks(blocks, transports)
         self._blocks = blocks
-        # Prefer naming an OVERLAY-blocked platform (actionable: handle the popup) over a
-        # plain cold one; otherwise the first not-ready platform.
-        overlay_blocked = next((p for p, b in blocks.items() if b.is_overlay), None)
-        if overlay_blocked is not None:
-            return overlay_blocked
-        return next((p for p, ok in states.items() if not ok), None)
+        # Prune the extend-attempted set: any platform whose block has cleared is eligible
+        # for a fresh extend attempt on a future popup episode. (If the block persists,
+        # the platform stays in `blocks` and remains in the attempted set — no retry.)
+        self._extend_attempted &= blocks.keys()
+        # Return ALL not-ready platform names — overlay-blocked first (actionable:
+        # handle the popup), then plain cold. Overlay-blocked platforms are also in
+        # `states` with value False, so exclude them from the cold list to avoid dupes.
+        overlay_blocked = [p for p, b in blocks.items() if b.is_overlay]
+        cold = [p for p, ok in states.items() if not ok and p not in overlay_blocked]
+        return overlay_blocked + cold
 
     async def _record_new_blocks(
         self, blocks: dict[str, SessionBlock], transports: dict[str, WarmTransport]
@@ -283,7 +351,7 @@ class HotSessionManager:
         """Probe all sessions once. Returns True iff every wired platform is placeable."""
         not_ready = await self._probe_readiness()
         self._log.info("hot_sessions.heartbeat", not_ready=not_ready)
-        return not_ready is None
+        return not not_ready
 
     async def _heartbeat_loop(self) -> None:
         """Probe forever. A not-ready session suspends auto-placement + alerts; recovery
@@ -294,18 +362,21 @@ class HotSessionManager:
                 not_ready = await self._probe_readiness()
             except Exception as exc:  # noqa: BLE001 — a fault suspends, never kills the loop
                 self._log.error("hot_sessions.heartbeat_error", error=str(exc))
-                not_ready = "unknown"
+                not_ready = ["unknown"]
             await self._apply_health(not_ready)
 
-    async def _apply_health(self, not_ready: str | None) -> None:
+    async def _apply_health(self, not_ready: list[str]) -> None:
         """Reconcile session readiness with the kill switch + alerts on transitions
         only (so we don't spam an alert every heartbeat while a session stays cold).
-        ``not_ready`` is the name of an un-placeable platform, or None if all ready."""
-        if not_ready is not None and not self._suspended_for_cold:
+        ``not_ready`` is the list of un-placeable platform names (overlay-blocked
+        first); empty iff every platform is placeable. ``not_ready`` non-empty AND
+        not currently suspended ⇒ trip + alert naming ALL not-ready platforms.
+        ``not_ready`` empty AND currently suspended ⇒ reset + "ready again"."""
+        if not_ready and not self._suspended_for_cold:
             self._suspended_for_cold = True
             self._guardrails.trip_kill_switch(_NOT_READY_REASON)
             await self._notifier.send(self._suspend_alert(not_ready))
-        elif not_ready is None and self._suspended_for_cold:
+        elif not not_ready and self._suspended_for_cold:
             self._suspended_for_cold = False
             # Reset only OUR trip — leave a hard freeze / daily-loss stop in place.
             if self._guardrails.kill_switch_reason == _NOT_READY_REASON:
@@ -317,19 +388,47 @@ class HotSessionManager:
                     f"({self._guardrails.kill_switch_reason}) — resolve + restart to resume."
                 )
 
-    def _suspend_alert(self, not_ready: str) -> str:
-        """The operator alert for a suspend transition — popup-specific when the named
-        platform is behind an RG lockout (so the operator knows to handle the popup,
-        not re-login), else the generic cold-session message."""
-        block = self._blocks.get(not_ready)
-        if block is not None and block.is_overlay:
-            return (
-                f'🚫 {not_ready} — responsible-gambling LOCKOUT ("{block.phrase}") is blocking '
-                f"the window. Auto-placement suspended. Handle it in the {not_ready} window "
-                "(it may be a mandatory break — placement can't resume until it clears); "
-                "I'll resume automatically. Detection keeps running."
-            )
+    async def _keepalive_loop(self) -> None:
+        """Periodic inactivity avoidance — dispatches ``transport.keepalive()`` on each
+        wired platform every ``keepalive_sec``. Faults are logged but never crash the
+        loop (one transport's failure must not stop keepalive on the others). The
+        heartbeat's readiness probes already register as server-side activity for
+        Betano (/api/balance) and Betsson (ctx- nav); this loop covers BetWarrior
+        (whose readiness probe is passive) and any other platform that lacks an
+        authenticated heartbeat probe."""
+        while True:
+            await asyncio.sleep(self._keepalive_sec)
+            for transport in (self._betano, self._betsson, self._betwarrior):
+                if transport is None:
+                    continue
+                try:
+                    await transport.keepalive()
+                except Exception as exc:  # noqa: BLE001 — never crash the loop
+                    self._log.warning(
+                        "hot_sessions.keepalive_error",
+                        platform=getattr(transport, "_platform", "?"),
+                        error=str(exc),
+                    )
+
+    def _suspend_alert(self, not_ready: list[str]) -> str:
+        """The operator alert for a suspend transition — per-platform state surfaced
+        (RG lockout vs session-timer vs session-expired vs cold) so the operator knows
+        what to do per window. Lists ALL not-ready platforms (concurrent failures all
+        surface — the first-not-ready masking bug stayed silent on the second)."""
+
+        def _segment(name: str) -> str:
+            block = self._blocks.get(name)
+            if block is not None and block.is_overlay:
+                if block.kind == "session_expired":
+                    return f'{name} 🔌 SESSION EXPIRED ("{block.phrase}") — re-login'
+                if block.kind == "session_timer_warning":
+                    return f'{name} ⏱️ SESSION TIMER ("{block.phrase}") — extend or re-login'
+                return f'{name} 🚫 RG LOCKOUT ("{block.phrase}") — handle the popup'
+            return f"{name} (cold)"
+
+        who = ", ".join(_segment(n) for n in not_ready)
         return (
-            f"🔌 {not_ready} session NOT READY — auto-placement suspended. Re-log into the "
-            f"{not_ready} window; I'll resume automatically. Detection keeps running."
+            f"🔌 Sessions NOT READY — auto-placement suspended. Not placeable: {who}. "
+            "Resolve each window (re-login or handle the popup); I'll resume automatically. "
+            "Detection keeps running."
         )

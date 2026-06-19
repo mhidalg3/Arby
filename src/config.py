@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     log_format: str = Field(default="json")
 
+    # Debug: CDP attach point for the operator's assistant to read-only inspect live
+    # betting windows (observe / screenshot / read DOM). Off by default. When set to N,
+    # exposes Chrome DevTools Protocol on localhost:N+per-platform-offset (betano +0,
+    # betsson +1, betwarrior +2). See src/execution/session.py:_cdp_debug_args.
+    cdp_port_base: int | None = Field(default=None, ge=1, le=65535)
+
 
 @lru_cache
 def get_settings() -> Settings:

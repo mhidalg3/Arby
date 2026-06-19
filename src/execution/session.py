@@ -20,12 +20,15 @@ import base64
 import binascii
 import contextlib
 import json
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 
 import structlog
+
+from src.config import get_settings
 
 log = structlog.get_logger(__name__)
 
@@ -63,20 +66,90 @@ _RG_BLOCK_PHRASES: Final[tuple[str, ...]] = (
     "cuánto tiempo llevás",
 )
 
+# Session-expired phrases (lowercased). These appear when a PBA platform has terminated
+# the session server-side — typically an inactivity logout (BetWarrior's "Estabas
+# desconectado / Su sesión se terminó por inactividad", Betsson's "sesión cerrada por
+# falta de actividad"). The captured bearer / ctx- / balance probe may keep passing for
+# minutes (the JWT `exp` is set at issuance, not at session kill — see ledger 2026-06-10
+# "BetWarrior inactivity logout"), so the readiness probe reads GREEN while the window
+# is unusable behind this popup. The popup itself is the backstop signal. Operator action
+# differs from RG lockout: re-login (not wait out a mandatory break).
+_SESSION_EXPIRED_PHRASES: Final[tuple[str, ...]] = (
+    "estabas desconectado",
+    "se terminó por inactividad",
+    "su sesión se terminó",
+    "sesión cerrada por falta de actividad",
+    "volver a iniciar sesión",
+)
+
+# Session-timer phrases (lowercased). These appear when a PBA platform is WARNING that
+# the session is about to expire (session still alive, action optional) — Betano's
+# "Temporizador de sesión" popup with "Sí, conservarlo" / "No, quiero desconectarme".
+# Distinct from session_expired (already dead) and rg_lockout (mandatory break): the
+# session is still usable until the timer lapses, but the modal occludes the betting UI
+# (placement would fail behind it). Operator (or auto-click) action: extend the session.
+_SESSION_TIMER_PHRASES: Final[tuple[str, ...]] = (
+    "temporizador de sesión",
+    "¿querés conservarlo?",
+    "sí, conservarlo",
+    "quiero desconectarme",
+    "tu sesión está activa por",
+)
+
 # Visible modal/overlay selector — used by capture_block_evidence to dump the block's
 # markup. A populated `dialogs` list means a true blocking OVERLAY; an empty one with a
 # phrase hit means a non-blocking BANNER (e.g. Betano's "12h descanso"). This is exactly
 # the distinction we need to ground but couldn't reproduce in the lab.
-_RG_BLOCK_DIALOG_SELECTOR = "[role=dialog],[aria-modal=true],.modal,.overlay,.modal-overlay"
+_RG_BLOCK_DIALOG_SELECTOR = (
+    # Standard ARIA + legacy class names (React Aria / Radix / MUI / plain .modal).
+    "[role=dialog],[aria-modal=true],.modal,.overlay,.modal-overlay,"
+    # Betano-specific (captured 2026-06-19): #session-timer is the stable outer id of
+    # the session-timer popup; .modal-container is Betano's generic modal class. Neither
+    # matches .modal (CSS class selectors are not substring matches). Add other platforms'
+    # classes here as their popup DOMs are captured.
+    "#session-timer,.modal-container,"
+    # BetWarrior-specific (captured 2026-06-19): the inactivity-logout popup
+    # ("Estabas desconectado") + session-summary popup both use stable IDs on a
+    # styled-components shell — sg-modal-backdrop is position:fixed z-index 100000000
+    # (the visible backdrop), sg-modal-wrapper is the inner content. Neither has
+    # role=dialog nor aria-modal. Multiple sg-modal-backdrop siblings can co-exist.
+    "#sg-modal-backdrop,#sg-modal-wrapper"
+)
 # Where the first production block dumps its DOM + screenshot, so the exact lockout
 # selector is grounded from the real event.
 _BLOCK_EVIDENCE_DIR = REPO_ROOT / "recon" / "artifacts" / "rg_blocks"
+
+# Per-platform "conserve session" button selectors — clicked by ``attempt_session_extend``
+# to auto-recover from a session_timer_warning popup. Betano's is grounded from the
+# captured DOM (id="st-maintain-button", 2026-06-19). Add other platforms' button
+# selectors here as their session-timer popups are captured. Absence from this mapping
+# means the platform has no known auto-extend path → manager falls back to suspend + alert.
+# Operator-authorized 2026-06-19 (per AGENTS.md: explicit confirmation for any real-
+# bookmaker interaction; the click is the same action the operator would take manually).
+_SESSION_EXTEND_BUTTON_SELECTORS: Final[dict[str, str]] = {
+    "betano": "#st-maintain-button",
+}
 
 # Returns the visible-overlay text and the full body text (both lowercased) so the
 # Python side can match RG phrases and classify overlay-vs-banner. Matching is kept in
 # Python (testable); the JS only extracts text.
 _BLOCK_SCAN_JS = """({sel}) => {
-    const vis = el => el.offsetParent !== null && el.getBoundingClientRect().width > 0;
+    const vis = el => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        // Fast path: any element with a valid offsetParent is visible. Covers absolute /
+        // relative / static / sticky positioned overlays (the common [role=dialog],
+        // .modal, .modal-overlay cases). MUST stay above the fixed-position fallback so
+        // existing non-fixed popups keep matching as overlays.
+        if (el.offsetParent !== null) return true;
+        // Fallback: WebKit returns offsetParent === null for position: fixed (Betano's
+        // session-timer outer wrapper is fixed) AND for display: none. Accept fixed
+        // elements as visible if their computed style says they're shown. (display: none
+        // elements already failed the rect check above with zero width/height.)
+        const cs = getComputedStyle(el);
+        return cs.position === 'fixed' && cs.display !== 'none' && cs.visibility !== 'hidden';
+    };
     let overlayText = '';
     for (const el of document.querySelectorAll(sel)) {
         if (vis(el)) overlayText += ' ' + (el.innerText || '');
@@ -88,18 +161,56 @@ _BLOCK_SCAN_JS = """({sel}) => {
 }"""
 
 
+_CDP_PORT_OFFSETS: Final[dict[str, int]] = {
+    "betano": 0,
+    "betsson": 1,
+    "betwarrior": 2,
+}
+
+
+def _cdp_debug_args(platform: str, port_base: int | None) -> list[str]:
+    """Per-platform Chromium CDP args, derived from ``Settings.cdp_port_base``.
+
+    Off by default — when ``port_base`` is None, returns ``[]`` so launch behavior is
+    identical to before. When set to N, exposes Chrome DevTools Protocol on
+    ``localhost:{N+offset}`` for each platform (betano +0, betsson +1, betwarrior +2),
+    letting an external READ-ONLY client (the operator's assistant via puppeteer CDP
+    attach) observe the accessibility tree, screenshot, and read DOM of the logged-in
+    window.
+
+    Read-only is a hard contract: navigate / click / side-effecting evaluate on a live
+    betting session can disrupt real-money placement. Port range / type validation is
+    handled by pydantic in Settings (``ge=1, le=65535``); this helper trusts its input.
+    """
+    if port_base is None:
+        return []
+    port = port_base + _CDP_PORT_OFFSETS.get(platform, 0)
+    return [f"--remote-debugging-port={port}"]
+
+
 @dataclass(frozen=True)
 class SessionBlock:
-    """A responsible-gambling block detected on the betting window.
+    """A block detected on the betting window that makes it unusable for placement.
 
-    ``is_overlay`` True ⇒ the RG phrase sits inside a visible blocking modal/overlay — a
-    real LOCKOUT that suspends placement. False ⇒ the phrase is only in the page text with
-    no overlay — a non-blocking BANNER (e.g. Betano's "12h descanso", confirmed placeable),
-    which is logged + captured but does NOT suspend.
+    Two ``kind`` values (both go through the same overlay-vs-banner classification;
+    both suspend placement when they appear as a visible overlay):
+    - ``"rg_lockout"`` — responsible-gambling mandatory break (e.g. Betano's
+      "Tomate un descanso"). May not be resolvable by re-login; operator may need to
+      wait out the break.
+    - ``"session_expired"`` — session terminated server-side (e.g. BetWarrior's
+      inactivity logout "Estabas desconectado"). Operator re-logs in to resolve. The
+      captured bearer's JWT ``exp`` may not have lapsed yet, so the readiness probe
+      alone can't see it — this popup is the backstop detection.
+
+    ``is_overlay`` True ⇒ the phrase sits inside a visible blocking modal/overlay — a
+    real LOCKOUT that suspends placement. False ⇒ the phrase is only in the page text
+    with no overlay — a non-blocking BANNER (e.g. Betano's "12h descanso", confirmed
+    placeable), which is logged + captured but does NOT suspend.
     """
 
     phrase: str
     is_overlay: bool
+    kind: str = "rg_lockout"
 
 
 def _jwt_exp(token: str) -> float | None:
@@ -211,6 +322,10 @@ class InSessionTransport:
             # (-34.60, -58.38) route to the CABA jurisdiction instead; PBA ≠ the city.
             permissions=["geolocation"],
             geolocation={"latitude": -34.9215, "longitude": -57.9545},
+            # READ-ONLY CDP attach point for the operator's assistant. Off by default;
+            # set Settings.cdp_port_base (env: CDP_PORT_BASE) to expose CDP on
+            # localhost:N+per-platform-offset. See _cdp_debug_args.
+            args=_cdp_debug_args(self._platform, get_settings().cdp_port_base),
         )
         await apply_stealth(self._context)
         # Capture the authenticated context header set (Betsson `ctx-`); harmless
@@ -392,11 +507,119 @@ class InSessionTransport:
         # only in page text (no overlay) = a non-blocking banner.
         for phrase in _RG_BLOCK_PHRASES:
             if phrase in overlay_text:
-                return SessionBlock(phrase=phrase, is_overlay=True)
+                return SessionBlock(phrase=phrase, is_overlay=True, kind="rg_lockout")
         for phrase in _RG_BLOCK_PHRASES:
             if phrase in body_text:
-                return SessionBlock(phrase=phrase, is_overlay=False)
+                return SessionBlock(phrase=phrase, is_overlay=False, kind="rg_lockout")
+        # Session-expired popups (inactivity logout, server-side kill) — same overlay-vs-
+        # banner classification, distinct kind so the alert can tell the operator to
+        # re-login (vs wait out an RG break). Backstops the JWT-exp-only readiness probe
+        # that can't see a server-side kill before the captured bearer lapses.
+        for phrase in _SESSION_EXPIRED_PHRASES:
+            if phrase in overlay_text:
+                return SessionBlock(phrase=phrase, is_overlay=True, kind="session_expired")
+        for phrase in _SESSION_EXPIRED_PHRASES:
+            if phrase in body_text:
+                return SessionBlock(phrase=phrase, is_overlay=False, kind="session_expired")
+        # Session-timer warnings (Betano "Temporizador de sesión") — session still alive
+        # but expiring, modal occludes the betting UI. Same overlay-vs-banner rule: a
+        # visible overlay suspends (placement would fail behind it); body-only is a
+        # non-blocking banner. Distinct kind so the alert can tell the operator to extend
+        # the session (vs re-login or wait out an RG break).
+        for phrase in _SESSION_TIMER_PHRASES:
+            if phrase in overlay_text:
+                return SessionBlock(phrase=phrase, is_overlay=True, kind="session_timer_warning")
+        for phrase in _SESSION_TIMER_PHRASES:
+            if phrase in body_text:
+                return SessionBlock(phrase=phrase, is_overlay=False, kind="session_timer_warning")
         return None
+
+    async def attempt_session_extend(self) -> bool:
+        """Auto-extend a session-timer warning by clicking the platform's "conserve
+        session" button (Betano's ``Sí, conservarlo``). Returns True iff the click
+        landed AND the popup dismissed within ~1s; False otherwise (no platform mapping,
+        no button, click fault, popup persisted). On False the manager falls back to
+        the normal suspend + alert path.
+
+        REAL BOOKMAKER INTERACTION — clicks a button in a logged-in betting window.
+        Operator-authorized 2026-06-19 (AGENTS.md: explicit confirmation required). The
+        risk surface is minimal: same action the operator takes manually, no bet placed,
+        no account state modified. Logs every attempt for audit."""
+        if self._dry_run or self._page is None:
+            return False
+        button_sel = _SESSION_EXTEND_BUTTON_SELECTORS.get(self._platform)
+        if button_sel is None:
+            return False  # no known extend button for this platform → fall back to alert
+        try:
+            async with self._page_lock:
+                button = await self._page.query_selector(button_sel)
+                if button is None:
+                    return False  # popup already dismissed, or wrong selector
+                self._log.info(
+                    "transport.session_extend_click", platform=self._platform, selector=button_sel
+                )
+                await button.click()
+                # Poll up to 1s for the button to disappear (proxy for popup dismissal).
+                for _ in range(10):
+                    await asyncio.sleep(0.1)
+                    if await self._page.query_selector(button_sel) is None:
+                        return True
+                self._log.warning(
+                    "transport.session_extend_failed_popup_did_not_dismiss",
+                    platform=self._platform, selector=button_sel,
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001 — extend must never crash the heartbeat
+            self._log.warning("transport.session_extend_error", error=str(exc))
+            return False
+
+    async def keepalive(self) -> None:
+        """Minimal inactivity avoidance — mouse move + scroll nudge + an occasional
+        click on a non-interactive area of the viewport. Best-effort; never raises.
+
+        REAL BOOKMAKER INTERACTION — synthetic user activity in a logged-in betting
+        window. Operator-authorized 2026-06-19. The 2026-06-13 lab result established
+        that mouse + scroll ALONE do not defeat BetWarrior's server-side inactivity
+        detection (the SPA fires zero bearer-bearing requests in steady state, so the
+        session times out without user action). This method adds OCCASIONAL CLICKS as
+        the escalation; if clicks prove insufficient too, the next step is an active
+        authenticated Kambi API call via ``page.evaluate`` (separate commit). For
+        Betano + Betsson the heartbeat's authenticated readiness probes
+        (``/api/balance``, ctx- nav) already register as server-side activity — this
+        keepalive is primarily for BetWarrior, but applied uniformly because it's cheap
+        and there's no reason to special-case."""
+        if self._dry_run or self._page is None:
+            return
+        try:
+            async with self._page_lock:
+                # Human-like mouse move to a random viewport spot (4 intermediate steps
+                # so the motion curve looks real, not a teleport).
+                x = random.randint(150, 900)
+                y = random.randint(150, 550)
+                await self._page.mouse.move(x, y, steps=4)
+                # Small scroll nudge and back — no net navigation, no scroll-position
+                # disruption to whatever the operator may be doing in the window.
+                await self._page.mouse.wheel(0, 120)
+                await asyncio.sleep(0.3)
+                await self._page.mouse.wheel(0, -120)
+                # Occasional click on a non-interactive area. The element-from-point
+                # check skips clicks that would land on a button/link/input/select —
+                # we only want the activity signal, never to trigger a real action.
+                if random.random() < 0.34:
+                    cx = random.randint(200, 800)
+                    cy = random.randint(200, 500)
+                    tag = await self._page.evaluate(
+                        "(x, y) => {"
+                        "  const e = document.elementFromPoint(x, y);"
+                        "  return e ? e.tagName.toLowerCase() : '';"
+                        "}",
+                        cx,
+                        cy,
+                    )
+                    if tag not in {"button", "a", "input", "select", "textarea"}:
+                        await self._page.mouse.click(cx, cy, delay=50)
+        except Exception as exc:  # noqa: BLE001 — keepalive must never crash the bot
+            self._log.warning("transport.keepalive_error", platform=self._platform, error=str(exc))
 
     async def capture_block_evidence(self, reason: str) -> str | None:
         """On the FIRST detection of a session block, dump the page's visible text + any
