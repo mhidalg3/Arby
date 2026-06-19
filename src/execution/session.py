@@ -609,12 +609,11 @@ class InSessionTransport:
                     cx = random.randint(200, 800)
                     cy = random.randint(200, 500)
                     tag = await self._page.evaluate(
-                        "(x, y) => {"
+                        "({x, y}) => {"
                         "  const e = document.elementFromPoint(x, y);"
                         "  return e ? e.tagName.toLowerCase() : '';"
                         "}",
-                        cx,
-                        cy,
+                        {"x": cx, "y": cy},
                     )
                     if tag not in {"button", "a", "input", "select", "textarea"}:
                         await self._page.mouse.click(cx, cy, delay=50)
