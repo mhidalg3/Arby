@@ -1,5 +1,32 @@
 # Project Ledger
 
+## 2026-06-19 — Post-crash recovery: commit orphaned AGENTS.md refactor
+
+**Context:** omp crashed mid-session with `zsh: trace trap omp` (SIGTRAP in the
+harness process itself ~13:30 local — a omp bug, NOT a code regression; a fresh omp
+process rebooted at 13:30:58). Reconstruction from git + `~/.omp/agent/history.db`:
+the last explicit task (prompt #14, "inactivity avoidance… consider that and then
+commit") was already DONE and committed — `8277b85` (keepalive) + `f8b4267`
+(`page.evaluate` arg-count fix, caught on first live run). The ONLY uncommitted
+change was an `AGENTS.md` refactor (mtime 01:14, orphaned from the overnight
+live-run session, never committed through ~12h of subsequent scoped source commits).
+
+**Decision:** The AGENTS.md refactor was coherent but did NOT trace to any logged
+user request — by the surgical-changes rule I flagged it rather than silently
+committing. Operator reviewed and chose to commit it. It aligns the project doc
+with the global harness instruction model: drops the now-duplicated Tone section
+(owned by `APPEND_SYSTEM.md`, higher authority), adds a Correctness-critical modules
+/ frontier-tier section mirroring global model-routing, tightens conventions +
+collapses the commands block. Corrected the Python pin `3.11+` → `3.13` to match
+`.python-version` (verified accurate against repo: asyncio_mode=auto,
+--strict-markers, mypy strict=true, migrations/init.sql present).
+
+**State:** commit `76a1965` on `feat/site-down-detection` (3 ahead of origin).
+Working tree clean. ruff + mypy strict clean; 37 session/keepalive tests pass.
+No behavioral change — docs only. Keepalive work remains the substantive recent
+deliverable (live, reviewer-validated per the entry below); its open follow-up is
+the documented Kambi active-bearer-capture escalation if clicks prove insufficient.
+
 ## 2026-06-18 — Live armed run: RG/session popup detection + auto-extend
 
 **Context:** First supervised live armed run (`scripts/run_hot_loop.py --arm --yes-real-money`)
