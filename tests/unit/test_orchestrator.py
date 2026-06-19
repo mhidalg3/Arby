@@ -77,6 +77,24 @@ class _Recovery:
         return RecoveryOutcome.UNRESOLVED
 
 
+class _Recorder:
+    """Recording audit recorder — captures every opportunity/execution call."""
+
+    def __init__(self) -> None:
+        self.opps: list[tuple] = []
+        self.execs: list[tuple] = []
+        self._next = 1
+
+    async def record_opportunity(self, market_id, opp, decision) -> int:  # type: ignore[no-untyped-def]
+        self.opps.append((market_id, opp, decision))
+        oid = self._next
+        self._next += 1
+        return oid
+
+    async def record_execution(self, opportunity_id, opp, result) -> None:  # type: ignore[no-untyped-def]
+        self.execs.append((opportunity_id, opp, result))
+
+
 def _guard() -> Guardrails:
     return Guardrails(
         max_position_per_match_ars=100_000.0,
@@ -102,6 +120,7 @@ def _orch(
     guard: Guardrails,
     placers: dict[str, _Placer],
     notifier: _Notifier | None = None,
+    recorder: _Recorder | None = None,
     empty_alert_after: int = 5,
 ) -> ArbOrchestrator:
     ex = Executor(
@@ -118,6 +137,7 @@ def _orch(
         budget_ars=1000.0,
         min_margin_pct=1.0,
         notifier=notifier,
+        recorder=recorder,  # type: ignore[arg-type]
         empty_alert_after=empty_alert_after,
     )
 
@@ -225,3 +245,29 @@ async def test_per_platform_ingestion_stall_alerts_once_then_recovers() -> None:
     src.stale = {}
     await orch.run_once()  # scrape returns → recovery alert
     assert any("betsson-pba ingestion recovered" in m for m in note.sent)
+
+
+async def test_approved_arb_records_opportunity_and_execution() -> None:
+    """An approved, auto-placed arb is recorded both as an opportunity (with the
+    durable id returned) and as its execution outcome."""
+    g = _guard()
+    bp, ap = _Placer(), _Placer()
+    rec = _Recorder()
+    orch = _orch(_FakeQuoteSource(_arb_market()), g, {"betsson": bp, "betano": ap}, recorder=rec)
+    await orch.run_once()
+    assert len(rec.opps) == 1
+    assert len(rec.execs) == 1
+    assert rec.execs[0][0] == 1  # the id returned by record_opportunity
+
+
+async def test_kill_switch_handoff_records_opportunity_not_execution() -> None:
+    """A tripped kill switch hands the arb off for manual placement: the
+    opportunity is still recorded (as APPROVED) but no execution is."""
+    g = _guard()
+    g.trip_kill_switch("session cold")
+    bp, ap = _Placer(), _Placer()
+    rec = _Recorder()
+    orch = _orch(_FakeQuoteSource(_arb_market()), g, {"betsson": bp, "betano": ap}, recorder=rec)
+    await orch.run_once()
+    assert len(rec.opps) == 1
+    assert rec.execs == []

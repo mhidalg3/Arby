@@ -1,5 +1,71 @@
 # Project Ledger
 
+## 2026-06-19 — Hot-path audit persistence (armed sessions → Postgres)
+
+**Context:** The armed hot loop (`scripts/run_hot_loop.py --arm --yes-real-money`)
+detected → risk-gated → placed real bets entirely in memory: `get_session` was
+imported nowhere, the `Opportunity`/`Placement` ORM models were never constructed,
+Postgres stayed empty. So an armed session left NO durable structured record of
+what was detected/placed — only stdout logs + Telegram. This wires a fail-soft,
+time-bounded persistence layer so every APPROVED arb + its execution outcome lands
+in Postgres, queryable for audit. End state: after an armed run, `SELECT … FROM
+opportunities`/`placements` shows each detected+approved arb, its legs, the risk
+verdict, and per-leg fills.
+
+**Decisions:**
+- **Reuse `opportunities`/`placements`** (not a new audit table). AGENTS rule
+  forbids a second parallel convention; tables were empty so reshaping was free.
+  Reshaped the 2-leg-centric schema to N-leg: dropped `platform_a/b`,
+  `decimal_odds_a/b`, `target_stake_a/b`; added `market_id`, `legs JSONB`,
+  `risk_confidence`, `high_margin_warning`, `execution_reason`; made
+  `partition_pair_id` nullable (hot path has no partition-pair provenance; a
+  future semantic pipeline can still set it); added `frozen` enum member;
+  widened `placements.leg` CHECK `('a','b')` → `^[a-z]$`; added
+  `idx_opportunities_market`.
+- **Recorder seam (`src/execution/audit.py`)**: `AuditRecorder` Protocol +
+  `NullRecorder`, mirroring the `Notifier`/`NullNotifier` pattern. No storage
+  import — importing the orchestrator never creates the DB engine.
+- **`PostgresAuditRecorder` (`src/storage/audit_recorder.py`)**: translates
+  domain objects → rows. Imported ONLY by `run_hot_loop` (composition root), so
+  the engine connects only in the armed path. **Every call is fail-soft AND
+  time-bounded (`asyncio.wait_for`, 3s)**: a DB error OR a stall returns
+  None/skips — audit can never raise into the loop or block a placement.
+- **Orchestrator hook**: after the arb alert, `record_opportunity` (APPROVED
+  arbs only — REJECTED stay structlog-only to avoid dedup-less row spam); after
+  execute, `record_execution` if an id was returned. Kill-switch handoffs record
+  the opportunity but no execution.
+- **Live-only wiring**: `recorder=PostgresAuditRecorder() if live else None` in
+  `run_hot_loop` — dry-run stays DB-free.
+
+**Latent model bugs surfaced + fixed** (the models were never exercised before;
+  first insert exposed them):
+- `values_callable=lambda e: [m.value for m in e]` on the `Enum(OpportunityStatus)`
+  column — SQLAlchemy defaulted to enum NAMES (`APPROVED`) but Postgres stores
+  lowercase VALUES (`approved`); inserts failed with InvalidTextRepresentation.
+- `passive_deletes=True` on `Opportunity.placements` — ORM `s.delete(opportunity)`
+  tried to null child FKs before the DB's ON DELETE CASCADE, violating NOT NULL.
+
+**State:** All 6 plan steps done. mypy strict clean; ruff check clean; 648 unit
+tests pass (incl. 2 new orchestrator recorder tests); 2 integration tests pass
+(COMPLETED + ABORTED round-trips against real Postgres, DB left clean). Schema
+applied to live DB via `docker compose down -v && up -d` (tables were empty).
+Reviewer pass ran; 1 blocking finding (audit stall could block placement — see
+Errors) resolved with the 3s `wait_for` bound.
+
+**Errors:**
+- Reviewer (priority-1): fail-soft caught exceptions but NOT stalls — a hung
+  Postgres (lock wait / disk full, not an immediate error) would leave
+  `await record_opportunity(...)` pending and the bet unplaced. Resolved by
+  bounding both recorder calls with `asyncio.wait_for(..., timeout=3.0)`: a
+  stall cancels the write (rolled back via get_session's exit), logs, returns
+  None; placement proceeds. Trade-off: a >3s audit write is lost (logged), but a
+  time-sensitive arb placement is never delayed by audit. 3s is generous for
+  localhost (writes are sub-50ms); only trips when the DB is genuinely unhealthy.
+- Integration test initially failed on the two latent model bugs above; both
+  fixed in `models.py` (no schema change needed — the DB enum values were already
+  lowercase; the fixes are ORM-side serialization/cascade).
+
+
 ## 2026-06-19 — Post-crash recovery: commit orphaned AGENTS.md refactor
 
 **Context:** omp crashed mid-session with `zsh: trace trap omp` (SIGTRAP in the

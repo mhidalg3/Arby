@@ -95,35 +95,40 @@ CREATE TYPE opportunity_status AS ENUM (
     'completed',
     'aborted_pre_execution',
     'aborted_post_leg_a',  -- naked exposure incident
-    'expired'
+    'expired',
+    'frozen'               -- recovery failed / unexpected state — halt
 );
 
+-- The hot path is N-leg (2-outcome O/U and 3-outcome 1X2) with no partition-pair
+-- provenance, so the legs live in a JSONB array and partition_pair_id is nullable.
+-- A future semantic pipeline can still populate partition_pair_id.
 CREATE TABLE IF NOT EXISTS opportunities (
     id              BIGSERIAL PRIMARY KEY,
     detected_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    partition_pair_id BIGINT NOT NULL REFERENCES partition_pairs(id),
-    platform_a      TEXT NOT NULL,
-    platform_b      TEXT NOT NULL,
-    decimal_odds_a  DOUBLE PRECISION NOT NULL,
-    decimal_odds_b  DOUBLE PRECISION NOT NULL,
-    target_stake_a  DOUBLE PRECISION NOT NULL,
-    target_stake_b  DOUBLE PRECISION NOT NULL,
-    expected_margin_pct DOUBLE PRECISION NOT NULL,
+    market_id       TEXT NOT NULL,   -- orchestrator's canonical market key (dedup id)
+    partition_pair_id BIGINT REFERENCES partition_pairs(id),  -- NULL from the hot path
+    legs            JSONB NOT NULL,  -- [{"platform","outcome","decimal_odds","target_stake"}, ...]
+    expected_margin_pct DOUBLE PRECISION NOT NULL,  -- realized ROI shown in the alert
     expected_profit DOUBLE PRECISION NOT NULL,
-    adaptive_threshold_pct DOUBLE PRECISION,
-    garch_variance  DOUBLE PRECISION,
+    risk_confidence DOUBLE PRECISION,               -- RiskDecision.confidence (nullable)
+    high_margin_warning BOOLEAN NOT NULL DEFAULT FALSE,  -- RiskDecision.high_margin_warning
+    adaptive_threshold_pct DOUBLE PRECISION,        -- NULL from the hot path
+    garch_variance  DOUBLE PRECISION,               -- NULL from the hot path
     status          opportunity_status NOT NULL DEFAULT 'detected',
-    status_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    status_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    execution_reason TEXT                           -- ExecutionResult.reason (aborted/naked/frozen)
 );
 
 CREATE INDEX idx_opportunities_status ON opportunities (status, detected_at DESC);
+CREATE INDEX idx_opportunities_market ON opportunities (market_id, detected_at DESC);
 
 -- ===== Placements =====
 -- One row per actual bet placement attempt. Linked to an opportunity.
+-- `leg` is 'a','b','c',... — one per leg of an N-leg arb.
 CREATE TABLE IF NOT EXISTS placements (
     id              BIGSERIAL PRIMARY KEY,
     opportunity_id  BIGINT NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,
-    leg             CHAR(1) NOT NULL CHECK (leg IN ('a', 'b')),
+    leg             CHAR(1) NOT NULL CHECK (leg ~ '^[a-z]$'),
     platform        TEXT NOT NULL,
     submitted_at    TIMESTAMPTZ NOT NULL,
     confirmed_at    TIMESTAMPTZ,

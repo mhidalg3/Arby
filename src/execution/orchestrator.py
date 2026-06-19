@@ -29,6 +29,7 @@ import structlog
 from src.arbitrage.dutch_book import ArbitrageOpportunity, detect_arbitrage
 from src.arbitrage.quotes import OddsQuote
 from src.execution.arb_executor import execute_opportunity
+from src.execution.audit import AuditRecorder, NullRecorder
 from src.execution.executor import ExecutionResult, Executor
 from src.execution.guardrails import Guardrails
 from src.execution.notify import Notifier, NullNotifier
@@ -70,6 +71,7 @@ class ArbOrchestrator:
         min_margin_pct: float = 1.0,
         dynamic_stake_cap_ars: float | None = None,
         notifier: Notifier | None = None,
+        recorder: AuditRecorder | None = None,
         empty_alert_after: int = 5,
         platform_stale_after_sec: float = 180.0,
     ) -> None:
@@ -83,6 +85,7 @@ class ArbOrchestrator:
         # carries no max_stake — without it their guardrail fail-closes.
         self._dynamic_cap = dynamic_stake_cap_ars
         self._notifier = notifier or NullNotifier()
+        self._recorder = recorder or NullRecorder()
         # Alert once if detection produces no market data for this many consecutive
         # cycles (ingestion stalled/blocked) — without halting; detection retries.
         self._empty_alert_after = empty_alert_after
@@ -128,6 +131,7 @@ class ArbOrchestrator:
             self._executed.add(market_id)
             self._log.info("orchestrator.arb_found", market_id=market_id, roi_pct=opp.realized_roi_pct)
             await self._notifier.send(format_arb_alert(market_id, opp))
+            opp_db_id = await self._recorder.record_opportunity(market_id, opp, decision)
             if self._guardrails.kill_switch_tripped:
                 # Auto-placement suspended (cold session / freeze / daily loss) →
                 # hand off to the operator; keep detecting the rest.
@@ -142,6 +146,8 @@ class ArbOrchestrator:
                 self._executor, opp, opp_id=market_id, dynamic_stake_cap_ars=self._dynamic_cap
             )
             self._log.info("orchestrator.executed", market_id=market_id, outcome=res.outcome)
+            if opp_db_id is not None:
+                await self._recorder.record_execution(opp_db_id, opp, res)
             results.append(res)
         return results
 

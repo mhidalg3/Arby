@@ -28,6 +28,7 @@ from src.execution.guardrails import Guardrails
 from src.execution.hot_session import HotSessionManager
 from src.execution.notify import build_notifier
 from src.execution.orchestrator import ArbOrchestrator
+from src.storage.audit_recorder import PostgresAuditRecorder
 from src.execution.quote_source import OverlapQuoteSource
 from src.execution.recovery import HumanRecoveryHandler
 from src.execution.reverify import LiveOddsReverifier
@@ -178,6 +179,7 @@ async def main() -> int:
                 budget_ars=budget,
                 dynamic_stake_cap_ars=betano_cap,
                 notifier=notifier,
+                recorder=PostgresAuditRecorder() if live else None,
             )
             log.warning("hot_loop.start", live=live, budget=budget, poll=poll)
             await orch.run_forever(poll_interval_sec=poll)  # until Ctrl-C (never self-halts)

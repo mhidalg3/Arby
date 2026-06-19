@@ -106,32 +106,38 @@ class OpportunityStatus(enum.StrEnum):
     ABORTED_PRE_EXECUTION = "aborted_pre_execution"
     ABORTED_POST_LEG_A = "aborted_post_leg_a"  # naked exposure
     EXPIRED = "expired"
+    FROZEN = "frozen"  # recovery failed / unexpected state — halt
 
 
 class Opportunity(Base):
     __tablename__ = "opportunities"
-
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    partition_pair_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("partition_pairs.id"), nullable=False
+    market_id: Mapped[str] = mapped_column(String, nullable=False)
+    partition_pair_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("partition_pairs.id"), nullable=True
     )
-    platform_a: Mapped[str] = mapped_column(String, nullable=False)
-    platform_b: Mapped[str] = mapped_column(String, nullable=False)
-    decimal_odds_a: Mapped[float] = mapped_column(Float, nullable=False)
-    decimal_odds_b: Mapped[float] = mapped_column(Float, nullable=False)
-    target_stake_a: Mapped[float] = mapped_column(Float, nullable=False)
-    target_stake_b: Mapped[float] = mapped_column(Float, nullable=False)
+    legs: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
     expected_margin_pct: Mapped[float] = mapped_column(Float, nullable=False)
     expected_profit: Mapped[float] = mapped_column(Float, nullable=False)
+    risk_confidence: Mapped[float | None] = mapped_column(Float)
+    high_margin_warning: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     adaptive_threshold_pct: Mapped[float | None] = mapped_column(Float)
     garch_variance: Mapped[float | None] = mapped_column(Float)
     status: Mapped[OpportunityStatus] = mapped_column(
-        Enum(OpportunityStatus, name="opportunity_status"), nullable=False
+        Enum(
+            OpportunityStatus,
+            name="opportunity_status",
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
     )
     status_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    execution_reason: Mapped[str | None] = mapped_column(Text)
 
-    placements: Mapped[list[Placement]] = relationship(back_populates="opportunity")
+    placements: Mapped[list[Placement]] = relationship(
+        back_populates="opportunity", passive_deletes=True
+    )
 
 
 class Placement(Base):
