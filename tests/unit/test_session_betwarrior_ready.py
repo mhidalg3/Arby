@@ -60,3 +60,23 @@ async def test_ready_falls_back_to_presence_when_exp_undecodable() -> None:
     # Opaque (non-JWT) bearer ⇒ no exp ⇒ presence-only, never worse than before.
     t = _transport_with_bearer("opaque-token", None)
     assert await t.check_betwarrior_ready(timeout_s=1) is True
+
+
+async def test_prepare_auth_returns_none_when_bearer_expired() -> None:
+    # Inactivity logout: the placer must fail-closed (None) rather than hand a
+    # known-dead token to placement and 401. This is the leg-A-401 root cause.
+    exp = time.time() - 60
+    t = _transport_with_bearer(_jwt(exp), exp)
+    assert await t.prepare_betwarrior_auth(timeout_s=1) is None
+
+
+async def test_prepare_auth_returns_bearer_when_unexpired() -> None:
+    exp = time.time() + 3600
+    t = _transport_with_bearer(_jwt(exp), exp)
+    assert await t.prepare_betwarrior_auth(timeout_s=1) is not None
+
+
+async def test_prepare_auth_falls_back_to_presence_when_exp_undecodable() -> None:
+    # Opaque bearer (no decodable exp) ⇒ presence-only, same as readiness.
+    t = _transport_with_bearer("opaque-token", None)
+    assert await t.prepare_betwarrior_auth(timeout_s=1) == "opaque-token"

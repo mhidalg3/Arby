@@ -409,7 +409,11 @@ class InSessionTransport:
         passively from the SPA's own authenticated player-API calls. Like the
         Betsson context we do NOT navigate — the logged-in SPA emits the bearer on
         its background polling. Returns ``None`` if none appears within
-        ``timeout_s`` (not logged in / no authenticated call yet)."""
+        ``timeout_s`` (not logged in / no authenticated call yet), or if the held
+        bearer's JWT ``exp`` has lapsed (inactivity logout / server revocation) —
+        fail-closed so the placer rejects "session bearer not captured" rather
+        than placing with a stale token and 401'ing. The single source of truth
+        for bearer liveness; `check_betwarrior_ready` delegates here."""
         if self._dry_run:
             self._log.info("transport.dry_run_prepare")
             return None
@@ -417,7 +421,16 @@ class InSessionTransport:
             if self._captured_bearer is not None:
                 break
             await asyncio.sleep(1)
-        return self._captured_bearer
+        bearer = self._captured_bearer
+        if bearer is None:
+            return None
+        # Fail-closed on a stale bearer: an inactivity logout stops the SPA's token
+        # refresh, so the held token's exp lapses while it's still present. Return
+        # None (placer rejects) rather than sending a known-dead token to placement.
+        if self._bearer_exp is not None and time.time() >= self._bearer_exp - _BEARER_EXP_SKEW_SEC:
+            self._log.warning("transport.betwarrior_bearer_expired", exp=self._bearer_exp)
+            return None
+        return bearer
 
     async def _read_json(self, url: str) -> tuple[int, dict[str, Any]]:
         """Ungated in-page GET for READS (readiness probes, balance) — NOT placement,
@@ -457,12 +470,10 @@ class InSessionTransport:
         before.) The placer still fail-closes on a stale bearer at place time."""
         if self._dry_run:
             return False
-        if await self.prepare_betwarrior_auth(timeout_s) is None:
-            return False
-        if self._bearer_exp is not None and time.time() >= self._bearer_exp - _BEARER_EXP_SKEW_SEC:
-            self._log.warning("transport.betwarrior_bearer_expired", exp=self._bearer_exp)
-            return False
-        return True
+        # Liveness (bearer present AND unexpired) is gated inside
+        # prepare_betwarrior_auth — the single source of truth shared with the
+        # placer, so readiness and placement can never disagree about staleness.
+        return await self.prepare_betwarrior_auth(timeout_s) is not None
 
     async def check_session_blocked(self) -> SessionBlock | None:
         """Detect a responsible-gambling block on the betting window.
