@@ -31,6 +31,8 @@ class _FakeTransport:
         self.extend_calls = 0
         # Keepalive behavior: count calls so tests can assert the loop fired.
         self.keepalive_calls = 0
+        # Session-persist behavior: count save_session calls (heartbeat + shutdown).
+        self.save_calls = 0
 
     async def __aenter__(self) -> _FakeTransport:
         self.entered = True
@@ -70,6 +72,9 @@ class _FakeTransport:
         # Track that the manager's keepalive loop fired on this transport. The real
         # transport does mouse/scroll/click in a Playwright page; the fake just counts.
         self.keepalive_calls += 1
+
+    async def save_session(self) -> None:
+        self.save_calls += 1
 
 
 def _guard() -> Guardrails:
@@ -132,6 +137,38 @@ async def test_heartbeat_loop_trips_kill_switch_when_session_dies() -> None:
         bsn.context_ok = False  # next heartbeat finds it cold
         await asyncio.sleep(0.05)  # let the loop fire
         assert g.kill_switch_tripped
+
+
+async def test_heartbeat_saves_ready_sessions() -> None:
+    """A ready session is persisted each heartbeat so a restart can re-inject it."""
+    bano, bsn, g = _FakeTransport(), _FakeTransport(), _guard()
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+    )
+    async with m:
+        await asyncio.sleep(0.05)  # let the loop fire
+        assert bano.save_calls > 0
+        assert bsn.save_calls > 0
+
+
+async def test_heartbeat_skips_cold_session_when_saving() -> None:
+    """A cold session is never persisted — never overwrite the last good save with
+    a logged-out cookie (Betsson issues an anonymous cookie on inactivity logout)."""
+    bano, bsn, g = _FakeTransport(), _FakeTransport(), _guard()
+    bsn.context_ok = False  # betsson cold from the start
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+    )
+    async with m:
+        await asyncio.sleep(0.05)  # let the loop fire
+        assert bano.save_calls > 0  # ready platform still saved
+        assert bsn.save_calls == 0  # cold platform skipped
 
 
 class _RecordingNotifier:

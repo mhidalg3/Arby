@@ -28,7 +28,6 @@ from src.execution.guardrails import Guardrails
 from src.execution.hot_session import HotSessionManager
 from src.execution.notify import build_notifier
 from src.execution.orchestrator import ArbOrchestrator
-from src.storage.audit_recorder import PostgresAuditRecorder
 from src.execution.quote_source import OverlapQuoteSource
 from src.execution.recovery import HumanRecoveryHandler
 from src.execution.reverify import LiveOddsReverifier
@@ -46,6 +45,7 @@ from src.risk.refreshers import (
 )
 from src.semantic.canonicalizer import Canonicalizer
 from src.semantic.fixture_resolver import FixtureResolver
+from src.storage.audit_recorder import PostgresAuditRecorder
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -93,7 +93,7 @@ async def main() -> int:
     # execution session (a login window) is opened only when live; its odds are scraped
     # for detection in BOTH modes (public Kambi API, no login).
     betano_t = InSessionTransport("betano", dry_run=False)
-    betsson_t = InSessionTransport("betsson", dry_run=False)
+    betsson_t = InSessionTransport("betsson", dry_run=False, restore_session=True)
     betwarrior_t = InSessionTransport("betwarrior", dry_run=False) if live else None
 
     async def _operator_login() -> None:

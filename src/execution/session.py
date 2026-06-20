@@ -432,6 +432,23 @@ class InSessionTransport:
             return None
         return bearer
 
+    async def save_session(self) -> None:
+        """Persist the live session (incl. the session-only cookies the persistent
+        profile drops on close) to ``<profile>/<platform>-session.json`` so a later
+        restart can re-inject it (see ``restore_session``). No-op in dry-run / before
+        the context opens. Fail-soft — a save fault is logged, never raised (the
+        heartbeat must never die on a persist failure)."""
+        if self._dry_run or self._context is None:
+            return
+        try:
+            from scripts.recon.recon import _session_state_path
+
+            await self._context.storage_state(path=str(_session_state_path(self._platform)))
+        except Exception as exc:  # noqa: BLE001 — persist must never break the loop
+            self._log.warning(
+                "transport.session_save_failed", platform=self._platform, error=str(exc)
+            )
+
     async def _read_json(self, url: str) -> tuple[int, dict[str, Any]]:
         """Ungated in-page GET for READS (readiness probes, balance) — NOT placement,
         so it does not require :meth:`arm`. Returns ``(status, parsed_json)``; ``(0, {})``

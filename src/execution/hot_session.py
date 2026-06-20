@@ -65,6 +65,10 @@ class WarmTransport(Protocol):
     # never raises. See InSessionTransport.keepalive for the operator authorization
     # and the 2026-06-13 lab result on why mouse-alone isn't enough.
     async def keepalive(self) -> None: ...
+    # Persist the live session (session-only cookies the profile drops on close) so a
+    # later restart can re-inject it. Called by the manager's heartbeat + on graceful
+    # shutdown. Fail-soft. See InSessionTransport.save_session.
+    async def save_session(self) -> None: ...
 
 
 class BetssonWarmTransport(WarmTransport, Protocol):
@@ -172,6 +176,15 @@ class HotSessionManager:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        # Last-known-good: persist READY sessions so a graceful restart can
+        # re-inject them. Probe first so a session that's cold at shutdown is
+        # skipped (keep the last good save). Best-effort — the bot is stopping.
+        try:
+            not_ready = await self._probe_readiness()
+        except Exception as exc:  # noqa: BLE001 — shutdown must not hang on a probe fault
+            self._log.warning("hot_sessions.shutdown_probe_error", error=str(exc))
+            not_ready = []
+        await self._save_sessions(not_ready)
         if self._betwarrior is not None:
             await self._betwarrior.__aexit__(*exc)
         await self._betsson.__aexit__(*exc)
@@ -353,6 +366,30 @@ class HotSessionManager:
         self._log.info("hot_sessions.heartbeat", not_ready=not_ready)
         return not not_ready
 
+    def _warm_transports(self) -> list[tuple[str, WarmTransport]]:
+        ts: list[tuple[str, WarmTransport]] = [
+            ("betano", self._betano),
+            ("betsson", self._betsson),
+        ]
+        if self._betwarrior is not None:
+            ts.append(("betwarrior", self._betwarrior))
+        return ts
+
+    async def _save_sessions(self, not_ready: list[str] | None = None) -> None:
+        """Persist every READY live session (session-only cookies the profile drops
+        on close) so a later restart can re-inject it. A platform in ``not_ready``
+        is SKIPPED — never overwrite a good saved session with a cold one (e.g.
+        Betsson issues an anonymous cookie on inactivity logout). Fail-soft per
+        platform — a save fault must never block the others or the loop/shutdown."""
+        cold = set(not_ready or ())
+        for name, t in self._warm_transports():
+            if name in cold:
+                continue
+            try:
+                await t.save_session()
+            except Exception as exc:  # noqa: BLE001 — never break the loop/shutdown
+                self._log.warning("hot_sessions.session_save_error", platform=name, error=str(exc))
+
     async def _heartbeat_loop(self) -> None:
         """Probe forever. A not-ready session suspends auto-placement + alerts; recovery
         resumes it. The loop never returns on a fault — detection must not stop."""
@@ -364,6 +401,9 @@ class HotSessionManager:
                 self._log.error("hot_sessions.heartbeat_error", error=str(exc))
                 not_ready = ["unknown"]
             await self._apply_health(not_ready)
+            # Persist READY sessions only — a cold session is skipped so we never
+            # overwrite the last good save (see _save_sessions).
+            await self._save_sessions(not_ready)
 
     async def _apply_health(self, not_ready: list[str]) -> None:
         """Reconcile session readiness with the kill switch + alerts on transitions
