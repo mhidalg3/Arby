@@ -21,7 +21,9 @@ Field mapping (`OddsQuote` → `Leg`):
 
 from __future__ import annotations
 
-from src.arbitrage.dutch_book import ArbitrageOpportunity
+from dataclasses import replace
+
+from src.arbitrage.dutch_book import ArbitrageOpportunity, detect_arbitrage
 from src.arbitrage.quotes import OddsQuote
 from src.execution.executor import ExecutionResult, Executor, Leg
 from src.risk.stake_limits import is_dynamic
@@ -71,12 +73,56 @@ async def execute_opportunity(
     opp: ArbitrageOpportunity,
     *,
     opp_id: str,
+    budget: float,
+    min_margin_pct: float,
     dynamic_stake_cap_ars: float | None = None,
 ) -> ExecutionResult:
     """Execute an approved N-leg opportunity through the Executor (N≥2 — a
     two-outcome O/U or a three-outcome 1X2 alike). The risk layer must have
     APPROVED it already; this only translates + places.
 
-    A one-sided opportunity (<2 legs) is not hedgeable; the Executor aborts it."""
+    ``budget`` and ``min_margin_pct`` mirror detection: they back the re-pricing
+    closure that re-runs `detect_arbitrage` at the FRESH reverify odds and
+    re-sizes the legs, so a drifted-but-still-profitable arb is captured instead
+    of aborted on per-leg tolerance. ``budget`` is the per-arb budget (not
+    ``opp.total_stake``), so a capped original allocation doesn't shrink the
+    re-priced one. A one-sided opportunity (<2 legs) is not hedgeable; the
+    Executor aborts it."""
     legs = legs_from_opportunity(opp, dynamic_stake_cap_ars=dynamic_stake_cap_ars)
-    return await executor.execute_n_leg(opp_id, legs)
+
+    def _revalidate(
+        current_legs: list[Leg],
+        current_odds: list[float],
+        current_caps: list[float | None],
+    ) -> list[Leg] | None:
+        # Re-price at fresh odds with the SAME detector. The fresh quote's
+        # max_stake is the leg's EFFECTIVE live cap: a freshly-read dynamic cap
+        # (current_caps[i], Betano's real per-bet ceiling) wins; otherwise the
+        # leg's static cap (live_max_stake_ars, the conservative fallback). The
+        # static fallback is None for dynamic platforms whose public feed carries
+        # no max_stake, so WITHOUT a live cap the re-sized leg would fail the
+        # guardrail — the cap_refresh hook exists to supply it.
+        fresh = [
+            replace(
+                q,
+                decimal_odds=o,
+                max_stake=cap if cap is not None else leg.live_max_stake_ars,
+            )
+            for q, o, leg, cap in zip(
+                opp.legs, current_odds, current_legs, current_caps, strict=True
+            )
+        ]
+        try:
+            repriced = detect_arbitrage(fresh, budget, min_margin_pct)
+        except ValueError:
+            return None  # malformed fresh odds (≤1.0) → treat as no arb
+        if repriced is None:
+            return None
+        return [
+            replace(
+                leg, odds=q.decimal_odds, stake_ars=s, live_max_stake_ars=q.max_stake
+            )
+            for leg, q, s in zip(current_legs, repriced.legs, repriced.stakes, strict=True)
+        ]
+
+    return await executor.execute_n_leg(opp_id, legs, revalidate=_revalidate)

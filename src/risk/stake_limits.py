@@ -6,10 +6,12 @@ differ by platform, so the effective max for a leg depends on the odds:
 
 - **Betsson** — flat `maxStake` 20,000,000 ARS AND a 100,000,000 payout cap →
   effective = ``min(20M, 100M / odds)``.
-- **Betano** — DYNAMIC: the cap is computed server-side per bet
-  (``POST /api/betslipcombo/limits``). Not knowable pre-bet, so
-  ``effective_max_stake_ars`` returns ``None`` ("must query live") and the
-  executor reads it from the bet-slip at placement time.
+- **Betano** — DYNAMIC: the cap is server-side per bet
+  (``POST /api/betslipcombo/limits`` → ``data.max``; confirmed readable pre-place for
+  singles 2026-06-21, live-validated over the authenticated transport). ``effective_max_stake_ars``
+  still returns ``None`` (the static model can't pre-compute it); the executor's
+  ``cap_refresh`` hook (``BetanoCapRefresher``) reads it pre-place, fail-soft to the static
+  fallback on any fault. See LEDGER 2026-06-21.
 - **Bplay** — payout cap 999,999,999 (effectively unlimited) → ``cap / odds``.
   (The "9,999,999" seen in the web UI is a 7-digit input-field limit, NOT the
   API cap — see LEDGER 2026-06-01.)

@@ -54,6 +54,21 @@ class Leg:
     platform_event_ref: str = ""  # event nav ref (Betsson slug / Bplay url_key)
     live_max_stake_ars: float | None = None  # live cap for dynamic platforms (Betano)
 
+# Re-price the arb at fresh reverify odds: given the original legs, the live
+# odds the executor just re-fetched, and each leg's live per-bet cap (None when
+# a platform has a static cap or the cap couldn't be read), return re-sized legs
+# (same order, same platforms) when the edge still clears the floor, or None when
+# it's gone. Sync — re-pricing is pure compute (detection + allocation). Injected
+# by the bridge (`arb_executor`) so the executor itself never decides
+# profitability (that's ``src/arbitrage`` + ``src/risk``).
+ReverifyResize = Callable[[list[Leg], list[float], list[float | None]], list[Leg] | None]
+
+# Fetch a leg's live per-bet stake cap (Betano's dynamic ceiling). Returns None
+# for static-cap platforms or when the cap can't be read (fail-soft). Injected so
+# the executor never talks to a bookmaker; the cap feeds re-pricing so a dynamic
+# leg sizes to the REAL book ceiling, not a stale fallback.
+CapRefresh = Callable[[Leg], Awaitable[float | None]]
+
 
 @dataclass(frozen=True)
 class PlacementResult:
@@ -135,6 +150,7 @@ class Executor:
         placer: LegPlacer | None = None,
         placers: Mapping[str, LegPlacer] | None = None,
         reverify: Callable[[Leg], Awaitable[float]] = _no_reverify,
+        cap_refresh: CapRefresh | None = None,
         dry_run: bool = True,
     ) -> None:
         # A cross-platform arb routes each leg to its platform's placer (`placers`
@@ -148,6 +164,7 @@ class Executor:
         self._placer = placer
         self._placers = dict(placers or {})
         self._reverify = reverify
+        self._cap_refresh = cap_refresh
         self._dry_run = dry_run
         self._tag = "[DRY-RUN] " if dry_run else ""
         self._log = log.bind(component="executor", dry_run=dry_run)
@@ -155,17 +172,25 @@ class Executor:
     def _placer_for(self, leg: Leg) -> LegPlacer | None:
         return self._placers.get(leg.platform) or self._placer
 
-    async def execute_two_leg(self, opp_id: str, leg_a: Leg, leg_b: Leg) -> ExecutionResult:
+    async def execute_two_leg(
+        self, opp_id: str, leg_a: Leg, leg_b: Leg, *, revalidate: ReverifyResize | None = None
+    ) -> ExecutionResult:
         """Two-leg convenience wrapper over :meth:`execute_n_leg`."""
-        return await self.execute_n_leg(opp_id, [leg_a, leg_b])
+        return await self.execute_n_leg(opp_id, [leg_a, leg_b], revalidate=revalidate)
 
-    async def execute_n_leg(self, opp_id: str, legs: list[Leg]) -> ExecutionResult:
+    async def execute_n_leg(
+        self, opp_id: str, legs: list[Leg], *, revalidate: ReverifyResize | None = None
+    ) -> ExecutionResult:
         """Place an N-leg arb (N≥2) sequentially, fail-closed. A one-sided 'arb'
-        is never placeable (nothing to hedge against), so <2 legs aborts."""
+        is never placeable (nothing to hedge against), so <2 legs aborts.
+
+        ``revalidate`` re-prices the arb at the fresh reverify odds (the arb layer
+        owns profitability); without it the strict per-leg odds-tolerance gate
+        applies (abort on any drift)."""
         if len(legs) < 2:
             return await self._abort(opp_id, f"need ≥2 legs to hedge, got {len(legs)}")
         try:
-            return await self._run(opp_id, legs)
+            return await self._run(opp_id, legs, revalidate)
         except Exception as exc:  # noqa: BLE001 — any unexpected state escalates, never improvises
             return await self._freeze(opp_id, f"unexpected error: {exc!s}")
 
@@ -175,7 +200,9 @@ class Executor:
     def _label(i: int) -> str:
         return chr(ord("A") + i)  # 0→A, 1→B, 2→C, …
 
-    async def _run(self, opp_id: str, legs: list[Leg]) -> ExecutionResult:
+    async def _run(
+        self, opp_id: str, legs: list[Leg], revalidate: ReverifyResize | None = None
+    ) -> ExecutionResult:
         if self._guardrails.kill_switch_tripped:
             return await self._abort(opp_id, "kill switch tripped")
 
@@ -190,8 +217,42 @@ class Executor:
                 )
             placers.append(p)
 
-        # 1) Pre-check every leg (guardrails) and re-verify every leg's odds — nothing
-        #    placed yet, so any failure aborts with zero at risk.
+        # 1) Re-verify every leg's LIVE odds first (nothing placed yet). An
+        #    unverifiable leg (re-fetch failed / market gone → 0.0 sentinel) aborts.
+        current_odds: list[float] = []
+        for i, leg in enumerate(legs):
+            c = await self._reverify(leg)
+            if c <= 0.0:  # _UNVERIFIED sentinel — re-fetch failed / market gone
+                return await self._abort(
+                    opp_id, f"leg {self._label(i)} odds unverifiable (re-fetch failed / market gone)"
+                )
+            current_odds.append(c)
+
+        # 2) Re-price the arb at the fresh odds. The arb layer owns profitability;
+        #    `revalidate` re-runs detection + re-sizes, or returns None when the edge
+        #    is gone. Without it, keep the strict per-leg tolerance gate (abort on drift).
+        if revalidate is not None:
+            # Collect each leg's live cap (only when re-pricing will consume it).
+            # Betano's dynamic ceiling; None for static-cap platforms or on a read
+            # failure (fail-soft → re-pricing falls back to the leg's static cap).
+            current_caps: list[float | None]
+            if self._cap_refresh is not None:
+                current_caps = [await self._cap_refresh(leg) for leg in legs]
+            else:
+                current_caps = [None] * len(legs)
+            repriced = revalidate(legs, current_odds, current_caps)
+            if repriced is None:
+                return await self._abort(opp_id, "arb no longer profitable at live odds")
+            legs = repriced
+        else:
+            for i, leg in enumerate(legs):
+                if not self._guardrails.odds_still_acceptable(leg.odds, current_odds[i]):
+                    return await self._abort(
+                        opp_id,
+                        f"leg {self._label(i)} odds drifted {leg.odds}→{current_odds[i]} beyond tolerance",
+                    )
+
+        # 3) Guardrail pre-check every (possibly re-sized) leg — abort before placing.
         for i, leg in enumerate(legs):
             check = self._guardrails.check_leg(
                 platform=leg.platform,
@@ -202,18 +263,13 @@ class Executor:
             )
             if not check.allowed:
                 return await self._abort(opp_id, f"leg {self._label(i)} guardrail: {check.reason}")
-            current = await self._reverify(leg)
-            if not self._guardrails.odds_still_acceptable(leg.odds, current):
-                return await self._abort(
-                    opp_id,
-                    f"leg {self._label(i)} odds drifted {leg.odds}→{current} beyond tolerance",
-                )
 
-        # 2) Place sequentially. Re-verify each leg's LIVE odds right before placing it
-        #    (drift accrues while earlier legs are placed) and place AT the re-verified
-        #    odds — within tolerance the arb still holds; beyond it (or unverifiable →
-        #    0.0) we stop. Before any leg is live that's an abort; once ≥1 leg is live,
-        #    it's NAKED EXPOSURE (the hedge is incomplete).
+        # Place sequentially. Re-verify each leg's LIVE odds right before placing it
+        # (drift accrues while earlier legs are placed) and place AT the re-verified
+        # odds — now against the RE-PRICED odds, so it only aborts/goes naked if the
+        # market moves again during the place window. Beyond tolerance (or
+        # unverifiable → 0.0) we stop: abort when nothing's live, NAKED EXPOSURE once
+        # ≥1 leg is live (the hedge is incomplete).
         placed: list[PlacementResult] = []
         for i, (leg, placer) in enumerate(zip(legs, placers, strict=True)):
             current = await self._reverify(leg)

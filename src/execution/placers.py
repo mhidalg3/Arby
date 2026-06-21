@@ -230,6 +230,44 @@ def build_betano_request(slip_state: dict[str, Any], stake_ars: float) -> dict[s
     return {"betslip": betslip}
 
 
+def build_betano_limits(slip: dict[str, Any], tag: str) -> dict[str, Any]:
+    """Betano ``POST /api/betslipcombo/limits`` — read the per-bet stake ceiling
+    for the slip's single selection pre-place. Threads the slip subset + the
+    selection's server-generated ``tag`` forward; ``type: "SGL"`` marks a single.
+    Captured 2026-06-21: the response is ``{"data": {"min": …, "max": …}}`` — NOT
+    the ``data.bets[].maxAmount`` shape ``updatebets`` echoes (that one is always
+    0). Deep-copies the slip so the caller's state is untouched."""
+    return {"betslip": copy.deepcopy(slip), "tag": tag, "type": "SGL"}
+
+
+def betano_leg_tag(data: dict[str, Any]) -> str | None:
+    """The server-generated selection tag (``data.legs[0].tag``, mirrored in
+    ``data.bets[0].tag``) that ``plain-leg``/``updatebets`` return and
+    ``betslipcombo/limits`` threads forward. Falls back across legs→bets→None."""
+    for key in ("legs", "bets"):
+        items = data.get(key)
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            tag = items[0].get("tag")
+            if isinstance(tag, str) and tag:
+                return tag
+    return None
+
+
+def betano_limits_max(resp: dict[str, Any]) -> float | None:
+    """Parse ``{"data": {"min": …, "max": …}}`` → the per-bet max stake, or None
+    when the field is absent / not a number (fail-soft)."""
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return None
+    max_val = data.get("max")
+    if max_val is None:
+        return None
+    try:
+        return float(max_val)
+    except (TypeError, ValueError):
+        return None
+
+
 def _f(value: Any) -> float:
     try:
         return float(value)

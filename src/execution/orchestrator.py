@@ -143,7 +143,12 @@ class ArbOrchestrator:
                 continue
             self._log.info("orchestrator.executing", market_id=market_id)
             res = await execute_opportunity(
-                self._executor, opp, opp_id=market_id, dynamic_stake_cap_ars=self._dynamic_cap
+                self._executor,
+                opp,
+                opp_id=market_id,
+                dynamic_stake_cap_ars=self._dynamic_cap,
+                budget=self._budget,
+                min_margin_pct=self._min_margin_pct,
             )
             self._log.info("orchestrator.executed", market_id=market_id, outcome=res.outcome)
             if opp_db_id is not None:

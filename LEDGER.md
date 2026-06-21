@@ -1,5 +1,123 @@
 # Project Ledger
 
+## 2026-06-21 — Aggression raise: budget 200→5000 + Betano live-cap sizing (B + C shipped, live-validated)
+
+**Context:** Make the armed bot place MORE and BIGGER bets. Two levers decided with
+the operator: **B** — raise the per-arb budget and the guardrail ceilings (the real
+aggression lever; at budget 200 a Betano leg is ≤~192 ARS < the 300 fallback, so the
+cap never bound). **C** — size Betano legs to their real live per-bet cap instead of
+the 300 ARS static fallback, which both lets the larger budget deploy on Betano AND
+retires the 2026-06-20 "stale-cap re-sizing" naked-exposure residual. C is
+FEASIBILITY-GATED: the Betano pre-place cap (`data.bets[].maxAmount`) was 0.0 in the
+`updatebets` echo, so the only remaining source is the uncaptured
+`POST /api/betslipcombo/limits`.
+
+**Decisions:**
+- **B shipped (values only, no logic change) in `scripts/run_hot_loop.py`:** budget
+  default `"200"`→`"5000"`; `max_position_per_match_ars` `min(PER_LEG_CAP_ARS*4,
+  1000.0)`→`5000.0` (≥ budget; an arb's legs share one `match_id` and `check_leg`
+  uses strict `>`, so a 5000-sum arb clears a 5000 cap); `max_total_exposure_ars`
+  `1000.0`→`15000.0` (~3 arbs of headroom). `max_daily_loss_ars` left at 1000 — a
+  single ~5000 naked realized loss trips the kill switch immediately (intended
+  scale-up backstop; raise this one literal for more realized-loss tolerance).
+  `BETANO_CAP_ARS` default left at 300 (becomes C's failure fallback). `PER_LEG_CAP_ARS`
+  constant deleted (only the replaced line-78 expression referenced it; confirmed 2
+  sites). Guardrail/risk LOGIC untouched.
+- **C0 PASSED + C SHIPPED + LIVE-VALIDATED.** The cap IS readable pre-place for singles
+  over the AUTHENTICATED transport: ``POST /api/betslipcombo/limits`` →
+  ``{"data":{"min":…,"max":…}}``, per-bet cap = ``data.max`` (NOT ``data.bets[].maxAmount``
+  = the 0.0 ``updatebets`` echo); live values 12,600,891 / 70,004,950 / 3,574,720.85 ARS
+  (three selections) — correctly dynamic per selection. Request ``tag`` = the plain-leg
+  response's ``data.legs[0].tag`` (== DOM ``data-selnid``); ``type:"SGL"``. The SPA also
+  sends ``x-kbversion: 3.47.0`` (telemetry) but it is NOT required — the production
+  ``InSessionTransport.fetch`` request (``content-type`` only) was validated live (200,
+  identical ``data.max`` with/without it), so ``BetanoCapRefresher`` needs no custom
+  headers. C's ADDITIVE plumbing: a ``cap_refresh`` hook on ``Executor``
+  (collected in ``_run`` phase 1 only when a ``revalidate`` callback is set, threaded as the
+  3rd arg of the widened ``ReverifyResize``); ``arb_executor._revalidate`` prefers the live
+  cap and carries it into the re-sized leg's ``live_max_stake_ars`` (the plan-underspecified
+  linkage that stops phase-3 ``check_leg`` rejecting a Betano leg sized past 300);
+  ``BetanoCapRefresher`` (reverify.py) probes plain-leg→limits over the AUTHENTICATED
+  transport, fail-soft→None on any fault; wired in ``run_hot_loop`` with ``betano_t``.
+  9 unit tests + reviewer PASS. Live-validated end-to-end via CDP (plain-leg→limits returns
+  ``data.max`` on a logged-in session). Retires the 2026-06-20 stale-cap residual.
+- **ROOT CAUSE of the mid-investigation 401 (resolved):** an early live test of
+  ``betslipcombo/limits`` returned 401 because the CDP window had LOGGED OUT (``pocaauth``
+  cookie absent — confirmed via ``page.cookies()``). Plain-leg/updatebets still 200 on a
+  GUEST slip, so the logout was non-obvious and briefly looked like an unpinned auth header.
+  On re-login (``pocaauth`` restored) the limits call 200'd. Production runs logged-in
+  (operator logs in via the hot-loop gate), so ``BetanoCapRefresher`` sends ``pocaauth`` and
+  works. LESSON: verify ``pocaauth`` presence before trusting a Betano 401.
+
+**State:** 669 unit tests pass, mypy strict + ruff clean. **Phase B + C both SHIPPED +
+live-validated** (B: budget 200→5000 + guardrails; C: Betano sizes to its live ``data.max``
+via ``BetanoCapRefresher``, fail-soft→300 on any fault). Remaining OPERATOR-GATED: armed
+smoke at ``BUDGET=5000`` (B's gain on all platforms; Betano now at its real live cap, not
+the 300 fallback). Security: rotate the Betano session — the operator's 2026-06-21 pasted
+capture carried live cookies (pocaauth, cf_clearance, GAUTH, datadome).
+
+## 2026-06-20 — Execution-capture: re-price drifted arbs at fresh reverify odds
+
+**Context:** Two arbs aborted in the executor's reverify gate (nothing placed) on
+2026-06-20 16:19 — `fx-a8cf4060e948|1x2` (ROI 5.86%, DRAW drifted 2.75→2.55 past
+the 1% tolerance) and `fx-f075c4c83258|1x2` (leg A unverifiable → 0.0 sentinel).
+Both were valid at detection; both aborted in reverify **phase 1**, before any
+`LegPlacer.place`. The first was a real missed arb: at the fresh odds it was still
+~2.68% profitable IF re-sized, but the per-leg tolerance gate discarded it. The
+second was correct fail-closed but misreported as "drifted X→0.0". Root driver: the
+orchestrator processes markets sequentially over one `fetch()` snapshot, so a market
+executed late carries stale snapshot odds and reverify (fresh) shows large drift —
+the fresh odds are already in hand, the executor just aborted on them instead of
+re-pricing.
+
+**Decisions:**
+- **Re-pricing is a profitability decision, so it lives in the arb layer and is
+  injected into the executor as a callback** (`ReverifyResize = Callable[[list[Leg],
+  list[float]], list[Leg] | None]`), honoring `executor.py`'s contract that
+  execution NEVER decides profitability. The executor's `_run` phase 1 now splits
+  into: (1) reverify every leg (abort on `≤0.0` unverifiable sentinel with a clear
+  "unverifiable" message), (2) re-price via the callback OR fall back to the strict
+  per-leg tolerance gate when no callback, (3) guardrail `check_leg` on the
+  possibly-re-sized legs. Phase 2 (sequential place + per-leg reverify + naked-
+  exposure guard) is unchanged — it now runs against RE-PRICED odds.
+- **The closure (`arb_executor._revalidate`) reuses `detect_arbitrage` wholesale** —
+  overround, margin floor, `allocate_maxmin`, ROI floor. No duplicated arb math. It
+  builds fresh quotes at the live odds with each leg's EFFECTIVE live cap
+  (`live_max_stake_ars`) as `max_stake` — `opp.legs[i].max_stake` is None for dynamic
+  platforms (Betano), so the cap would otherwise be dropped and the re-sized leg fail
+  `check_leg`. `ValueError` (malformed fresh odds ≤1.0) → None (treat as no arb).
+- **`execute_opportunity` gained REQUIRED kwargs `budget` + `min_margin_pct`**
+  (clean cutover, no default). The orchestrator passes `self._budget` /
+  `self._min_margin_pct` — the SAME values detection uses, so the re-pricing floor
+  matches detection. Budget is the per-arb budget (e.g. 200), NOT `opp.total_stake`,
+  so a capped original allocation doesn't shrink the re-priced one. The floor is
+  `self._min_margin_pct` (no call-site literal to raise in isolation); a safety
+  buffer against further drift during sequential placement would need a SEPARATE
+  execution-only param (which would then NOT match detection) — not added here.
+- **Fetch count unchanged.** Phase 1 already reverified every leg today; only what it
+  does with the result changed (re-price instead of abort-on-drift).
+- **Residual risk — stale-cap re-sizing (ACCEPTED AS BOUNDED).** The closure sizes
+  against `leg.live_max_stake_ars`, set once at detection in `leg_from_quote`; the
+  `reverify(leg)->float` contract returns ODDS only, not a fresh cap. Re-pricing can
+  INCREASE a drifted leg's stake (DRAW 2.75→2.55 re-sizes 77→80.5), so if a
+  bookmaker has since TIGHTENED that leg's cap, phase-1 `check_leg` passes against
+  the stale cap, earlier legs fill, and the oversized later leg is rejected by the
+  book → naked exposure. This is BOUNDED by the existing phase-2 naked-exposure
+  guard + operator alert (the notify+manual-hedge model); the old abort-on-drift
+  prevented it by not placing at all. Operator decision (2026-06-20): accept as
+  bounded rather than constrain re-pricing or extend the reverify contract now.
+  Closes the loop if a future tightening-cap incident occurs.
+
+**State:** 659 unit tests pass (6 reprice tests: capture / evaporated / unverifiable
+phase-1, plus phase-2 naked-exposure-after-reprice, binding-cap-respect, and
+budget-not-total_stake), mypy strict + ruff clean. Re-pricing eliminates the old
+phase-1 "drifted X→Y beyond tolerance" abort for a still-profitable arb, and an
+unconfirmable leg reads "unverifiable". CAVEAT: re-pricing resets the drift baseline,
+so phase 2 can STILL abort or go NAKED on FURTHER drift during sequential placement
+(now a known, tested, bounded path — not the old phase-1 abort). The stale-cap
+re-sizing residual (above) is accepted as bounded by the naked-exposure guard.
+Operator smoke (armed) is the remaining live validation.
+
 ## 2026-06-19 — Hot-path audit persistence (armed sessions → Postgres)
 
 **Context:** The armed hot loop (`scripts/run_hot_loop.py --arm --yes-real-money`)

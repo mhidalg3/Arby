@@ -30,7 +30,7 @@ from src.execution.notify import build_notifier
 from src.execution.orchestrator import ArbOrchestrator
 from src.execution.quote_source import OverlapQuoteSource
 from src.execution.recovery import HumanRecoveryHandler
-from src.execution.reverify import LiveOddsReverifier
+from src.execution.reverify import BetanoCapRefresher, LiveOddsReverifier
 from src.execution.session import InSessionTransport
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
@@ -51,7 +51,6 @@ _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-PER_LEG_CAP_ARS = 300.0  # hard trial cap, mirrors trial_place
 _BETANO_HOME = "https://www.betano.bet.ar/"
 _BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
 _BETWARRIOR_HOME = "https://pba.betwarrior.bet.ar/"
@@ -68,15 +67,15 @@ async def main() -> int:
     if args.arm and not args.yes_real_money:
         raise SystemExit("REFUSED: --arm requires --yes-real-money")
 
-    budget = float(os.environ.get("BUDGET", "200"))
+    budget = float(os.environ.get("BUDGET", "5000"))
     # 45s default: with the multi-book overlap, a faster poll bursts the linker (Betsson)
     # into a WAF 403. Gives the per-event fetches room + keeps odds within staleness.
     poll = float(os.environ.get("POLL", "45"))
     betano_cap = float(os.environ.get("BETANO_CAP_ARS", "300"))
 
     guard = Guardrails(
-        max_position_per_match_ars=min(PER_LEG_CAP_ARS * 4, 1000.0),
-        max_total_exposure_ars=1000.0,
+        max_position_per_match_ars=5000.0,
+        max_total_exposure_ars=15000.0,
         max_daily_loss_ars=1000.0,
         odds_tolerance_pct=1.0,
     )
@@ -169,6 +168,7 @@ async def main() -> int:
                 recovery=HumanRecoveryHandler(notifier),
                 placers=placers,
                 reverify=reverify,
+                cap_refresh=BetanoCapRefresher(betano_t),
                 dry_run=not live,
             )
             orch = ArbOrchestrator(

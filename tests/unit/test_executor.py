@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
+from src.arbitrage.dutch_book import detect_arbitrage
+from src.arbitrage.quotes import OddsQuote
+from src.execution.arb_executor import execute_opportunity
 from src.execution.executor import (
     DryRunPlacer,
     ExecutionOutcome,
@@ -92,6 +95,7 @@ def _executor(
     rec: _FakeRecovery,
     placer: object,
     reverify: Callable[[Leg], Awaitable[float]] | None = None,
+    cap_refresh: Callable[[Leg], Awaitable[float | None]] | None = None,
 ) -> Executor:
     kw: dict[str, object] = {
         "guardrails": g,
@@ -101,6 +105,8 @@ def _executor(
     }
     if reverify is not None:
         kw["reverify"] = reverify
+    if cap_refresh is not None:
+        kw["cap_refresh"] = cap_refresh
     return Executor(**kw)  # type: ignore[arg-type]
 
 
@@ -291,3 +297,228 @@ async def test_aborts_when_a_platform_has_no_placer() -> None:
     ).execute_two_leg("opp", leg_a, leg_b)
     assert res.outcome is ExecutionOutcome.ABORTED and "no placer" in res.reason
     assert pa.calls == 0  # nothing placed
+
+
+# ---- re-pricing at fresh reverify odds (capture drifted arbs) ----
+
+
+def _arb1_quotes(*, home_max_stake: float = 5000.0) -> tuple[OddsQuote, OddsQuote, OddsQuote]:
+    """Arb-1 shape: betwarrior AWAY 2.75 + DRAW 2.75, betsson HOME 4.6.
+    A real ~5.5% 1X2 arb (overround 0.9446); AWAY/DRAW carry a large max_stake so
+    the re-sized allocation clears the guardrail. ``home_max_stake`` lets a test
+    bind the HOME leg's cap (default uncapped)."""
+    return (
+        OddsQuote(
+            platform="betwarrior", market_id="m", outcome="away",
+            decimal_odds=2.75, max_stake=5000.0, timestamp=0.0,
+        ),
+        OddsQuote(
+            platform="betwarrior", market_id="m", outcome="draw",
+            decimal_odds=2.75, max_stake=5000.0, timestamp=0.0,
+        ),
+        OddsQuote(
+            platform="betsson", market_id="m", outcome="home",
+            decimal_odds=4.6, max_stake=home_max_stake, timestamp=0.0,
+        ),
+    )
+
+
+async def test_reprice_captures_drifted_but_still_profitable_arb() -> None:
+    """DRAW drifts 2.75→2.55 at reverify. The arb is still profitable at the
+    fresh odds (overround 0.9732, margin 2.68%) → re-price + re-size + PLACE,
+    instead of aborting on the 1% per-leg tolerance. The DRAW fill lands at the
+    fresh 2.55 odds with re-sized stakes, and every outcome still pays ≥ total."""
+    g, n = _guard(), _FakeNotifier()
+    opp = detect_arbitrage(list(_arb1_quotes()), 200.0, 1.0)
+    assert opp is not None  # sanity: the snapshot is a real arb
+
+    async def reverify(leg: Leg) -> float:
+        if leg.outcome == "draw":
+            return 2.55  # drifted 7.3% — past the 1% tolerance but still an arb
+        return leg.odds
+
+    placer = _CountingPlacer()
+    ex = _executor(g, n, _FakeRecovery(), placer, reverify)
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=200.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert placer.calls == 3
+    fills = list(res.legs)
+    total = sum(f.stake_filled for f in fills)
+    # every outcome pays out at least the total stake — still hedged post-reprice
+    assert all(f.stake_filled * f.odds_filled >= total for f in fills)
+    # the DRAW fill (index 1) is at the fresh odds with a re-sized stake (not 77)
+    assert fills[1].odds_filled == 2.55
+    assert fills[1].stake_filled != 77.0
+
+
+async def test_reprice_aborts_when_arb_evaporates_at_live_odds() -> None:
+    """DRAW collapses to 1.50 → overround ≥ 1 (edge gone) → abort cleanly with
+    the re-pricing message, nothing placed. The fresh odds are valid (>1.0), so
+    this is the re-pricer rejecting a vanished edge, not the unverifiable path."""
+    g, n = _guard(), _FakeNotifier()
+    opp = detect_arbitrage(list(_arb1_quotes()), 200.0, 1.0)
+    assert opp is not None
+
+    async def reverify(leg: Leg) -> float:
+        if leg.outcome == "draw":
+            return 1.50  # overround ≥ 1 → no arb
+        return leg.odds
+
+    placer = _CountingPlacer()
+    ex = _executor(g, n, _FakeRecovery(), placer, reverify)
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=200.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.ABORTED
+    assert res.reason == "arb no longer profitable at live odds"
+    assert placer.calls == 0
+
+
+async def test_reprice_unverifiable_leg_aborts_with_clear_message() -> None:
+    """A leg whose odds can't be confirmed (reverify → 0.0 sentinel) aborts with
+    an 'unverifiable' message — not the old 'drifted X→0.0' misreport — and
+    places nothing (fail-closed)."""
+    g, n = _guard(), _FakeNotifier()
+    opp = detect_arbitrage(list(_arb1_quotes()), 200.0, 1.0)
+    assert opp is not None
+
+    async def reverify(leg: Leg) -> float:
+        if leg.outcome == "away":
+            return 0.0  # unverifiable (refetch failed / market gone)
+        return leg.odds
+
+    placer = _CountingPlacer()
+    ex = _executor(g, n, _FakeRecovery(), placer, reverify)
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=200.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.ABORTED
+    assert "unverifiable" in (res.reason or "")
+    assert placer.calls == 0
+
+
+async def test_reprice_then_phase2_drift_is_naked_exposure() -> None:
+    """Re-pricing succeeds in phase 1, but the market drifts AGAIN during phase-2
+    sequential placement (after leg A is live) → NAKED EXPOSURE with one leg live,
+    not a clean abort. Re-pricing RESETS the drift baseline, so phase 2 only catches
+    FURTHER drift during the place window — the residual risk of capturing fast
+    markets (bounded by the existing naked-exposure guard + operator alert)."""
+    g, n = _guard(), _FakeNotifier()
+    opp = detect_arbitrage(list(_arb1_quotes()), 200.0, 1.0)
+    assert opp is not None
+    state = {"n": 0}
+
+    async def reverify(leg: Leg) -> float:
+        state["n"] += 1
+        # calls 1-3 = phase-1 reverify (no drift → arb re-prices + re-sizes);
+        # call 4 = phase-2 leg A (away) → ok, placed; call 5 = phase-2 leg B (draw)
+        # → drifts 10% past tolerance while leg A is already LIVE.
+        if state["n"] == 5:
+            return leg.odds * 0.9
+        return leg.odds
+
+    placer = _CountingPlacer()
+    ex = _executor(g, n, _FakeRecovery(), placer, reverify)
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=200.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert len(res.legs) == 1  # leg A live, hedge incomplete
+    assert g.total_exposure_ars == res.legs[0].stake_filled  # the live leg recorded
+    assert any("NAKED" in t for t in n.sent)
+
+
+async def test_reprice_respects_binding_live_cap() -> None:
+    """A binding live cap flows through re-pricing: the HOME leg (max_stake 30,
+    below its ~46 uncapped allocation) is SCALED by allocate_maxmin, not dropped.
+    The re-sized stake respects the cap and placement completes. Regression catcher:
+    if the closure built fresh quotes WITHOUT the cap (max_stake=None), HOME would
+    re-size to ~46 and check_leg would abort — so COMPLETED here proves the cap is
+    carried into the fresh quote."""
+    g, n = _guard(), _FakeNotifier()
+    opp = detect_arbitrage(list(_arb1_quotes(home_max_stake=30.0)), 200.0, 1.0)
+    assert opp is not None
+    assert opp.total_stake < 200.0  # the cap scaled the allocation down
+
+    async def reverify(leg: Leg) -> float:
+        return leg.odds  # no drift; re-price at the same odds
+
+    placer = _CountingPlacer()
+    ex = _executor(g, n, _FakeRecovery(), placer, reverify)
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=200.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    fills = list(res.legs)
+    assert fills[2].stake_filled <= 30.0  # HOME (index 2) cap respected post-reprice
+
+
+async def test_reprice_uses_per_arb_budget_not_original_total_stake() -> None:
+    """Re-pricing allocates against the per-arb ``budget`` kwarg, NOT
+    ``opp.total_stake``. A leg drifts so a formerly-binding cap no longer binds, and
+    the re-sized allocation GROWS beyond the original capped total — proving the
+    budget (not the shrunken original total) drove re-sizing."""
+    g, n = _guard(), _FakeNotifier()
+    # 2-leg arb; the betwarrior leg carries a binding 50 cap at detection odds
+    # (2.0), so detection's total is capped well below the 200 budget.
+    quotes = [
+        OddsQuote(
+            platform="betwarrior", market_id="m", outcome="home",
+            decimal_odds=2.0, max_stake=50.0, timestamp=0.0,
+        ),
+        OddsQuote(
+            platform="betsson", market_id="m", outcome="away",
+            decimal_odds=3.0, max_stake=5000.0, timestamp=0.0,
+        ),
+    ]
+    opp = detect_arbitrage(quotes, 200.0, 1.0)
+    assert opp is not None
+    assert opp.total_stake < 150.0  # capped below budget at detection odds
+
+    async def reverify(leg: Leg) -> float:
+        # betwarrior drifts UP to 5.0 → its uncapped stake drops, the 50 cap stops
+        # binding, so the re-priced allocation can grow toward the 200 budget.
+        if leg.platform == "betwarrior":
+            return 5.0
+        return leg.odds
+
+    placer = _CountingPlacer()
+    ex = _executor(g, n, _FakeRecovery(), placer, reverify)
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=200.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    total = sum(f.stake_filled for f in res.legs)
+    # re-priced total grew well past the original capped total → budget drove it
+    assert total > opp.total_stake + 20.0
+
+
+async def test_cap_refresh_caps_flow_into_revalidate() -> None:
+    """Phase C: the cap_refresh hook's per-leg live caps are collected in phase 1
+    and passed to revalidate (3rd arg), so re-pricing can size dynamic legs to the
+    real book ceiling. Only collected when a revalidate callback is set."""
+    seen: list[list[float | None]] = []
+
+    def revalidate(
+        legs: list[Leg], odds: list[float], caps: list[float | None]
+    ) -> list[Leg]:
+        seen.append(list(caps))
+        return legs  # accept legs unchanged — we only assert cap-passing here
+
+    async def cap_refresh(leg: Leg) -> float | None:
+        return 12_345.0 if leg.platform == "betano" else None
+
+    g, n = _guard(), _FakeNotifier()
+    ex = _executor(g, n, _FakeRecovery(), _CountingPlacer(), cap_refresh=cap_refresh)
+    res = await ex.execute_n_leg("o", list(_three_legs()), revalidate=revalidate)
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    # betsson None, betano live cap, betwarrior None — order matches _three_legs()
+    assert seen == [[None, 12_345.0, None]]
+
+
+async def test_cap_refresh_not_called_when_no_revalidate() -> None:
+    """Phase C: caps are only collected when a revalidate callback is set. Without
+    one, cap_refresh is never invoked — so the strict-tolerance path never probes the
+    book or builds a slip. Pins the dispatch guard in _run."""
+    calls = 0
+
+    async def cap_refresh(leg: Leg) -> float | None:
+        nonlocal calls
+        calls += 1
+        return None
+
+    g, n = _guard(), _FakeNotifier()
+    ex = _executor(g, n, _FakeRecovery(), _CountingPlacer(), cap_refresh=cap_refresh)
+    res = await ex.execute_n_leg("o", list(_three_legs()))  # NO revalidate= callback
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert calls == 0  # cap_refresh never invoked without a revalidate callback
