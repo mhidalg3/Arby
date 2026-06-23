@@ -10,10 +10,12 @@ from __future__ import annotations
 import uuid
 
 from src.execution.placers import (
+    BetHistoryMatch,
     build_betano_request,
     build_betsson_request,
     build_betwarrior_request,
     build_bplay_request,
+    match_betwarrior_coupon,
     parse_betano,
     parse_betsson,
     parse_betwarrior,
@@ -54,6 +56,92 @@ def test_betwarrior_accepted_normalizes_kambi_units() -> None:
     assert r.ref == "12713234454"
     assert r.odds_filled == 1.4  # ×1000 (confirmed by live placement)
     assert r.stake_filled == 1000.0  # ×1000
+
+
+def test_betwarrior_success_without_echoed_bet_rejected() -> None:
+    # A bare SUCCESS with no echoed coupon.bets is NOT a placement — the live-delay
+    # poll reuses this strict gate, so accepting on status alone could mark an
+    # unplaced bet as placed (blind naked exposure).
+    r = parse_betwarrior({"status": "SUCCESS", "couponRef": 999, "coupon": {"bets": [{}]}})
+    assert not r.accepted and "without echoed" in r.detail
+
+
+def test_match_betwarrior_coupon_open_accepted() -> None:
+    match, bet = match_betwarrior_coupon(
+        {
+            "historyCoupons": [
+                {
+                    "couponRef": 777,
+                    "bets": [{"betStatus": "OPEN", "stake": 500000, "betOdds": 1410}],
+                }
+            ]
+        },
+        coupon_ref=777,
+    )
+    assert match is BetHistoryMatch.ACCEPTED
+    assert bet["stake"] == 500000
+
+
+def test_match_betwarrior_coupon_waiting() -> None:
+    match, _ = match_betwarrior_coupon(
+        {"historyCoupons": [{"couponRef": 777, "bets": [{"betStatus": "WAITING_FOR_APPROVAL"}]}]},
+        coupon_ref=777,
+    )
+    assert match is BetHistoryMatch.WAITING
+
+
+def test_match_betwarrior_coupon_rejected() -> None:
+    match, _ = match_betwarrior_coupon(
+        {"historyCoupons": [{"couponRef": 777, "bets": [{"betStatus": "REFUSED"}]}]},
+        coupon_ref=777,
+    )
+    assert match is BetHistoryMatch.REJECTED
+
+
+def test_match_betwarrior_coupon_not_found_is_unknown() -> None:
+    # Coupon absent (not propagated / resolved+gone) → keep polling → pending_unknown.
+    match, bet = match_betwarrior_coupon({"historyCoupons": []}, coupon_ref=777)
+    assert match is BetHistoryMatch.UNKNOWN and bet == {}
+
+
+def test_match_betwarrior_coupon_bet_ref_fallback() -> None:
+    # couponRef doesn't match, but a bet's betRef does → still found.
+    match, _ = match_betwarrior_coupon(
+        {
+            "historyCoupons": [
+                {
+                    "couponRef": 0,
+                    "bets": [{"betStatus": "OPEN", "betRef": 42, "stake": 1, "betOdds": 1}],
+                }
+            ]
+        },
+        coupon_ref=777,
+        bet_ref=42,
+    )
+    assert match is BetHistoryMatch.ACCEPTED
+
+
+def test_match_betwarrior_coupon_bet_ref_classifies_matched_not_first() -> None:
+    # Multi-bet coupon: bets[0] is OPEN but OUR betRef is on bets[1] which is still
+    # WAITING. Must classify the matched bet (WAITING), NOT bets[0] (OPEN) — the
+    # catastrophic case where a sibling bet's acceptance is mistaken for ours.
+    match, bet = match_betwarrior_coupon(
+        {
+            "historyCoupons": [
+                {
+                    "couponRef": 777,
+                    "bets": [
+                        {"betStatus": "OPEN", "betRef": 1, "stake": 1, "betOdds": 1},
+                        {"betStatus": "WAITING_FOR_APPROVAL", "betRef": 42},
+                    ],
+                }
+            ]
+        },
+        coupon_ref=777,
+        bet_ref=42,
+    )
+    assert match is BetHistoryMatch.WAITING
+    assert bet.get("betRef") == 42
 
 
 def test_betsson_accepted() -> None:

@@ -19,6 +19,7 @@ in-session send is validated in the Phase-1 trial.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -42,6 +43,18 @@ _BETSSON_REQUIRED_HEADERS = {
     "x-sb-jurisdiction": "Iplyc",
 }
 _BETWARRIOR_PLACE_URL = "https://cf-al-auth-api.kambicdn.com/player/api/v2019/bwargbap/coupon.json"
+# The SPA's own authenticated coupon-history GET (same host as the placement POST).
+# Proven reachable on cf-al-auth-api.kambicdn.com by the auth-liveness probe and the
+# 2026-06-01 recon. The previous inferred per-coupon URL (``.../coupon/{ref}.json``)
+# 404'd on the 2026-06-23 LIVE_DELAY_PENDING capture (couponRef 12796224824) — this is
+# the corrected endpoint. NO ``status=`` filter: a bet accepted during the live delay
+# leaves the PENDING bucket (betStatus → OPEN) and would vanish from a ``status=PENDING``
+# query, so only an unfiltered query observes the accepted state.
+_BETWARRIOR_COUPON_HISTORY_URL = (
+    "https://cf-al-auth-api.kambicdn.com/player/api/v2019/bwargbap"
+    "/coupon/history.json?lang=es_AR&market=AR&client_id=200&channel_id=1"
+    "&range_size=100&range_start=0"
+)
 _BETANO_BASE = "https://www.betano.bet.ar/api/betslip/v3"
 _BPLAY_BASE = "https://ws-deportespba.bplay.bet.ar"
 
@@ -141,8 +154,19 @@ class BetWarriorLegPlacer:
 
     platform = "betwarrior-pba"
 
-    def __init__(self, transport: BetWarriorTransport) -> None:
+    def __init__(
+        self,
+        transport: BetWarriorTransport,
+        *,
+        live_delay_timeout_s: float = 16.0,
+        live_delay_interval_s: float = 2.0,
+    ) -> None:
         self._t = transport
+        # Kambi's live-bet delay window is a few seconds (sport-dependent); 16s covers it
+        # with margin while bounding how long a pending bet stalls the executor. Tightened
+        # in unit tests via the constructor.
+        self._live_delay_timeout_s = live_delay_timeout_s
+        self._live_delay_interval_s = live_delay_interval_s
         self._log = log.bind(component="leg_placer", platform=self.platform)
 
     async def place(self, leg: Leg) -> PlacementResult:
@@ -175,7 +199,122 @@ class BetWarriorLegPlacer:
             # outcome, validation) so a rejection is diagnosable, not an opaque 400.
             self._log.warning("leg_placer.http_error", status=status, body=str(resp)[:300])
             return PlacementResult(accepted=False, detail=f"HTTP {status}: {str(resp)[:200]}")
+        # Log the body on ANY non-SUCCESS HTTP-200 response — previously only HTTP ≥ 400 was
+        # logged, so a LIVE_DELAY_PENDING (the transient hold the poll below resolves) went
+        # blind. This also captures any future unrecognized status literal for diagnosis.
+        if resp.get("status") != "SUCCESS":
+            self._log.warning(
+                "leg_placer.betwarrior_non_success",
+                status=resp.get("status"),
+                coupon_ref=resp.get("couponRef"),
+                body=str(resp)[:2000],
+            )
+        if resp.get("status") == placers.BETWARRIOR_LIVE_DELAY_PENDING:
+            return await self._poll_live_delay(resp, bearer)
         return placers.parse_betwarrior(resp)
+
+    async def _poll_live_delay(self, place_resp: dict[str, Any], bearer: str) -> PlacementResult:
+        """Resolve a Kambi ``LIVE_DELAY_PENDING`` placement by polling the player-API
+        ``coupon/history.json`` until the bet settles, bounded by ``live_delay_timeout_s``.
+
+        The ONLY way to ACCEPT is a history coupon whose ``betStatus == OPEN`` with an
+        echoed ``stake``+``betOdds`` (``match_betwarrior_coupon`` — the same strict gate as
+        a synchronous place), so the poll can never accept more loosely. A known REJECT
+        literal is a CLEAN reject (we KNOW the bet is dead). Anything else (still
+        ``WAITING_FOR_APPROVAL``, coupon not yet propagated, unrecognized status, transport
+        error, HTTP ≥ 400) keeps polling; if the deadline elapses without a definitive
+        ACCEPT/REJECT the bet was SUBMITTED (we hold a couponRef) and may still be
+        pending/placed → ``pending_unknown=True`` (NOT a clean reject: the executor must not
+        report "nothing placed" and hide a live position). The poll is GET-only: it never
+        re-POSTs, so it cannot double-place."""
+        ref = place_resp.get("couponRef")
+        if ref is None:
+            # The bet was SUBMITTED (LIVE_DELAY_PENDING = received) but the body gave no
+            # coupon handle to poll → acceptance cannot be confirmed. NOT a clean reject:
+            # it may still settle on the book. Same pending_unknown treatment as a timeout
+            # so the executor never reports "nothing placed" for a submitted bet.
+            return PlacementResult(
+                accepted=False,
+                pending_unknown=True,
+                detail=(
+                    "betwarrior: LIVE_DELAY_PENDING without couponRef (submitted, cannot "
+                    "poll — verify on the book)"
+                ),
+            )
+        # betRef for fallback matching (some history variants re-key by bet, not coupon).
+        _coupon = place_resp.get("coupon")
+        _coupon_bets = _coupon.get("bets") if isinstance(_coupon, dict) else None
+        bet_ref = (
+            _coupon_bets[0].get("betRef")
+            if isinstance(_coupon_bets, list) and _coupon_bets and isinstance(_coupon_bets[0], dict)
+            else None
+        )
+        url = _BETWARRIOR_COUPON_HISTORY_URL
+        headers = {"authorization": f"Bearer {bearer}"}
+        deadline = time.monotonic() + self._live_delay_timeout_s
+        attempt = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Sleep at most the remaining window — never oversleep past the deadline. A poll
+            # that returns OPEN marginally past it is still ACCEPTED: the bet is genuinely
+            # placed, and discarding it would hide a real position (blind naked exposure).
+            await asyncio.sleep(min(self._live_delay_interval_s, remaining))
+            attempt += 1
+            try:
+                status, resp = await self._t.fetch("GET", url, headers=headers)
+            except TransportError as exc:
+                self._log.warning(
+                    "leg_placer.betwarrior_poll_error", attempt=attempt, error=str(exc)[:500]
+                )
+                continue  # keep polling to the deadline; pending_unknown if it never resolves
+            if status >= 400:
+                self._log.warning(
+                    "leg_placer.betwarrior_poll_http_error",
+                    attempt=attempt,
+                    status=status,
+                    body=str(resp)[:1500],
+                )
+                continue
+            match, bet = placers.match_betwarrior_coupon(resp, coupon_ref=ref, bet_ref=bet_ref)
+            if match is placers.BetHistoryMatch.ACCEPTED:
+                self._log.info(
+                    "leg_placer.betwarrior_delay_resolved",
+                    attempt=attempt,
+                    bet_status=placers.BETWARRIOR_BET_OPEN,
+                    coupon_ref=ref,
+                )
+                return placers.betwarrior_fill(bet, ref)
+            if match is placers.BetHistoryMatch.REJECTED:
+                # A definitive reject literal — the bet is NOT placed. Clean reject.
+                self._log.warning(
+                    "leg_placer.betwarrior_delay_rejected",
+                    attempt=attempt,
+                    coupon_ref=ref,
+                    bet_status=str(bet.get("betStatus"))[:80],
+                )
+                return PlacementResult(
+                    accepted=False,
+                    detail=f"betwarrior: bet rejected ({bet.get('betStatus')}, couponRef {ref})",
+                )
+            # WAITING / UNKNOWN / not-yet-propagated — keep polling to the deadline.
+        self._log.warning(
+            "leg_placer.betwarrior_delay_timeout",
+            coupon_ref=ref,
+            bet_ref=bet_ref,
+            attempts=attempt,
+            timeout_s=self._live_delay_timeout_s,
+        )
+        return PlacementResult(
+            accepted=False,
+            pending_unknown=True,
+            detail=(
+                f"betwarrior: LIVE_DELAY_PENDING unresolved after "
+                f"{self._live_delay_timeout_s}s ({attempt} polls, couponRef {ref}) — "
+                f"the bet may still be pending/placed on BetWarrior; verify couponRef {ref}"
+            ),
+        )
 
 
 def _data_envelope(resp: dict[str, object]) -> dict[str, object]:
@@ -276,7 +415,9 @@ class BplayLegPlacer:
                 json_body=placers.build_bplay_togglebet(outcome_id, csrf, self._url_key),
             )
             if status >= 400:
-                return PlacementResult(accepted=False, detail=f"HTTP {status} (togglebet): {str(resp)[:160]}")
+                return PlacementResult(
+                    accepted=False, detail=f"HTTP {status} (togglebet): {str(resp)[:160]}"
+                )
             csrf = placers.bplay_csrf_from_response(resp) or csrf
 
             status, resp = await self._t.fetch(
@@ -294,5 +435,7 @@ class BplayLegPlacer:
             self._log.warning("leg_placer.transport_error", error=str(exc))
             return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
         if status >= 400:
-            return PlacementResult(accepted=False, detail=f"HTTP {status} (place): {str(resp)[:160]}")
+            return PlacementResult(
+                accepted=False, detail=f"HTTP {status} (place): {str(resp)[:160]}"
+            )
         return placers.parse_bplay(resp)

@@ -38,13 +38,14 @@ log = structlog.get_logger(__name__)
 # the correct degradation — never delay a time-sensitive arb placement on audit.
 _AUDIT_TIMEOUT_SEC = 3.0
 
-# ExecutionOutcome → OpportunityStatus. Total over the four members; the `.get`
+# ExecutionOutcome → OpportunityStatus. Total over the five members; the `.get`
 # default below is unreachable defensive cover (a future outcome must be mapped
 # here, else it lands as EXPIRED).
 _OUTCOME_TO_STATUS: dict[ExecutionOutcome, OpportunityStatus] = {
     ExecutionOutcome.COMPLETED: OpportunityStatus.COMPLETED,
     ExecutionOutcome.ABORTED: OpportunityStatus.ABORTED_PRE_EXECUTION,
     ExecutionOutcome.NAKED_EXPOSURE: OpportunityStatus.ABORTED_POST_LEG_A,
+    ExecutionOutcome.PENDING_UNKNOWN: OpportunityStatus.PENDING_UNKNOWN,
     ExecutionOutcome.FROZEN: OpportunityStatus.FROZEN,
 }
 

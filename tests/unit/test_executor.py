@@ -59,6 +59,28 @@ class _RaisingPlacer:
         raise RuntimeError("session expired")
 
 
+class _PendingUnknownPlacer:
+    """DryRunPlacer that returns a pending_unknown result at a chosen leg index
+    (bet submitted, acceptance unconfirmed) and fills the rest normally."""
+
+    def __init__(self, pending_index: int) -> None:
+        self.pending_index = pending_index
+        self.calls = 0
+
+    async def place(self, leg: Leg) -> PlacementResult:
+        i = self.calls
+        self.calls += 1
+        if i == self.pending_index:
+            return PlacementResult(
+                accepted=False,
+                pending_unknown=True,
+                detail="betwarrior: LIVE_DELAY_PENDING unresolved (couponRef 777)",
+            )
+        return PlacementResult(
+            accepted=True, stake_filled=leg.stake_ars, odds_filled=leg.odds, ref=f"ref{i}"
+        )
+
+
 def _guard(**over: float) -> Guardrails:
     base = {
         "max_position_per_match_ars": 10_000.0,
@@ -96,6 +118,7 @@ def _executor(
     placer: object,
     reverify: Callable[[Leg], Awaitable[float]] | None = None,
     cap_refresh: Callable[[Leg], Awaitable[float | None]] | None = None,
+    auth_precheck: Callable[[Leg], Awaitable[bool]] | None = None,
 ) -> Executor:
     kw: dict[str, object] = {
         "guardrails": g,
@@ -107,6 +130,8 @@ def _executor(
         kw["reverify"] = reverify
     if cap_refresh is not None:
         kw["cap_refresh"] = cap_refresh
+    if auth_precheck is not None:
+        kw["auth_precheck"] = auth_precheck
     return Executor(**kw)  # type: ignore[arg-type]
 
 
@@ -138,6 +163,75 @@ async def test_three_leg_third_leg_rejected_is_naked_with_two_live() -> None:
     assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
     assert len(res.legs) == 2  # two legs live
     assert any("NAKED" in t and "2 leg" in t for t in n.sent)
+
+
+async def test_pending_unknown_on_first_leg_halts_not_abort() -> None:
+    """A LIVE_DELAY_PENDING that doesn't resolve is NOT a clean reject: the bet may
+    be placed. Leg A pending_unknown → PENDING_UNKNOWN (kill switch tripped + alert),
+    never ABORTED (which would falsely claim 'nothing placed' and hide a live position)."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _PendingUnknownPlacer(pending_index=0)
+    res = await _executor(g, n, _FakeRecovery(), placer).execute_two_leg("opp", *_legs())
+    assert res.outcome is ExecutionOutcome.PENDING_UNKNOWN
+    assert g.kill_switch_tripped  # auto-placement halted
+    assert any("PENDING UNKNOWN" in t for t in n.sent)
+    assert placer.calls == 1  # never placed leg B
+
+
+async def test_pending_unknown_after_live_leg_is_naked() -> None:
+    """Leg A placed, leg B pending_unknown: a confirmed live leg + an unconfirmed one
+    is naked exposure (the hedge is incomplete either way)."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _PendingUnknownPlacer(pending_index=1)
+    res = await _executor(g, n, _FakeRecovery(), placer).execute_two_leg("opp", *_legs())
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert len(res.legs) == 1  # leg A confirmed live
+    assert any("NAKED" in t for t in n.sent)
+
+
+def _incident_legs() -> tuple[Leg, Leg, Leg]:
+    # Mirror the 2026-06-20 naked-exposure incident: two betsson legs then betwarrior
+    # (Kambi) last — the leg whose server-dead bearer 401'd. All share one match.
+    return (
+        Leg("betsson-pba", "m1", "1X2", "home", 60.0, 3.0),
+        Leg("betsson-pba", "m1", "1X2", "draw", 60.0, 3.1),
+        Leg("betwarrior-pba", "m1", "1X2", "away", 60.0, 3.2),
+    )
+
+
+async def test_pre_place_auth_gate_aborts_before_placing_anything() -> None:
+    """The 2026-06-20 naked-exposure incident, fixed: a betwarrior (Kambi) leg whose
+    session is server-dead (auth_precheck ⇒ False) aborts BEFORE leg A is placed —
+    zero position. Without the D2 gate the betsson legs A/B would place and the dead
+    leg C would leave them unhedged (NAKED)."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _CountingPlacer()
+
+    # Auth dead ONLY on the betwarrior (Kambi) leg — exactly the wiring's behaviour.
+    async def auth_dead_on_betwarrior(leg: Leg) -> bool:
+        return leg.platform.split("-", 1)[0].lower() != "betwarrior"
+
+    ex = _executor(g, n, _FakeRecovery(), placer, auth_precheck=auth_dead_on_betwarrior)
+    res = await ex.execute_n_leg("opp", list(_incident_legs()))
+    assert res.outcome is ExecutionOutcome.ABORTED
+    assert "session auth not live" in res.reason
+    assert placer.calls == 0  # NOTHING placed — no naked exposure
+
+
+async def test_pre_place_auth_gate_live_session_places_normally() -> None:
+    """A live session (auth_precheck ⇒ True on every leg) is invisible to execution:
+    the arb completes exactly as without the gate. Guards against the gate firing by
+    accident on a healthy session."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _CountingPlacer()
+
+    async def auth_always_live(leg: Leg) -> bool:
+        return True
+
+    ex = _executor(g, n, _FakeRecovery(), placer, auth_precheck=auth_always_live)
+    res = await ex.execute_n_leg("opp", list(_incident_legs()))
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert placer.calls == 3  # all legs placed
 
 
 async def test_placed_bet_alert_describes_leg_platform_event_and_bet() -> None:
@@ -309,16 +403,28 @@ def _arb1_quotes(*, home_max_stake: float = 5000.0) -> tuple[OddsQuote, OddsQuot
     bind the HOME leg's cap (default uncapped)."""
     return (
         OddsQuote(
-            platform="betwarrior", market_id="m", outcome="away",
-            decimal_odds=2.75, max_stake=5000.0, timestamp=0.0,
+            platform="betwarrior",
+            market_id="m",
+            outcome="away",
+            decimal_odds=2.75,
+            max_stake=5000.0,
+            timestamp=0.0,
         ),
         OddsQuote(
-            platform="betwarrior", market_id="m", outcome="draw",
-            decimal_odds=2.75, max_stake=5000.0, timestamp=0.0,
+            platform="betwarrior",
+            market_id="m",
+            outcome="draw",
+            decimal_odds=2.75,
+            max_stake=5000.0,
+            timestamp=0.0,
         ),
         OddsQuote(
-            platform="betsson", market_id="m", outcome="home",
-            decimal_odds=4.6, max_stake=home_max_stake, timestamp=0.0,
+            platform="betsson",
+            market_id="m",
+            outcome="home",
+            decimal_odds=4.6,
+            max_stake=home_max_stake,
+            timestamp=0.0,
         ),
     )
 
@@ -455,12 +561,20 @@ async def test_reprice_uses_per_arb_budget_not_original_total_stake() -> None:
     # (2.0), so detection's total is capped well below the 200 budget.
     quotes = [
         OddsQuote(
-            platform="betwarrior", market_id="m", outcome="home",
-            decimal_odds=2.0, max_stake=50.0, timestamp=0.0,
+            platform="betwarrior",
+            market_id="m",
+            outcome="home",
+            decimal_odds=2.0,
+            max_stake=50.0,
+            timestamp=0.0,
         ),
         OddsQuote(
-            platform="betsson", market_id="m", outcome="away",
-            decimal_odds=3.0, max_stake=5000.0, timestamp=0.0,
+            platform="betsson",
+            market_id="m",
+            outcome="away",
+            decimal_odds=3.0,
+            max_stake=5000.0,
+            timestamp=0.0,
         ),
     ]
     opp = detect_arbitrage(quotes, 200.0, 1.0)
@@ -489,9 +603,7 @@ async def test_cap_refresh_caps_flow_into_revalidate() -> None:
     real book ceiling. Only collected when a revalidate callback is set."""
     seen: list[list[float | None]] = []
 
-    def revalidate(
-        legs: list[Leg], odds: list[float], caps: list[float | None]
-    ) -> list[Leg]:
+    def revalidate(legs: list[Leg], odds: list[float], caps: list[float | None]) -> list[Leg]:
         seen.append(list(caps))
         return legs  # accept legs unchanged — we only assert cap-passing here
 

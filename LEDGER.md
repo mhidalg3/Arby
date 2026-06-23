@@ -1,5 +1,109 @@
 # Project Ledger
 
+## 2026-06-23 — First real arbitrage execution completed
+
+**Context:** The live armed bot completed the first verified real-money arbitrage execution.
+Capture: `recon/artifacts/session_viewer/20260623_125619/postmortem.md`; market
+`fx-ee45e93fd258|1x2`; logged at `2026-06-23T19:40:02Z` through `19:40:22Z`
+(viewer wall clock `16:40:38`); outcome `completed`; `dry_run=false`; 3 legs.
+
+**Decisions / validation:** The BetWarrior LIVE_DELAY_PENDING v2 poll is now live-proven.
+Two BetWarrior legs submitted as `LIVE_DELAY_PENDING` with `delayBeforeAcceptingBet=1`:
+coupon `12799829805` (`Bonsucesso-RJ`, stake `563.910` ARS, odds `9.00`, betRef
+`15922873201`) and coupon `12799836393` (`Cabofriense-RJ`, stake `676.690` ARS,
+odds `7.50`, betRef `15922877179`). Both resolved on poll attempt 1 with
+`bet_status=OPEN`; no re-POST, no timeout, no `PENDING_UNKNOWN`, no naked exposure.
+The implied third Betsson leg was ~`3759.40` ARS at ~`1.35`, balancing all outcomes
+at ~`5075.18` ARS payout; total stake ~`5000.00` ARS; expected gross profit ~`75.19`
+ARS; ROI matches the logged `1.5037593984962223%`.
+
+**State:** Operator verified the BetWarrior and Betsson bets were actually placed. The
+viewer screenshots show both platform sessions active/clear of blocking overlays, but
+do not show receipts; the API/event stream is the authoritative bot-side proof. The
+execution completed with `executor.completed` followed immediately by
+`orchestrator.executed outcome=completed`.
+
+**Errors / learnings:** The win validates the `coupon/history.json` endpoint, unfiltered
+history lookup, `couponRef` matching, and strict `OPEN` acceptance gate. It also surfaced
+that the watcher/postmortem still under-documents the Betsson receipt leg and leaves stale
+Betsson coupon noise visible after placement; useful next observability work is receipt
+capture for all platforms and explicit per-leg stake/odds logging in postmortems.
+
+## 2026-06-23 — BetWarrior LIVE_DELAY_PENDING: corrected poll endpoint + PENDING_UNKNOWN outcome
+
+**Context:** The 2026-06-22 deploy of the LIVE_DELAY_PENDING poll (v1) used an INFERRED
+per-coupon endpoint (`GET .../coupon/{couponRef}.json`). The first natural capture after
+deploy (arb `fx-3fd3d42b6d4e|1x2`, ROI 17.36%, 2026-06-22 22:07:50) proved it WRONG: every
+poll returned HTTP 404, the poll timed out after 16s (7 polls), and the executor aborted.
+No money lost (abort before any leg placed). The capture also gave the real pending body
+(`couponRef=12796224824`, `couponExternalRef=ae30704f-...`, `betRef=15918842962`,
+`betStatus=WAITING_FOR_APPROVAL`, `stake=234720`, `betOdds=25000`, `potentialPayout=5868000`)
+and a second rejection earlier that evening (ROI 30.87% > 25% max — artifact guard).
+The v1 poll ARCHITECTURE was right (log pending body, no re-POST, bounded wait, fail-closed,
+no false accept); only the endpoint + the unresolved-timeout semantics were wrong.
+
+**Decisions (this session — poll v2):**
+- **Endpoint: `coupon/history.json` (no status filter).** Replaced the 404-ing
+  `.../coupon/{ref}.json` with the SPA's OWN authenticated coupon-history GET on the same
+  host (cf-al-auth-api.kambicdn.com) — the SAME endpoint the auth-liveness probe + the
+  2026-06-01 recon proved reachable. CRITICAL: NO `status=` query param — a bet accepted
+  during the live delay leaves the PENDING bucket (`betStatus` → OPEN) and would VANISH
+  from a `status=PENDING` query, so only an unfiltered query observes the accepted state.
+  (`src/execution/leg_placer.py:_BETWARRIOR_COUPON_HISTORY_URL`.)
+- **Match by `couponRef` (fallback `betRef`).** New `match_betwarrior_coupon` (placers.py)
+  scans `historyCoupons` for the placed coupon and classifies `bets[0].betStatus`:
+  `OPEN` + echoed `stake`/`betOdds` → ACCEPT (same strict gate as `parse_betwarrior`);
+  `WAITING_FOR_APPROVAL` → keep polling; a known reject literal (REFUSED/REJECTED/…)
+  → clean reject; absent/unrecognized → keep polling. Unit-tested (6 cases).
+- **Unresolved → `PENDING_UNKNOWN`, not a clean reject.** The v1 timeout returned a plain
+  `accepted=False`, which the executor reported as ABORTED ("nothing placed") — FALSE when
+  the bet was submitted and may still be pending/placed. New `PlacementResult.pending_unknown`
+  flag + `ExecutionOutcome.PENDING_UNKNOWN`: on leg-A timeout the executor trips the kill
+  switch (halt auto-placement so the bot can't compound an unconfirmed position) + alerts the
+  operator to verify the coupon NOW; on a later-leg timeout it routes to NAKED_EXPOSURE
+  (a confirmed live leg + an unconfirmed one). A definitive REJECT stays a clean reject.
+  (`src/execution/executor.py`, `PlacementResult`, `_pending_unknown`.)
+- **Schema:** `OpportunityStatus.PENDING_UNKNOWN` (models.py + `migrations/init.sql`
+  `'pending_unknown'` enum value) + `_OUTCOME_TO_STATUS` mapping (audit_recorder.py).
+  Audit is best-effort (3s timeout, try/except) so a not-yet-migrated live DB won't crash
+  the armed loop — run `ALTER TYPE opportunity_status ADD VALUE 'pending_unknown';` on the
+  live DB before/after deploy.
+- **Body logging length raised** (`non_success` 500→2000, poll_http_error 300→1500) so the
+  next capture's pending body is fully visible, not truncated mid-coupon.
+- **Viewer** (`scripts/view_hot_sessions.py`): `executor.pending_unknown` +
+  `leg_placer.betwarrior_delay_rejected` added to the watch set; `bet_status` in the tail.
+
+**State:** 687 unit tests pass (placers 92%, executor 98%, leg_placer 82% coverage), ruff
+clean, mypy strict clean. NOT yet deployed — the live armed bot (PID 45329) still runs poll v1.
+Deploy = restart the hot loop; then prove on the next natural LIVE_DELAY_PENDING via the
+viewer's `betwarrior_delay_resolved` (OPEN) / `betwarrior_delay_rejected` / `betwarrior_delay_timeout`
+(pending_unknown) events.
+
+**PITFALL (process):** running `ruff format` on the WHOLE repo reformatted 56 files of
+pre-existing formatting drift; a blanket `git checkout` to undo it also reverted the
+previous session's UNCOMMITTED work in `tests/unit/test_placers.py` + `LEDGER.md` (the v1
+poll entries). Recreated the critical placers coverage (strictness + matcher, 6 tests) and
+this consolidated LEDGER entry. LESSON: never `ruff format` the whole tree mid-task; format
+only the files you changed, and never blanket-revert untracked/uncommitted work — diff each
+file before checkout.
+
+**Still deferred (safe-path steps 2–5):** BetWarrior-first leg ordering; residual hedge
+recomputation after a changed-odds fill (the reason `allowOddsChange*=NO` is kept); a full
+`PlacementStatus = ACCEPTED | REJECTED | PENDING_UNKNOWN` enum (the `pending_unknown` flag is
+the minimal slice of it). The history endpoint + betStatus classification are GROUNDED from
+the capture body shape but the live `historyCoupons` entry for an OPEN bet has NOT yet been
+observed end-to-end — the next capture confirms or corrects the OPEN/field assumptions.
+
+**Login-gate EOF crash (found + fixed on first real gate-touch):** the operator touched
+`/tmp/arby_login_done` and the hot loop DIED with `EOFError: EOF when reading a line` at
+`run_hot_loop.py:_operator_login` → `input()`. The gate feeder
+(`while [ ! -f /tmp/arby_login_done ]; do sleep 2; done`) keeps stdin open until the file
+exists, then EOFs; `input()` raised instead of proceeding. This was LATENT — the previous
+session's bot never got past the gate. FIX: wrap `input()` in `try/except EOFError`; on EOF
+proceed ONLY if the gate file actually exists (a feeder death before the operator is ready
+must NOT silently trade past the gate — `SystemExit` otherwise). ruff-clean (ASYNC240 →
+`asyncio.to_thread(os.path.exists, ...)`). Redeployed: hot loop PID 80550, viewer 79354.
+
 ## 2026-06-21 — Aggression raise: budget 200→5000 + Betano live-cap sizing (B + C shipped, live-validated)
 
 **Context:** Make the armed bot place MORE and BIGGER bets. Two levers decided with

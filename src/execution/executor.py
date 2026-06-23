@@ -54,6 +54,7 @@ class Leg:
     platform_event_ref: str = ""  # event nav ref (Betsson slug / Bplay url_key)
     live_max_stake_ars: float | None = None  # live cap for dynamic platforms (Betano)
 
+
 # Re-price the arb at fresh reverify odds: given the original legs, the live
 # odds the executor just re-fetched, and each leg's live per-bet cap (None when
 # a platform has a static cap or the cap couldn't be read), return re-sized legs
@@ -68,6 +69,12 @@ ReverifyResize = Callable[[list[Leg], list[float], list[float | None]], list[Leg
 # the executor never talks to a bookmaker; the cap feeds re-pricing so a dynamic
 # leg sizes to the REAL book ceiling, not a stale fallback.
 CapRefresh = Callable[[Leg], Awaitable[float | None]]
+# Pre-place session-auth-liveness check (per leg). Returns False to ABORT the whole
+# arb before any leg is placed — e.g. a BetWarrior (Kambi) bearer the server has
+# invalidated (inactivity-logout 401), detected by a real authenticated probe so a
+# dead session can't go naked on the earlier legs. Injected so the executor stays
+# platform-agnostic; non-fragile platforms return True unconditionally from the wiring.
+AuthPrecheck = Callable[[Leg], Awaitable[bool]]
 
 
 @dataclass(frozen=True)
@@ -77,6 +84,12 @@ class PlacementResult:
     odds_filled: float = 0.0
     ref: str = ""
     detail: str = ""
+    # The bet was SUBMITTED but its acceptance could not be confirmed (e.g. a
+    # BetWarrior LIVE_DELAY_PENDING that didn't settle within the poll window). It
+    # may be placed on the book, so this is NOT a clean reject: the executor routes
+    # it to PENDING_UNKNOWN (halt + alert) rather than ABORTED ("nothing placed"),
+    # which would hide a live position.
+    pending_unknown: bool = False
 
 
 class LegPlacer(Protocol):
@@ -112,6 +125,10 @@ class ExecutionOutcome(StrEnum):
     COMPLETED = "completed"
     ABORTED = "aborted"  # before any leg placed — nothing at risk
     NAKED_EXPOSURE = "naked_exposure"  # ≥1 leg live, hedge incomplete — needs attention
+    # A bet was submitted but its acceptance could not be confirmed — it may be
+    # placed on the book. Halts auto-placement (kill switch) + alerts; neither a
+    # clean abort ("nothing placed" would hide a live position) nor confirmed naked.
+    PENDING_UNKNOWN = "pending_unknown"
     FROZEN = "frozen"  # unexpected state, recovery failed — halt
 
 
@@ -151,6 +168,7 @@ class Executor:
         placers: Mapping[str, LegPlacer] | None = None,
         reverify: Callable[[Leg], Awaitable[float]] = _no_reverify,
         cap_refresh: CapRefresh | None = None,
+        auth_precheck: AuthPrecheck | None = None,
         dry_run: bool = True,
     ) -> None:
         # A cross-platform arb routes each leg to its platform's placer (`placers`
@@ -165,6 +183,7 @@ class Executor:
         self._placers = dict(placers or {})
         self._reverify = reverify
         self._cap_refresh = cap_refresh
+        self._auth_precheck = auth_precheck
         self._dry_run = dry_run
         self._tag = "[DRY-RUN] " if dry_run else ""
         self._log = log.bind(component="executor", dry_run=dry_run)
@@ -224,7 +243,8 @@ class Executor:
             c = await self._reverify(leg)
             if c <= 0.0:  # _UNVERIFIED sentinel — re-fetch failed / market gone
                 return await self._abort(
-                    opp_id, f"leg {self._label(i)} odds unverifiable (re-fetch failed / market gone)"
+                    opp_id,
+                    f"leg {self._label(i)} odds unverifiable (re-fetch failed / market gone)",
                 )
             current_odds.append(c)
 
@@ -264,6 +284,18 @@ class Executor:
             if not check.allowed:
                 return await self._abort(opp_id, f"leg {self._label(i)} guardrail: {check.reason}")
 
+        # 4) Pre-place session-auth gate — abort before placing ANY leg if a leg's
+        #    session is server-dead. BetWarrior (Kambi) readiness is the only one blind
+        #    to a server-side kill (its bearer's JWT exp outlives an inactivity logout),
+        #    so the wiring probes its live bearer; a 401/403 here aborts with ZERO
+        #    position instead of placing leg A/B then going naked on the dead leg C.
+        if self._auth_precheck is not None:
+            for i, leg in enumerate(legs):
+                if not await self._auth_precheck(leg):
+                    return await self._abort(
+                        opp_id, f"leg {self._label(i)} session auth not live (pre-place)"
+                    )
+
         # Place sequentially. Re-verify each leg's LIVE odds right before placing it
         # (drift accrues while earlier legs are placed) and place AT the re-verified
         # odds — now against the RE-PRICED odds, so it only aborts/goes naked if the
@@ -280,6 +312,14 @@ class Executor:
                 return await self._abort(opp_id, reason)
             res = await placer.place(replace(leg, odds=current))  # place AT the re-verified odds
             if not res.accepted:
+                if res.pending_unknown:
+                    # Bet submitted but unconfirmed — may be placed. NOT a clean reject:
+                    # if earlier legs are live this is naked (confirmed + unconfirmed);
+                    # otherwise it's an unconfirmed position that must halt + alert.
+                    reason = f"leg {self._label(i)} unconfirmed (may be placed): {res.detail}"
+                    if placed:
+                        return await self._naked(opp_id, reason, placed)
+                    return await self._pending_unknown(opp_id, reason)
                 reason = f"leg {self._label(i)} rejected: {res.detail}"
                 if placed:  # earlier legs already live → unhedged
                     return await self._naked(opp_id, reason, placed)
@@ -292,10 +332,10 @@ class Executor:
         self._log.info("executor.completed", opp_id=opp_id, legs=len(placed))
         return ExecutionResult(ExecutionOutcome.COMPLETED, legs=tuple(placed))
 
-    def _format_complete(
-        self, opp_id: str, legs: list[Leg], placed: list[PlacementResult]
-    ) -> str:
-        lines = [f"{self._tag}✅ arb {opp_id}: COMPLETE — {len(placed)} legs filled (hedge secured)"]
+    def _format_complete(self, opp_id: str, legs: list[Leg], placed: list[PlacementResult]) -> str:
+        lines = [
+            f"{self._tag}✅ arb {opp_id}: COMPLETE — {len(placed)} legs filled (hedge secured)"
+        ]
         for i, (leg, res) in enumerate(zip(legs, placed, strict=True)):
             lines.append(
                 f"   Leg {self._label(i)}: {leg.platform} {leg.outcome} "
@@ -330,9 +370,22 @@ class Executor:
             f"🚨 {self._tag}arb {opp_id}: NAKED EXPOSURE — {len(placed)} leg(s) LIVE, hedge "
             f"incomplete: {reason}. Manual action needed (close/hedge the open position)."
         )
-        return ExecutionResult(
-            ExecutionOutcome.NAKED_EXPOSURE, reason=reason, legs=tuple(placed)
+        return ExecutionResult(ExecutionOutcome.NAKED_EXPOSURE, reason=reason, legs=tuple(placed))
+
+    async def _pending_unknown(self, opp_id: str, reason: str) -> ExecutionResult:
+        """A bet was submitted but its acceptance could not be confirmed — it may be
+        placed on the book. Trip the kill switch (halt auto-placement so the bot
+        can't compound an unconfirmed position) and alert the operator to verify
+        the coupon on the book NOW. Neither a clean abort (which falsely claims
+        "nothing placed") nor a confirmed naked (we don't know if anything's live)."""
+        self._log.error("executor.pending_unknown", opp_id=opp_id, reason=reason)
+        self._guardrails.trip_kill_switch(f"pending unknown: {reason}")
+        await self._notifier.send(
+            f"⚠️ {self._tag}arb {opp_id}: PENDING UNKNOWN — a bet was submitted but its "
+            f"acceptance could not be confirmed: {reason}. VERIFY the book now — the bet "
+            f"may be placed. Auto-placement halted (kill switch) until you confirm + reset."
         )
+        return ExecutionResult(ExecutionOutcome.PENDING_UNKNOWN, reason=reason)
 
     async def _freeze(self, opp_id: str, reason: str) -> ExecutionResult:
         self._log.error("executor.escalating", opp_id=opp_id, reason=reason)

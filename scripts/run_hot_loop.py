@@ -105,13 +105,25 @@ async def main() -> int:
             await betwarrior_t.goto(_BETWARRIOR_HOME)
             windows = "ALL THREE windows"
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            input,
-            f"\n  ▶ Log into {windows} (Betano: complete any challenge; Betsson: log in, "
-            "stay on PBA — the manager will do the My-Account nav; BetWarrior: log in). "
-            "When all show your balance, press ENTER… ",
-        )
+        try:
+            await loop.run_in_executor(
+                None,
+                input,
+                f"\n  ▶ Log into {windows} (Betano: complete any challenge; Betsson: log "
+                "in, stay on PBA — the manager will do the My-Account nav; BetWarrior: "
+                "log in). When all show your balance, press ENTER… ",
+            )
+        except EOFError:
+            # Background launch: stdin is the gate feeder
+            # (`while [ ! -f /tmp/arby_login_done ]; do sleep 2; done`), which EOFs when
+            # the operator touches the gate file. Proceed ONLY if the file actually exists
+            # — a feeder death before the operator is ready must NOT silently trade past
+            # the gate (would place through un-logged-in sessions).
+            if not await asyncio.to_thread(os.path.exists, "/tmp/arby_login_done"):
+                raise SystemExit(
+                    "login gate: stdin EOF but /tmp/arby_login_done absent — feeder died "
+                    "before the operator signaled ready; aborting (sessions not logged in)"
+                ) from None
 
     async with httpx.AsyncClient(headers=headers, timeout=25.0) as client:
         # Real notifier if Telegram creds are in the keychain, else a NullNotifier.

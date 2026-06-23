@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import uuid
+from enum import StrEnum
 from typing import Any
 
 from src.execution.executor import PlacementResult
@@ -117,7 +118,10 @@ def build_bplay_togglebet(outcome_id: int, csrf_token: str, url_key: str = "/") 
     The live app keys the context to the EVENT url_key (not "/"); pass it. The CSRF
     does NOT rotate within a slip (confirmed by capture) — the response echoes the
     same token under ``header.csrf_token``."""
-    return {"context": _bplay_context(url_key), "data": {"id": outcome_id, "csrf_token": csrf_token}}
+    return {
+        "context": _bplay_context(url_key),
+        "data": {"id": outcome_id, "csrf_token": csrf_token},
+    }
 
 
 def bplay_csrf_from_response(resp: dict[str, Any]) -> str:
@@ -317,6 +321,14 @@ def parse_bplay(resp: dict[str, Any]) -> PlacementResult:
     )
 
 
+# Kambi returns this TRANSIENT placement status when a bet is held during the live-bet
+# delay window: the bet was RECEIVED and is pending (resolves to SUCCESS/ACCEPTED or a
+# reject after a few seconds) — NOT a rejection. ``parse_betwarrior`` stays strict
+# (status == SUCCESS and an echoed coupon.bets); the placer owns the bounded poll that resolves it (see
+# ``BetWarriorLegPlacer._poll_live_delay``). Shared literal so both modules agree.
+BETWARRIOR_LIVE_DELAY_PENDING = "LIVE_DELAY_PENDING"
+
+
 def parse_betwarrior(resp: dict[str, Any]) -> PlacementResult:
     """``{"status":"SUCCESS","couponRef":N,"coupon":{"bets":[{"betOdds","stake"}]}}``
     Kambi units: BOTH odds and stake are ×1000 (confirmed by a live placement — a 1.14
@@ -324,12 +336,105 @@ def parse_betwarrior(resp: dict[str, Any]) -> PlacementResult:
     if resp.get("status") != "SUCCESS":
         return PlacementResult(accepted=False, detail=f"betwarrior: status={resp.get('status')}")
     bet = _first(_d(resp.get("coupon")).get("bets"))
+    # Require an ECHOED bet (stake + odds). A bare status == SUCCESS with no coupon.bets
+    # is NOT a placement — the live-delay poll (``match_betwarrior_coupon``) applies the
+    # same echoed-bet gate, so accepting on status alone could mark an unplaced bet as
+    # placed and leave the executor building a naked position. The documented SUCCESS
+    # shape always echoes coupon.bets[0], so this never rejects a genuine placement —
+    # it only closes the status-only hole.
+    if "stake" not in bet or "betOdds" not in bet:
+        return PlacementResult(
+            accepted=False,
+            detail="betwarrior: SUCCESS without echoed coupon.bets (status ok, no bet)",
+        )
+    return betwarrior_fill(bet, resp.get("couponRef", ""))
+
+
+def betwarrior_fill(bet: dict[str, Any], ref: Any) -> PlacementResult:
+    """Build the ACCEPTED result from a Kambi bet echo. Both ``stake`` and
+    ``betOdds`` are minor units ×1000 (÷1000 → ARS / decimal odds). Shared by the
+    synchronous SUCCESS parse and the live-delay history poll so the unit
+    conversion lives in exactly one place."""
     return PlacementResult(
         accepted=True,
         stake_filled=_f(bet.get("stake")) / 1000.0,
         odds_filled=_f(bet.get("betOdds")) / 1000.0,
-        ref=str(resp.get("couponRef", "")),
+        ref=str(ref),
     )
+
+
+# ---- BetWarrior (Kambi) coupon/history.json poll classification ----
+# A LIVE_DELAY_PENDING placement is resolved by polling the player-API
+# ``coupon/history.json`` — the SAME authenticated GET the SPA and the auth-liveness
+# probe use (proven 200 on cf-al-auth-api.kambicdn.com). The response wraps coupons in
+# ``historyCoupons``; we match the placed ``couponRef`` and classify ``bets[0].betStatus``.
+# NO ``status=`` query filter: a bet accepted during the live delay leaves the PENDING
+# bucket (betStatus → OPEN) and would VANISH from a ``status=PENDING`` query, so only an
+# unfiltered query can observe the accepted state. Grounded from the 2026-06-23 capture
+# (couponRef 12796224824, betStatus WAITING_FOR_APPROVAL, stake 234720, betOdds 25000)
+# and the 2026-06-01 recon (coupon/history.json → 200, empty historyCoupons).
+BETWARRIOR_BET_OPEN = "OPEN"  # accepted — the bet is live
+BETWARRIOR_BET_WAITING = "WAITING_FOR_APPROVAL"  # pending the live-delay window
+# Known REJECTION literals (bet NOT accepted). Matched case-insensitively so a Kambi
+# casing change can't turn a reject into a pending-unknown false alarm.
+_BETWARRIOR_BET_REJECTED = frozenset(
+    {"REFUSED", "REJECTED", "CANCELLED", "DECLINED", "VOID", "NOT_ACCEPTED"}
+)
+
+
+class BetHistoryMatch(StrEnum):
+    ACCEPTED = "accepted"  # betStatus OPEN + echoed stake/odds
+    WAITING = "waiting"  # betStatus WAITING_FOR_APPROVAL — keep polling
+    REJECTED = "rejected"  # a known reject literal — clean reject
+    UNKNOWN = "unknown"  # not found / unrecognized status — keep polling
+
+
+def match_betwarrior_coupon(
+    resp: dict[str, Any], *, coupon_ref: Any, bet_ref: Any = None
+) -> tuple[BetHistoryMatch, dict[str, Any]]:
+    """Classify a placed BetWarrior coupon inside a ``coupon/history.json`` body.
+
+    Returns ``(classification, matched_bet)`` — ``matched_bet`` is empty when the
+    coupon isn't present. Matches on the top-level ``couponRef`` the placement
+    echoes, falling back to ``betRef`` so a history variant that re-keys by bet is
+    still found. ``ACCEPTED`` requires OPEN status AND echoed ``stake``+``betOdds``
+    (the same strict gate as ``parse_betwarrior``) so the poll can never accept more
+    loosely than a synchronous place."""
+    coupons = resp.get("historyCoupons")
+    if not isinstance(coupons, list):
+        return BetHistoryMatch.UNKNOWN, {}
+    for c in coupons:
+        if not isinstance(c, dict):
+            continue
+        bets = c.get("bets")
+        # Match the coupon by couponRef (primary) or by a bet carrying our betRef (fallback).
+        coupon_match = c.get("couponRef") == coupon_ref or (
+            bet_ref is not None
+            and isinstance(bets, list)
+            and any(isinstance(b, dict) and b.get("betRef") == bet_ref for b in bets)
+        )
+        if not coupon_match:
+            continue
+        # Identify OUR bet within the matched coupon. When we have a betRef, find it
+        # EXPLICITLY — never bets[0]: a multi-bet coupon could classify a different bet
+        # (e.g. ACCEPT an OPEN sibling while our betRef is still WAITING_FOR_APPROVAL).
+        if bet_ref is not None and isinstance(bets, list):
+            bet = next(
+                (b for b in bets if isinstance(b, dict) and b.get("betRef") == bet_ref), {}
+            )
+        else:
+            bet = _first(bets)
+        status = str(bet.get("betStatus", "")).upper()
+        if status == BETWARRIOR_BET_OPEN and "stake" in bet and "betOdds" in bet:
+            return BetHistoryMatch.ACCEPTED, bet
+        if status == BETWARRIOR_BET_WAITING:
+            return BetHistoryMatch.WAITING, bet
+        if status in _BETWARRIOR_BET_REJECTED:
+            return BetHistoryMatch.REJECTED, bet
+        return BetHistoryMatch.UNKNOWN, bet
+    # Coupon not in the list yet (not propagated) or already resolved+gone.
+    # Either way: keep polling; unresolved at the deadline → pending_unknown.
+    return BetHistoryMatch.UNKNOWN, {}
 
 
 def parse_betsson(resp: dict[str, Any]) -> PlacementResult:

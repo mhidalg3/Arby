@@ -95,6 +95,7 @@ CREATE TYPE opportunity_status AS ENUM (
     'completed',
     'aborted_pre_execution',
     'aborted_post_leg_a',  -- naked exposure incident
+    'pending_unknown',     -- bet submitted, acceptance unconfirmed; halt + verify
     'expired',
     'frozen'               -- recovery failed / unexpected state — halt
 );

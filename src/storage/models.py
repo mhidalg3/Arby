@@ -104,7 +104,9 @@ class OpportunityStatus(enum.StrEnum):
     LEG_B_PENDING = "leg_b_pending"
     COMPLETED = "completed"
     ABORTED_PRE_EXECUTION = "aborted_pre_execution"
-    ABORTED_POST_LEG_A = "aborted_post_leg_a"  # naked exposure
+    ABORTED_POST_LEG_A = "aborted_post_leg_a"  # naked exposure incident
+    # bet submitted but acceptance unconfirmed — may be placed; halt + verify
+    PENDING_UNKNOWN = "pending_unknown"
     EXPIRED = "expired"
     FROZEN = "frozen"  # recovery failed / unexpected state — halt
 

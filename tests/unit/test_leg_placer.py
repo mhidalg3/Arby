@@ -64,6 +64,37 @@ class SeqTransport:
         return self._responses[len(self.calls) - 1]
 
 
+class _DelayTransport:
+    """BetWarrior fake: the POST returns a LIVE_DELAY_PENDING place body (with a
+    couponRef), and each GET poll returns the next queued (status, body). Exercises
+    BetWarriorLegPlacer._poll_live_delay without real network or multi-second sleeps."""
+
+    def __init__(
+        self,
+        *,
+        place_body: dict[str, Any],
+        poll_responses: list[tuple[int, dict[str, Any]]],
+        bearer: str | None = "TOK",
+    ) -> None:
+        self.bearer = bearer
+        self._place_body = place_body
+        self._poll_responses = list(poll_responses)
+        self.calls: list[dict[str, Any]] = []
+
+    async def prepare_betwarrior_auth(self) -> str | None:
+        return self.bearer
+
+    async def fetch(self, method, url, *, json_body=None, headers=None):  # type: ignore[no-untyped-def]
+        self.calls.append({"method": method, "url": url})
+        if method == "POST":
+            return 200, self._place_body
+        # GET poll — drain the queue; default to coupon-not-yet-propagated once
+        # exhausted (match_betwarrior_coupon → UNKNOWN → keep polling → timeout).
+        if self._poll_responses:
+            return self._poll_responses.pop(0)
+        return 200, {"historyCoupons": []}
+
+
 def _leg(
     platform: str, outcome_id: str, stake: float, odds: float, event_ref: str = "futbol/x-vs-y"
 ) -> Leg:
@@ -125,8 +156,13 @@ async def test_betsson_fills_exposure_from_requested_when_not_echoed() -> None:
     # Betsson's response echoes no stake/odds → fall back to requested (for exposure).
     t = FakeTransport(
         200,
-        {"couponStatus": {"couponStatusPollingResult": "Success", "couponId": "C1",
-                          "couponPlacementErrors": []}},
+        {
+            "couponStatus": {
+                "couponStatusPollingResult": "Success",
+                "couponId": "C1",
+                "couponPlacementErrors": [],
+            }
+        },
     )
     res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-x", 50.0, 2.62))
     assert res.accepted and res.stake_filled == 50.0 and res.odds_filled == 2.62
@@ -157,7 +193,9 @@ async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
     assert call["json"]["couponRows"][0]["outcomeId"] == 4206111729
     assert call["json"]["couponRows"][0]["odds"] == 1410  # 1.41 ×1000 (captured app contract)
     assert call["json"]["bets"][0]["stake"] == 500000  # 500.0 ×1000
-    assert call["json"]["allowOddsChange"] == "NO"  # exact odds = the edge (live re-verify supplies)
+    assert (
+        call["json"]["allowOddsChange"] == "NO"
+    )  # exact odds = the edge (live re-verify supplies)
 
 
 async def test_betwarrior_fails_closed_when_bearer_not_captured() -> None:
@@ -165,6 +203,133 @@ async def test_betwarrior_fails_closed_when_bearer_not_captured() -> None:
     res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
     assert not res.accepted and "bearer not captured" in res.detail
     assert not t.calls  # never POSTed
+
+
+async def test_betwarrior_live_delay_poll_resolves_to_open() -> None:
+    # POST → LIVE_DELAY_PENDING (couponRef 777); the GET poll finds the coupon in
+    # coupon/history.json with betStatus OPEN + echoed stake/odds → accepted.
+    t = _DelayTransport(
+        place_body={"status": "LIVE_DELAY_PENDING", "couponRef": 777},
+        poll_responses=[
+            (
+                200,
+                {
+                    "historyCoupons": [
+                        {
+                            "couponRef": 777,
+                            "bets": [{"betStatus": "OPEN", "betOdds": 1410, "stake": 500000}],
+                        }
+                    ]
+                },
+            ),
+        ],
+    )
+    res = await BetWarriorLegPlacer(t, live_delay_timeout_s=1.0, live_delay_interval_s=0.0).place(
+        _leg("betwarrior-pba", "42", 500.0, 1.41)
+    )
+    assert res.accepted and res.ref == "777" and res.odds_filled == 1.41
+    assert not res.pending_unknown
+    # Placed via POST, then GET-polled the coupon/history.json endpoint.
+    assert t.calls[0]["method"] == "POST" and t.calls[0]["url"].endswith("/coupon.json")
+    assert t.calls[1]["method"] == "GET" and "/coupon/history.json" in t.calls[1]["url"]
+
+
+async def test_betwarrior_live_delay_poll_waiting_then_open() -> None:
+    # First poll → WAITING_FOR_APPROVAL (keep polling); second poll → OPEN → accepted.
+    t = _DelayTransport(
+        place_body={"status": "LIVE_DELAY_PENDING", "couponRef": 777},
+        poll_responses=[
+            (
+                200,
+                {
+                    "historyCoupons": [
+                        {
+                            "couponRef": 777,
+                            "bets": [
+                                {
+                                    "betStatus": "WAITING_FOR_APPROVAL",
+                                    "betOdds": 1410,
+                                    "stake": 500000,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            ),
+            (
+                200,
+                {
+                    "historyCoupons": [
+                        {
+                            "couponRef": 777,
+                            "bets": [{"betStatus": "OPEN", "betOdds": 1410, "stake": 500000}],
+                        }
+                    ]
+                },
+            ),
+        ],
+    )
+    res = await BetWarriorLegPlacer(t, live_delay_timeout_s=1.0, live_delay_interval_s=0.0).place(
+        _leg("betwarrior-pba", "42", 500.0, 1.41)
+    )
+    assert res.accepted and res.ref == "777"
+    assert len(t.calls) == 3  # POST + 2 polls
+
+
+async def test_betwarrior_live_delay_poll_rejected_is_clean_reject() -> None:
+    # betStatus REFUSED → a definitive reject → clean reject, NOT pending_unknown.
+    t = _DelayTransport(
+        place_body={"status": "LIVE_DELAY_PENDING", "couponRef": 777},
+        poll_responses=[
+            (
+                200,
+                {
+                    "historyCoupons": [
+                        {
+                            "couponRef": 777,
+                            "bets": [{"betStatus": "REFUSED", "betOdds": 1410, "stake": 500000}],
+                        }
+                    ]
+                },
+            ),
+        ],
+    )
+    res = await BetWarriorLegPlacer(t, live_delay_timeout_s=1.0, live_delay_interval_s=0.0).place(
+        _leg("betwarrior-pba", "42", 500.0, 1.41)
+    )
+    assert not res.accepted and not res.pending_unknown
+    assert "rejected" in res.detail and "REFUSED" in res.detail
+
+
+async def test_betwarrior_live_delay_poll_times_out_pending_unknown() -> None:
+    # Coupon never appears in history (still WAITING / not propagated) → deadline
+    # trips → pending_unknown (bet was submitted; may still be placed), not a
+    # clean reject.
+    t = _DelayTransport(
+        place_body={"status": "LIVE_DELAY_PENDING", "couponRef": 777},
+        poll_responses=[],  # defaults to coupon-not-propagated
+    )
+    res = await BetWarriorLegPlacer(
+        t, live_delay_timeout_s=0.02, live_delay_interval_s=0.005
+    ).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
+    assert not res.accepted and res.pending_unknown
+    assert "LIVE_DELAY_PENDING unresolved" in res.detail and "777" in res.detail
+    assert len(t.calls) >= 2  # POSTed + polled at least once
+
+
+async def test_betwarrior_live_delay_without_coupon_ref_is_pending_unknown() -> None:
+    # No couponRef on the pending body, but the bet WAS submitted (LIVE_DELAY_PENDING) →
+    # cannot poll, and it may still settle → pending_unknown (NOT a clean reject).
+    t = _DelayTransport(
+        place_body={"status": "LIVE_DELAY_PENDING"},  # no couponRef
+        poll_responses=[(200, {"historyCoupons": []})],
+    )
+    res = await BetWarriorLegPlacer(t, live_delay_timeout_s=1.0, live_delay_interval_s=0.0).place(
+        _leg("betwarrior-pba", "42", 500.0, 1.41)
+    )
+    assert not res.accepted and res.pending_unknown
+    assert "without couponRef" in res.detail
+    assert len(t.calls) == 1  # POSTed only — never polled
 
 
 async def test_betano_runs_slip_sequence_and_places_with_refreshed_hash() -> None:
