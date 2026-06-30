@@ -34,6 +34,12 @@ from src.execution.session import Transport, TransportError
 log = structlog.get_logger(__name__)
 
 _BETSSON_PLACE_URL = "https://pba.betsson.bet.ar/api/sb/v2/coupons"
+# A favorable Betsson odds correction is re-submitted only up to this much above the
+# submitted price. Real arb drift is ~1-5%; a multiple-of-the-price "valid" odds is a
+# data/selection anomaly, so we fail closed past the cap. Deliberately NOT the 1.0%
+# `odds_tolerance_pct` (config.py:39) — that governs UNFAVORABLE drift and would
+# re-reject the observed +2.30% favorable move this change exists to capture.
+_BETSSON_RESUBMIT_MAX_UPLIFT_PCT = 20.0
 # Headers the coupons POST always needs; merged UNDER the captured live context so
 # the placer never depends on which request we captured the context from.
 _BETSSON_REQUIRED_HEADERS = {
@@ -122,11 +128,65 @@ class BetssonLegPlacer:
         if status >= 400:
             return PlacementResult(accepted=False, detail=f"HTTP {status}: {str(resp)[:200]}")
         result = placers.parse_betsson(resp)
-        if result.accepted and result.stake_filled == 0.0:
-            # Betsson's coupon response doesn't echo stake/odds — fall back to the
-            # requested values so the executor records exposure correctly.
-            return replace(result, stake_filled=leg.stake_ars, odds_filled=leg.odds)
-        return result
+        if result.accepted:
+            if result.stake_filled == 0.0:
+                # Betsson's coupon response doesn't echo stake/odds — fall back to the
+                # requested values so the executor records exposure correctly.
+                return replace(result, stake_filled=leg.stake_ars, odds_filled=leg.odds)
+            return result
+        # Not accepted. E_BETTING_ODDS_INVALID + validOdds is a price-confirmation
+        # handshake: when the new price is FAVORABLE (higher odds at the SAME stake →
+        # worst-case payout strictly non-decreasing, hedge can only improve) and within
+        # the anomaly cap, re-submit ONCE at the exact returned odds. Unfavorable /
+        # over-cap / non-odds / ambiguous rejects keep the reject (executor aborts when
+        # nothing's placed; flags naked once a leg is live).
+        correction = placers.betsson_odds_correction(resp)
+        if correction is None:
+            return result
+        # Selection identity: the single-selection coupon's correction must be for OUR
+        # selection. marketSelectionTag == platform_outcome_id (both the
+        # `s-m-f-<hash>-<MARKET>-<outcome>` form: builder posts platform_outcome_id as
+        # marketSelectionId, placers.py:73; live reject tag, events.jsonl:17). A
+        # non-empty tag that differs ⇒ the market/line changed underneath us → fail
+        # closed.
+        if correction.selection_tag not in ("", leg.platform_outcome_id):
+            self._log.warning(
+                "leg_placer.betsson_odds_tag_mismatch",
+                submitted_selection=leg.platform_outcome_id,
+                correction_tag=correction.selection_tag,
+            )
+            return result
+        uplift_ceiling = leg.odds * (1.0 + _BETSSON_RESUBMIT_MAX_UPLIFT_PCT / 100.0)
+        if not (leg.odds < correction.valid_odds <= uplift_ceiling):
+            self._log.info(
+                "leg_placer.betsson_odds_unfavorable",
+                submitted=leg.odds,
+                valid_odds=correction.valid_odds,
+                selection_tag=correction.selection_tag,
+            )
+            return result
+        self._log.info(
+            "leg_placer.betsson_odds_resubmit",
+            submitted=leg.odds,
+            valid_odds=correction.valid_odds,
+            selection_tag=correction.selection_tag,
+        )
+        retry_request = placers.build_betsson_request(
+            [(leg.platform_outcome_id, correction.valid_odds_str)], leg.stake_ars
+        )
+        try:
+            status, resp = await self._t.fetch(
+                "POST", _BETSSON_PLACE_URL, json_body=retry_request, headers=headers
+            )
+        except TransportError as exc:
+            self._log.warning("leg_placer.transport_error", error=str(exc))
+            return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
+        if status >= 400:
+            return PlacementResult(accepted=False, detail=f"HTTP {status}: {str(resp)[:200]}")
+        retry = placers.parse_betsson(resp)
+        if retry.accepted and retry.stake_filled == 0.0:
+            return replace(retry, stake_filled=leg.stake_ars, odds_filled=correction.valid_odds)
+        return retry
 
 
 class BetWarriorTransport(Protocol):
@@ -177,7 +237,9 @@ class BetWarriorLegPlacer:
             return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
         if not bearer:
             return PlacementResult(
-                accepted=False, detail="betwarrior: session bearer not captured (logged in?)"
+                accepted=False,
+                detail="betwarrior: session bearer not captured (logged in?)",
+                auth_failed=True,
             )
         # leg.odds must be the live-re-verified current odds (allowOddsChange is NO) —
         # Kambi rejects "Invalid odds specified" if it doesn't match the book's current.
@@ -198,7 +260,11 @@ class BetWarriorLegPlacer:
             # Surface the Kambi error body — it names the reason (odds change, suspended
             # outcome, validation) so a rejection is diagnosable, not an opaque 400.
             self._log.warning("leg_placer.http_error", status=status, body=str(resp)[:300])
-            return PlacementResult(accepted=False, detail=f"HTTP {status}: {str(resp)[:200]}")
+            return PlacementResult(
+                accepted=False,
+                detail=f"HTTP {status}: {str(resp)[:200]}",
+                auth_failed=status == 401,
+            )
         # Log the body on ANY non-SUCCESS HTTP-200 response — previously only HTTP ≥ 400 was
         # logged, so a LIVE_DELAY_PENDING (the transient hold the poll below resolves) went
         # blind. This also captures any future unrecognized status literal for diagnosis.

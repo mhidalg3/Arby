@@ -75,6 +75,12 @@ CapRefresh = Callable[[Leg], Awaitable[float | None]]
 # dead session can't go naked on the earlier legs. Injected so the executor stays
 # platform-agnostic; non-fragile platforms return True unconditionally from the wiring.
 AuthPrecheck = Callable[[Leg], Awaitable[bool]]
+# Drive a full re-auth for this leg's platform (e.g. a BetWarrior logout→login when the
+# held Kambi bearer is server-rejected on a placement 401). True ⇒ session refreshed,
+# caller may retry the failed leg ONCE. Injected so the executor stays platform-agnostic;
+# returns False for platforms without auto re-auth or on a challenge/failure — the
+# executor then keeps today's abort/naked, never adding exposure.
+ReauthHandler = Callable[[Leg], Awaitable[bool]]
 
 
 @dataclass(frozen=True)
@@ -90,6 +96,10 @@ class PlacementResult:
     # it to PENDING_UNKNOWN (halt + alert) rather than ABORTED ("nothing placed"),
     # which would hide a live position.
     pending_unknown: bool = False
+    # The placement failed a session-auth check (HTTP 401 / no bearer) — eligible for
+    # one auto re-auth + retry (see ReauthHandler). Other ≥400 rejects stay False so
+    # they keep today's abort/naked behavior; only BetWarrior's auth failures set it.
+    auth_failed: bool = False
 
 
 class LegPlacer(Protocol):
@@ -169,6 +179,7 @@ class Executor:
         reverify: Callable[[Leg], Awaitable[float]] = _no_reverify,
         cap_refresh: CapRefresh | None = None,
         auth_precheck: AuthPrecheck | None = None,
+        reauth: ReauthHandler | None = None,
         dry_run: bool = True,
     ) -> None:
         # A cross-platform arb routes each leg to its platform's placer (`placers`
@@ -184,6 +195,7 @@ class Executor:
         self._reverify = reverify
         self._cap_refresh = cap_refresh
         self._auth_precheck = auth_precheck
+        self._reauth = reauth
         self._dry_run = dry_run
         self._tag = "[DRY-RUN] " if dry_run else ""
         self._log = log.bind(component="executor", dry_run=dry_run)
@@ -303,6 +315,7 @@ class Executor:
         # unverifiable → 0.0) we stop: abort when nothing's live, NAKED EXPOSURE once
         # ≥1 leg is live (the hedge is incomplete).
         placed: list[PlacementResult] = []
+        reauthed = False  # one re-auth per execution (a 2nd BW leg reuses the fresh bearer)
         for i, (leg, placer) in enumerate(zip(legs, placers, strict=True)):
             current = await self._reverify(leg)
             if not self._guardrails.odds_still_acceptable(leg.odds, current):
@@ -311,6 +324,23 @@ class Executor:
                     return await self._naked(opp_id, reason, placed)
                 return await self._abort(opp_id, reason)
             res = await placer.place(replace(leg, odds=current))  # place AT the re-verified odds
+            # One bounded re-auth: a BetWarrior 401/no-bearer (auth_failed) is eligible
+            # for a single logout→login + retry. Re-auth takes time, so re-verify odds and
+            # re-check tolerance before the retry — a challenged/failed re-auth or
+            # post-re-auth drift falls through to the unchanged abort/naked block below,
+            # so the rescue NEVER adds exposure. Per-execution bound: a 2nd BetWarrior leg
+            # reuses the now-fresh bearer (no 2nd re-auth); if that still 401s, one clean
+            # abort/naked follows (no loop).
+            if not res.accepted and res.auth_failed and self._reauth is not None and not reauthed:
+                reauthed = True
+                await self._notifier.send(
+                    f"{self._tag}arb {opp_id}: leg {self._label(i)} 401 "
+                    "— re-authenticating BetWarrior…"
+                )
+                if await self._reauth(leg):
+                    current = await self._reverify(leg)
+                    if self._guardrails.odds_still_acceptable(leg.odds, current):
+                        res = await placer.place(replace(leg, odds=current))
             if not res.accepted:
                 if res.pending_unknown:
                     # Bet submitted but unconfirmed — may be placed. NOT a clean reject:

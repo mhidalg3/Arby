@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,10 @@ _SESSION_EVENTS = {
     "transport.block_probe_error",
     "transport.reality_check_dismissed",
     "transport.reality_check_dismiss_error",
+    "transport.promotions_home_recovered",
+    "transport.promotions_home_error",
+    "hot_sessions.promotions_home_recovered",
+    "hot_sessions.promotions_home_failed",
     "transport.session_expired",
     "guardrails.kill_switch_tripped",
     "guardrails.kill_switch_reset",
@@ -156,6 +161,8 @@ def _classify(platform: str, scan: dict[str, Any], shadow: list[Any], url: str) 
     overlay = (scan.get("overlayText") or "").lower()
     body = (scan.get("bodyText") or "").lower()
     blob = overlay + " " + body + " " + " ".join(s.get("text", "") for s in shadow).lower()
+    if platform == "betwarrior" and "/promotions" in url.lower() and "promociones" in blob:
+        return "promotions_page"
     for p in _SESSION_EXPIRED_PHRASES:
         if p in blob:
             return "session_expired"
@@ -478,6 +485,10 @@ class Viewer:
 
 
 async def main() -> int:
+    # When stdout is redirected to a log file (the normal deployment), Python
+    # block-buffers print() and a `tail -f` sees nothing until ~4KB accumulates. Force
+    # line buffering so each tick flushes live.
+    sys.stdout.reconfigure(line_buffering=True)
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--platforms",

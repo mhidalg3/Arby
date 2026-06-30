@@ -1,5 +1,779 @@
 # Project Ledger
 
+## 2026-06-29 — Betsson reality-check: exclusive detection (phrase AND close button)
+
+**Context:** The bot overreported reality-check popups — it fired on any Betsson page
+showing the responsible-gambling disclaimer text (e.g. the promo/bonus page
+`ofertas.pba.betsson.bet.ar/ag/bono-de-bienvenida-deportes-out`, 502 context-error
+pages), not just the actual popup. Root cause: `_BETSSON_REALITY_CHECK_SCAN_JS` matched
+the reality-check PHRASE anywhere visible on the page (including footer/promo text),
+with no requirement that the popup's own UI element be present. Combined with the
+same-day skip-goto guard, this created a deadlock: false-positive → skip goto → window
+stuck on the promo page → scan keeps false-positiving.
+
+**Decisions:** Tightened `_BETSSON_REALITY_CHECK_SCAN_JS` to require BOTH a grounded
+reality-check phrase AND the popup's own close button (`fds-button[data-test-id^=
+"reality-check"]`). A page with footer disclaimer text but no `Cerrar` button now returns
+`found: false` → no false-positive block → `establish_betsson_context` runs its goto
+normally (navigating back to the sportsbook / clearing 502s). Only the real popup
+(phrase + button both visible) triggers detection and the close recovery. The close JS
+(`_BETSSON_REALITY_CHECK_CLOSE_JS`) already required both, so no change there.
+
+**State:** 739 unit tests pass (ruff/mypy clean). The exclusivity logic lives in the JS
+scan string, which the fake-page tests do NOT execute — they verify the Python
+consumption path (unchanged). The phrase+button requirement itself needs live validation:
+confirm the promo page and 502 pages no longer produce a `reality_check` block, and that
+a real popup still does. Redeploy from the operator's terminal to pick this up.
+
+## 2026-06-29 — Betsson reality-check: stop page reload while popup is up
+
+**Context:** The Betsson reality-check popup persisted while the bot "just refreshed the
+page" — a reload cannot dismiss it (only the orange `Cerrar` /
+`fds-button[data-test-id="reality-check-btn-1"]` does). Root cause:
+`establish_betsson_context()` does `page.goto(_BETSSON_HOME, networkidle)` on every heartbeat
+readiness probe (`_probe_readiness` → `self._betsson.establish_betsson_context()`), even while
+the popup is up. The block IS detected and the close recovery IS scheduled (targets the
+grounded selector + real pointer click), but the constant reload fights the click (DOM
+mid-render) and can re-trigger the SPA after a successful close.
+
+**Decisions:** Added a reality-check guard at the top of `establish_betsson_context()`
+(session.py): before any goto / betslip clear / in-app nav, call `check_session_blocked()`;
+if the block is a `reality_check` overlay, log `transport.betsson_context_skipped_reality_
+check` and return False immediately. The manager still detects the block via its own
+`check_session_blocked()` call and runs `attempt_reality_check_close()` to click Cerrar —
+but against a stable DOM, not a page mid-reload. Non-reality-check blocks (RG lockout,
+session_expired, session_timer) fall through to the goto unchanged. No new exposure: a
+not-ready Betsson is suspended; the close only dismisses a reminder (never places a bet).
+
+**State:** Verification green — focused + full `uv run pytest tests/unit/ -q` (739 passed),
+ruff check/format, mypy on session.py. New regressions lock in the contract:
+`establish_betsson_context()` returns False WITHOUT calling `goto()` when the reality-check
+shadow popup is present; and goto IS called when no overlay is up (the skip is
+reality-check-specific, not universal). Running bot does NOT have this fix — redeploy from
+the operator's terminal to pick it up.
+
+
+## 2026-06-27 — Betsson reality-check follow-up: bounded retries per popup episode
+
+**Context:** A new live Betsson reality-check popup stayed open for ~20 minutes even after
+the earlier grounded `fds-button[data-test-id="reality-check-btn-1"]` close fix had been
+deployed. The active hot-loop process (PID 33018) started at 17:15, after `session.py`
+was modified at 16:54, so this was not simply old code. Live DOM inspection was not
+available: the process environment had no `CDP_PORT_BASE`, and `http://127.0.0.1:9223`
+was not listening. `/tmp/arby_hot_loop.log` was stale (last timestamp 2026-06-26)
+because the running process writes stdout/stderr to the operator terminal.
+
+**Decisions:** Fixed the concrete manager-level wedging bug: Betsson reality-check close
+was one-shot per popup episode. If the first click missed, landed during SPA cooldown /
+animation, or the custom element ignored it, `_reality_check_attempted` stayed set until
+the popup disappeared, so no further close attempts ran. Recovery now keeps one background
+task per popup episode, but that task performs a bounded retry loop:
+`_REALITY_CHECK_MAX_CLOSE_ATTEMPTS = 3`, `_REALITY_CHECK_CLOSE_RETRY_DELAY_S = 10`,
+`_REALITY_CHECK_CLOSE_ATTEMPT_TIMEOUT_S = 20` per close attempt, and
+`_REALITY_CHECK_RECHECK_TIMEOUT_S = 10` for cheap block rechecks. The manager does
+`check_session_blocked()` before each attempt and immediately after a failed attempt; if
+the popup has already cleared or changed kind, it re-probes readiness and resets health
+without another click. Timed-out close attempts or rechecks consume the bounded recovery
+budget instead of wedging the task forever. The click target remains the grounded
+`fds-button` selector; this change does not widen the bookmaker click surface.
+`attempt_reality_check_close()` now logs
+`transport.reality_check_target_missing` when scan sees the popup but cannot find a close
+coordinate.
+
+**State:** Tests updated for the new contract: persistent popup retries up to the cap and
+then stays suspended/alerted; a transient missed click recovers on a later attempt; a
+manual/late clear before retry resets health without another click; a clear during retry
+delay skips the next click; hung close attempts and hung rechecks time out and consume
+bounded retry budget; a second popup episode gets a fresh close budget after the first
+clears. Verification green: focused recovery tests, ruff, mypy, and full
+`uv run pytest tests/unit/ -q` (737 passed).
+Next operator redeploy should set
+`CDP_PORT_BASE=9222` so the viewer/assistant can inspect Betsson live via 9223 if the
+popup still fails after bounded retries.
+
+**Errors / learnings:** The previous entry over-focused on selector grounding. Selector
+correctness is necessary but not sufficient when the recovery policy permits only one
+click. A safe bookmaker-popup recovery should be bounded, observable, and retry transient
+misses without creating an unbounded click loop.
+
+## 2026-06-27 — Naked exposure drift analysis: ordering evidence and hedge-policy choices
+
+**Context:** A live 3-way arb on Aguia de Maraba PA vs Parnahyba PI went naked after the
+bot placed two Betsson legs first, then rejected the final BetWarrior HOME leg because
+reverify drifted from 1.94 to 1.82. The drift objectively killed the arb:
+`1/1.82 + 1/3.1 + 1/6.8 = 1.01909 > 1`, so the executor correctly refused to complete
+the original arb under profitability guardrails. With only the two Betsson legs live, the
+tail was large: HOME win ≈ -2,377 ARS; DRAW/AWAY ≈ +2,685/+2,682 ARS.
+
+**Decisions / analysis:** This is a between-leg drift and sequencing failure, not a missing
+initial validation gate. The executor already checks profitability at current live odds
+before placement and re-verifies each leg immediately before placing it. The evidence
+belongs in the leg-order decision doc: same-platform-pair-first / multi-leg-platform-first
+left the single remaining BW hedge leg last; BW drift then exposed the already-filled
+Betsson pair. Prefer the single remaining platform early in 3-way 2+1 splits, especially
+when that platform is BW or otherwise operationally fragile.
+
+**Fallback hedge policy choices:** Do not treat auto-hedge as automatically correct; it is
+a risk-policy choice between EV and tail risk.
+
+- EV-seeking: maybe stay naked.
+- Tail-risk-limiting: hedge and accept a small certain loss.
+- Capital-preservation / operator-sleep mode: hedge automatically under capped-loss thresholds.
+
+For this specific arb, the best equalized HOME hedge at 1.82 would have been about 2,780
+ARS, locking roughly -97 ARS across outcomes. Staying naked is higher-EV only if the
+post-drift market probabilities are trusted as fair, but it carries the much worse -2,377
+ARS HOME tail. Any automated hedge must therefore live in `src/risk` as an explicit policy:
+minimize worst-case loss only when the locked rescue loss is under a configured cap, never
+as an unconditional "complete the arb anyway" bypass.
+
+**State:** `docs/leg_placement_order_decision.md` now records this incident and the
+latency constraint for future residual-tail ordering. Residual-tail scoring must be local
+pre-placement arithmetic over already-known legs/stakes/odds and platform risk priors; it
+must not add bookmaker calls, browser probes, sleeps, or between-leg pauses. For normal
+3-way arbs, evaluating all leg orders is only six permutations, so CPU cost is negligible;
+if inputs are missing, fall back to the hand-coded heuristic rather than delaying
+execution. No code changed in this entry.
+
+**Errors / learnings:** "Complete the arb" and "cap the naked tail" are different
+objectives. At 1.82 the arb no longer existed; the only automated rescue available was a
+loss-capping hedge. Placement order should reduce the chance of reaching that state by
+putting the single fragile/remaining platform earlier, not by adding slower validation
+loops.
+
+## 2026-06-27 — BetWarrior cold-on-redeploy fix (post-login sportsbook warmup)
+
+**Context:** After redeploy, BetWarrior reported cold / disabled auto-placement even
+though the operator had logged in. Only a manual force-reauth (`touch
+/tmp/arby_force_bw_reauth`) flipped it live. Diagnosis: `_captured_bearer` (the Kambi
+placement bearer) is set only when the SPA fires a `kambicdn.com/player/` request, which
+happens when the **sportsbook widget loads** — NOT on auth alone (validated during the
+reauth work). On deploy `_operator_login` navigated BW only to the root
+(`_BETWARRIOR_HOME = "https://pba.betwarrior.bet.ar/"`), so after login the window sat on
+the root, never loaded the sportsbook, never emitted the bearer, and the (correctly
+passive) readiness probe `check_betwarrior_ready` → `prepare_betwarrior_auth` returned
+None → cold. The force-reauth worked solely because `attempt_betwarrior_relogin`
+navigates to `_BW_SPORTSBOOK_HOME`.
+
+**Decisions:** Added a one-time post-login sportsbook warmup in `_operator_login`
+(`scripts/run_hot_loop.py`): AFTER the operator signals done (ENTER or the gate file),
+navigate the BW window to `_BW_SPORTSBOOK_HOME` once. This loads the sportsbook widget →
+emits the bearer → the first `_probe_readiness` captures it → BW reports live. The
+readiness probe stays passive (no nav hidden inside it). The operator prompt now notes
+"BetWarrior: log in — the bot opens its sportsbook after". Reuses the canonical
+`_BW_SPORTSBOOK_HOME` from session.py (single source of truth).
+
+**State:** Verification green: `uv run mypy scripts/run_hot_loop.py`, `uv run ruff check
+scripts/run_hot_loop.py`, `uv run ruff format --check scripts/run_hot_loop.py`, and
+`uv run pytest tests/unit/ -q` (731 passed). Live validation requires the next redeploy
+from the operator's terminal — the currently running bot does not pick up this change.
+After redeploy BW should report live on the first heartbeat without a force-reauth.
+
+**Errors / learnings:** A passive readiness probe that keys on a token the SPA emits only
+on a specific page is fragile at cold-start: the probe can't see a live session if the
+window is parked on the wrong page. The deploy flow must place each platform on the page
+that emits its readiness signal before the first probe runs.
+
+## 2026-06-27 — Betsson reality-check auto-close fixed for live `fds-button` Cerrar
+
+**Context:** Live Betsson window showed the reality-check popup (`¿Sabés qué hora es?`).
+The bot detected it correctly and alerted/suspended, but the recovery did not dismiss it:
+the popup persisted and the bot only kept refreshing/remaining blocked. Operator grounded
+the actual close control: orange `<fds-button data-test-id="reality-check-btn-1">Cerrar</fds-button>`
+at the bottom of the popup.
+
+**Decisions:** Updated the Betsson reality-check close path to find the close target inside
+the same shadow-root subtree that contains a grounded reality-check phrase, require the
+grounded `fds-button[data-test-id="reality-check-btn-1"]` custom element, and return its
+viewport center. `attempt_reality_check_close()` now performs a real Playwright mouse
+move+click at that coordinate instead of synthetic DOM `.click()`, then keeps the existing
+post-click scan gate: success only if the reality marker disappears. The recovery remains
+Betsson-only and fail-soft; a missing selector or persistent popup returns False and leaves
+the existing suspend+alert path active.
+
+**State:** Focused tests were updated to model the custom-element coordinate-return +
+`page.mouse.click` contract, including a negative assertion against the old generic
+`button` / `role=button` fallback. Reviewer found that fallback too broad; it is now
+removed, so only the grounded `fds-button[data-test-id="reality-check-btn-1"]` target is
+eligible. Verification green: `uv run pytest tests/unit/test_session_blocked.py
+tests/unit/test_hot_session.py -q` (59 passed), `uv run ruff check src/execution/session.py
+tests/unit/test_session_blocked.py`, `uv run ruff format --check src/execution/session.py
+tests/unit/test_session_blocked.py`, `uv run mypy src/execution/session.py`, and
+`uv run pytest tests/unit/ -q` (731 passed). Live validation requires redeploy and the next
+Betsson reality-check popup; the currently running bot will not pick up this code.
+
+**Errors / learnings:** The previous close JS only considered native `button` /
+`role=button` nodes with exact text `Cerrar`, so it missed Betsson's custom `fds-button`
+host. For SPA/custom-element bookmaker controls, selector grounding is not enough; prefer
+real pointer clicks when the operator's manual action is a visible button press.
+
+## 2026-06-27 — Arb execution standing: fixes, validation gaps, and leg-order decision doc
+
+**Context:** Operator requested a consolidated status entry for current arb-execution abort /
+naked-exposure fixes and a separate decision document for placement ordering policy. The
+decision doc is `docs/leg_placement_order_decision.md`.
+
+**Decisions / current standing:**
+- **BetWarrior auth rescue is reactive today, not pre-place zero-exposure.** `Executor`
+  has an `auth_precheck` seam, but `scripts/run_hot_loop.py` does not currently pass one.
+  Current BW protection is placement-time `auth_failed` → logout→login→fresh bearer →
+  reverify → one retry. It covers no-bearer and HTTP 401 only.
+- **BetWarrior HTTP 409 `USER_NOT_AUTHENTICATED` is a likely follow-up, not covered.** The
+  current placer sets `auth_failed=True` only for no-bearer and `status == 401`; a 409
+  would still take the normal reject path today. If implemented, classify only explicit
+  `USER_NOT_AUTHENTICATED`, not all 409 conflicts.
+- **BetWarrior `LIVE_DELAY_PENDING` poll is live-validated.** One real armed path showed
+  `LIVE_DELAY_PENDING` → coupon-history poll attempt 1 → `OPEN` → `executor.completed`.
+  If unresolved, it remains `PENDING_UNKNOWN` because the coupon may already be placed;
+  BW-first does not make that a clean no-exposure outcome.
+- **Betsson odds correction is narrow and still live-unvalidated.** It is a single
+  favorable-only `E_BETTING_ODDS_INVALID` re-submit at the returned `validOdds` for the
+  same selection within the 20% cap. Unfavorable / ambiguous / over-cap / second reject
+  still falls through to normal abort/naked behavior.
+- **Betano's low arb contribution is probably detection topology first.** The hot loop
+  wires only `BetanoScraper(mode="prematch")` (`top-events-v2`), not Betano live or a full
+  catalog. Separate Betano feed contribution from Betano execution quality before drawing
+  placement reliability conclusions.
+- **Placement order is currently accidental, not risk-aware.** Detector emits legs by
+  sorted outcome cell; `arb_executor.py` preserves that order. Betsson-first naked cases
+  are therefore artifacts of which platform won early sorted cells, not a deliberate
+  platform policy.
+
+**State / next work:**
+- Remaining live validation: natural BW 401→reauth→retry→complete; BW 409 observation /
+  follow-up if `USER_NOT_AUTHENTICATED` appears; Betsson favorable odds resubmit accepted
+  live.
+- Recommended near-term ordering posture: for BW-including arbs, prefer BW early to move
+  known auth hard-reject risk before other legs are live, while explicitly accepting that
+  unresolved BW `LIVE_DELAY_PENDING` can still create single-leg `PENDING_UNKNOWN`.
+- Longer-term ordering should score every permutation by failure mode, pending/unknown
+  probability, already-committed stake, and worst-case residual P/L; low-odds-first,
+  high-odds-first, single-leg-first, and multi-leg-platform-first are proxies, not enough
+  alone.
+
+**Errors / risks:** The biggest open safety gap is not the relogin implementation itself;
+it is policy: current leg order is deterministic but not exposure-minimizing. The next
+implementation should avoid a simplistic platform-only rule and instead encode a bounded
+risk-aware ordering heuristic with observable metrics.
+
+## 2026-06-26 — BetWarrior auto re-auth VALIDATED (live drill green); final fixes
+
+**Context:** The controlled drill (`touch /tmp/arby_force_bw_reauth`) now completes the
+full autonomous rescue end-to-end on the live bot: logout → login → sportsbook goto →
+fresh bearer captured → Telegram "✅ OK". The window was logged out + back in with NO
+operator action. This validates the relogin method — the previously-unvalidated part — live.
+
+**Decisions (the fixes that got it green):**
+- **Logout targets the logout ICON, not "cerrar sesión" text.** The logout control is an
+  icon (`class*='icon-logout'`) — NO text, NO testid (operator-inspected 2026-06-26) — so
+  the earlier text search never matched and the logout never fired (session persisted →
+  no fresh login). `_betwarrior_logout` now finds + clicks the visible icon element.
+- **Real-pointer clicks (`mouse.click` at the visible element's center), not synthetic JS
+  `.click()`.** BetWarrior's React account-menu + logout respond to real pointer events
+  (the login-trigger's Playwright click already worked); the logout now matches it.
+- **Success keys on the authenticated UI (user-trigger visible) + a sportsbook goto to
+  surface the bearer.** The Kambi bearer is NOT emitted on auth alone — it fires on
+  sportsbook load (punter/session.json). Validated live: a manual sportsbook nav made the
+  bot capture the bearer + flip "ready again". So after the UI is authed the relogin
+  navigates to the sportsbook home, then requires `_captured_bearer != pre_login` (a fresh
+  token) before returning True — never True without a bearer (the retry would otherwise
+  hit prepare_betwarrior_auth→None and fail).
+- **Keyring lookup inside the fail-soft try** (reviewer finding): a keyring fault returns
+  False (→ abort/naked), not executor freeze.
+
+**State:** Relogin method VALIDATED live (drill green). The executor retry (Step 4) +
+ proactive session_expired recovery (Step 5) are unit-tested; the only path NOT exercised
+ live is the full real-arb 401 → retry → place (needs a real BW arb, which happens in
+ operation — the relogin + the retry are each independently validated). 731 unit tests
+ pass; mypy strict + ruff clean. The drill trigger (`touch /tmp/arby_force_bw_reauth`)
+ remains in run_hot_loop for future re-validation; removable on request.
+
+**Errors / learnings:**
+- **A React dropdown's click target may be an icon with no text/testid** — text-based
+  selectors silently never match. Ground selectors from the live DOM; don't infer from
+  Spanish phrasing.
+- **Synthetic JS `.click()` doesn't reliably open React menus** — use real pointer events
+  (ElementHandle.click / mouse.click) for any SPA control that opens a dropdown.
+- **Authenticated UI ≠ authenticated placement bearer**: a logged-in SPA shows balance
+  (PAM) but doesn't emit the Kambi placement bearer until the sportsbook widget loads.
+  Surface the bearer via a sportsbook navigation after auth, and gate success on the
+  bearer itself (≠ pre-login), not the balance UI.
+
+## 2026-06-26 — BetWarrior auto re-auth COMPLETE (Steps 3/4/5 + tests); live drill pending
+
+**Context:** Completes the BetWarrior placement-401 auto re-auth + arb-rescue feature
+(Steps 1/2/6 are in the entry directly below). Steps 3/4/5 + their tests landed after an
+operator-coordinated live capture grounded the missing selectors.
+
+**Decisions:**
+- **The reactive relogin must LOG OUT first (the key fix).** Operator-confirmed manual
+  rescue (2026-06-26): BetWarrior's SPA keeps a stale (server-dead) session mounted that
+  BLOCKS a fresh login until an explicit logout — the original reload→popup→CTA hypothesis
+  was WRONG (the session persists; no popup auto-surfaces). `attempt_betwarrior_relogin`
+  (session.py) now: clear stale bearer → log out (account menu `[data-testid='user-
+  trigger']` → click the visible "Cerrar sesión" by text, since it has no testid) → wait
+  for the account trigger to disappear (the reliable logged-out signal — NOT login-button,
+  a wrapper ancestor that mounts hidden when logged-in) → open the login form → clear+type
+  creds with human pacing → submit → require a FRESH bearer (`_captured_bearer != pre_login`,
+  not the balance UI, which a stale-but-valid-JWT bearer can fake).
+- **Selectors grounded live (2026-06-26):** login trigger `[data-testid='login-button']`,
+  user/pass/submit `[data-testid='login-email'/'login-password'/'login-submit-button']`
+  (public form), account menu `[data-testid='user-trigger']`, session-expired CTA
+  `[class*='SessionInaccuracyModal__CtaButtonCss']` (recon DOM dump 2026-06-19).
+- **Reactive wiring (Step 4, run_hot_loop.py):** `async def _reauth(leg)` gated to
+  `leg.platform == 'betwarrior-pba'` + `live` + a wired BW transport, closing over the
+  concrete `betwarrior_t`; passed as `reauth=` into the Executor (Step 2's bounded retry).
+- **Proactive wiring (Step 5, hot_session.py):** mirrors the reality_check recovery —
+  `_session_reauth_attempted/_tasks/_pending_*` state (init + `__aexit__` cancel/clear +
+  `&= blocks.keys()` pruning), a `session_expired`+`name=='betwarrior'` pending branch in
+  `_probe_readiness`, a recovery loop in `_start_pending_recoveries`, and `_schedule_*
+  session_reauth`/`_relogin_session` (re-probe + `_apply_health` on success; leave
+  suspend+alert on fail/challenge). `attempt_betwarrior_relogin` added to the
+  `WarmTransport` Protocol so Step 5's `WarmTransport`-typed recovery calls type-check.
+- **Tests (test_hot_session.py):** `_FakeTransport.relogin_ok`+calls; 2 tests —
+  session_expired suspends→relogs→`ready again` (order asserted); relogin-failure stays
+  suspended (one attempt/episode, alert remains). **731 unit tests pass; mypy strict +
+  ruff lint/format clean on the 8 changed files.**
+
+**State:** Feature complete + statically verified. **PENDING the live drill** — the
+reactive logout→login→fresh-bearer flow can ONLY be reproduced in the running bot
+(scripted fresh launches come up logged-out: BetWarrior's session is session-only cookies
+the profile drops on close, and `restore_session` re-inject contaminates). Operator
+relaunches the bot with the new code, forces a dead BW session, and confirms
+`leg_placer.http_error status=401` → "re-authenticating BetWarrior…" →
+`transport.betwarrior_relogin_ok` → retry places. Then a challenged login (OTP) →
+`transport.betwarrior_relogin_challenged` → abort/naked + alert (no new exposure).
+
+**Errors / learnings:**
+- **Logout-first changes the failure surface:** a challenged/failed relogin now LEAVES THE
+  BW PROFILE LOGGED OUT (vs the old persisted-stale-session state) until the operator
+  manually signs back in. Still no new exposure (degrades to abort/naked + alert), but a
+  behavior change to expect during the drill.
+- **BetWarrior login state is NOT cookie-restorable:** session-only cookies drop on Chrome
+  close; `restore_session` (even a fresh json) leaves the SPA logged-out ("saldo: no se
+  pudo recuperar"). The bot's restart always needs a fresh login_gate login; the
+  autonomous relogin is for the IN-FLIGHT 401 case (bot running, session dies).
+- **`login-button` is a wrapper ancestor** (mounts hidden when logged-in) — use
+  `[data-testid='user-trigger']` visibility as the logged-in/logged-out signal.
+
+## 2026-06-26 — BetWarrior auto re-auth: Steps 1/2/6 done + verified; Steps 3/4/5/0 blocked on live login-DOM capture
+
+**Context:** Approved BetWarrior placement-401 auto re-auth + arb-rescue retry (reactive:
+401 → logout+login → re-verify+retry the failed leg; proactive: session_expired heartbeat
+→ auto re-auth). The armed bot (PID 27749) still 401-aborts/goes naked on a server-killed
+BW Kambi session (e.g. fx-77d054089566 leg-C abort).
+
+**Decisions (DONE — Steps 1/2/6):**
+- **auth_failed signal:** `PlacementResult.auth_failed: bool = False` (executor.py); set
+  True ONLY on BetWarrior's no-bearer return (leg_placer.py:238) and the `status==401`
+  HTTP-error return (leg_placer.py:257). Non-401 ≥400 stays False (today's abort/naked).
+  The `parse_*` placers + arb_executor bridge are unaffected (defaults False).
+- **Executor bounded re-auth + retry:** new `ReauthHandler` type + `reauth` param
+  (executor.py:182). In `_run`, on `not accepted and auth_failed` with reauth wired AND a
+  per-execution `reauthed` flag unset: re-auth → re-verify odds → re-check tolerance → ONE
+  retry placement. Bounded once per execution (2nd BW leg reuses the fresh bearer; a 2nd
+  401 → clean abort/naked, no loop). Challenged/failed re-auth or post-reauth drift falls
+  through unchanged → abort/naked; the rescue NEVER adds exposure.
+- **Tests:** 7 new — retry-completes; once-per-execution (happy + the `reauthed` guard
+  biting on a 2nd 401 leg); reauth-fail→naked; reauth-then-drift→naked (leg-aware
+  downward drift on the BW leg's 3rd reverify); non-auth-reject→no-reauth; + BW
+  401/no-bearer/non-401 auth_failed at the placer. **729 unit tests pass; mypy strict +
+  ruff lint/format clean on the 4 changed files.**
+
+**State (BLOCKED — needs operator):** Steps 3/4/5/0 need the real BetWarrior LOGIN-FORM
+selectors (username/password/submit inputs, the header login trigger, the OTP/captcha
+marker) — NOT in any repo/recon capture (verified: recon BW HTML is a server-rendered
+Next.js shell + logged-in sessions; the only grounded BW selectors are the inactivity-
+overlay CTA `SessionInactivityModal__CtaButtonCss` and the `balance.accountBalance`="Saldo
+de la cuenta" translation key — neither is the login form). CDP :9224 currently exposes
+ZERO external page targets for THIS armed browser (`/json/list` → `[]`, puppeteer "No page
+targets"), and the armed bot owns the window — driving a logout+login on a live real-money
+bot is destructive (AGENTS.md forbids without confirmation). **Shipping 1/2/6 now is
+SAFE:** `reauth=None` everywhere (Step 4 wiring not done) → the retry block is inert, the
+executor behaves exactly as before.
+
+**Errors / learnings:**
+- **`odds_still_acceptable` is DIRECTIONAL** (guardrails.py:142): odds rising is always
+  fine (favorable); only a DROP beyond `odds_tolerance_pct` fails. A drift fake that
+  drifts UP never trips it (the retry fired). Gate any drift test on an UNFAVORABLE
+  (downward) move, leg-aware so other legs' pre-place checks stay steady.
+- **Planned Step 3 correctness (bake in when unblocked):** `prepare_betwarrior_auth()`
+  returns the cached `_captured_bearer`, so a UI-success relogin can retry with the OLD
+  server-dead token. `attempt_betwarrior_relogin` MUST clear `_captured_bearer`/
+  `_bearer_exp` before login AND require a FRESH bearer (`_captured_bearer !=
+  pre_login_token`) before returning True — `_on_request` blindly repopulates it, so a
+  timestamp isn't a strict-enough gate; string-difference is.
+
+## 2026-06-25 — Implemented arb alert team-names + audit-id persistence (incident follow-up #2)
+
+**Context:** Direct follow-up to the fx-61bcbcd4cc28 naked-exposure incident below
+(gaps: alerts show only an irreversible `fx-<uuid>` id, and audit drops
+`platform_outcome_id`/`platform_event_id` so a naked leg can't be recovered
+programmatically). Implemented both fixes. **NOT yet deployed** — the armed bot
+(PID 27749) runs pre-session code; redeploy needs the operator's terminal.
+
+**Decisions:**
+- **Alert team names via a duck-typed `market_names` seam — NOT math-layer fields.**
+  `assemble_partitions()` now also returns a `market_id -> (home, away)` map derived
+  from the SAME complete/fresh markets it returns; `OverlapQuoteSource` and
+  `CanonicalizingQuoteSource` cache it as `self.market_names`, overwritten on EVERY
+  `fetch()` path (incl. empty-scrape / early-return) so it never goes stale across
+  cycles. `format_arb_alert(opp_id, opp, home_team, away_team)` renders "Home vs Away"
+  in the header (keeping the canonical `opp_id` on a `market` line), falling back to
+  id-only when names are absent. The orchestrator reads it via
+  `getattr(self._quotes, "market_names", {})` — exactly the existing `stale_platforms`
+  pattern; the `QuoteSource` Protocol is unchanged and test fakes need no edits.
+  `src/arbitrage/` (math) is untouched: team names are per-market, not per-leg, so they
+  don't belong on `OddsQuote`/`ArbitrageOpportunity`.
+- **Audit-id persistence:** `PostgresAuditRecorder._write_opportunity` now writes
+  `platform_outcome_id` + `platform_event_id` into the `opportunities.legs` JSONB
+  (`market_id` was already a column). No schema/migration change.
+
+**State:** `src/execution/quote_source.py`, `src/execution/orchestrator.py`,
+`src/storage/audit_recorder.py`, `tests/unit/test_orchestrator.py` (+1 lock-in test:
+names render AND market id retained; id-only fallback). 721 unit tests pass; mypy strict
+clean; ruff lint+format clean on the 4 changed files (the wider 41-file format drift in
+the tree is pre-existing operator work + ruff version drift, left untouched). Reviewer
+pass: no BLOCKING findings (overall correct, confidence 0.88). **PENDING DEPLOY**
+(operator-terminal relaunch) — bundle with the still-unimplemented BetWarrior re-auth
+fix (follow-up #1, NOT done: the armed bot still 401s on BetWarrior placement, e.g. the
+23:31 abort of fx-77d054089566|1x2 = Botafogo-PB vs Brusque-SC).
+
+## 2026-06-25 — Naked-exposure incident fx-61bcbcd4cc28|1x2: manual hedge + BetWarrior full-reauth finding
+
+**Context:** Armed hot-loop executed arb `fx-61bcbcd4cc28|1x2` (Deportivo Armenio vs
+CA Ituzaingó, Primera B Metropolitana, kickoff 2026-06-27 18:30Z; ROI 1.3417%).
+Legs A (betsson AWAY 641.403@7.9) and B (betsson DRAW 1559.103@3.25) filled
+(`success=true`, bet IDs 181370037966524416 / 181370039438723072; committed 2200.506
+ARS, equalized payout 5067.084). Leg C (betwarrior HOME @1.81 target) rejected at
+22:39:11Z with HTTP 401 Unauthorized → `executor.naked_exposure` (live=2). Operator
+re-logged-in and requested a rescue; the bot did not auto-retry (naked-flagged arbs
+are dedup'd by `market_id`, operator-hedge model by design).
+
+**Decisions:**
+- **No programmatic rescue was possible** (six grounded blockers, see Errors) — the
+  rescue was manual, by the operator, in the BetWarrior UI.
+- **The arb was already broken before rescue.** HOME (Armenio) shortened across the
+  market from 1.81 → 1.46 (betsson) / 1.61 (betwarrior). Breakeven to complete the
+  Dutch book on the locked A/B payout (5067.084, committed 2200.506) is HOME odds >
+  **1.7676**; both books were far below, so no profitable completion existed on any
+  reachable book. Cross-book check via raw httpx was blocked (betsson WAF 403).
+- **Damage-limitation: locked the loss.** Operator placed 3147 ARS on betwarrior HOME
+  @1.61 (full-time 1X2), equalizing every outcome to ≈ **−281 ARS** realized,
+  eliminating the −2200 HOME-win tail. Preferred the small certain loss (fits the
+  bot's risk-free model) over riding the naked {+2866 / −2200} position. No fair
+  HOME-win probability was assigned — 1.61/1.46 are margin-laden single-book lines,
+  not fair odds; the decision rested on the breakeven math + tail risk, not on EV.
+
+**State:** Legs A/B are **bot-audited** (bet IDs above in `placements`, `success=true`).
+Leg C is an **operator-confirmed manual** placement on betwarrior HOME @1.61 (3147 ARS)
+— it has NO audit row / coupon ref in our state (the manual leg was never captured; the
+≈ −281 ARS figure is contingent on that leg having landed as the operator reports, not on
+a system-captured placement). Together the three legs hedge every outcome to ≈ −281 ARS
+realized. The armed loop ran throughout and did not re-touch the market (dedup'd as
+naked) — no conflict with the manual hedge. No code changed.
+
+**Errors / learnings:**
+- **🔑 BetWarrior auth failure needs a FULL logout+login, not a bearer re-capture.**
+  The operator's MANUAL placement also failed to confirm until a complete
+  logout→login cycle — only then did the bet place. The execution layer's current
+  auth model (capture the Kambi bearer from authenticated SPA calls; `AuthPrecheck`
+  probes the live bearer before placing) is INSUFFICIENT: the session can be in a
+  state where the bearer probes "live" yet the server still 401s the placement, and
+  only a full re-auth clears it. This is the root of the recurring BetWarrior
+  placement auth trouble. **Follow-up: on a placement 401, drive a full
+  logout+login (not a bearer re-fetch) before retrying.**
+- **`platform_outcome_id` / `platform_event_id` are not durably persisted**, so the
+  exact BetWarrior selection could not be recovered programmatically.
+  `PostgresAuditRecorder._write_opportunity()` drops both fields; the hot loop
+  (`run_hot_loop.py` + `OverlapQuoteSource`) is fully in-process and writes only
+  `opportunities` + `placements` — it does NOT XADD `arb:opportunities` or write
+  `odds:latest`, and `odds_snapshots` / `platform_events` / `canonical_outcomes` /
+  `matches` were all empty (0 rows; `odds_snapshots` also has no
+  `platform_outcome_id` column). With 5 live Kambi "Match" variants on the event
+  (HOME 1.19–2.23) and no persisted id, auto-identifying leg C was unsafe.
+  **Follow-up: persist `platform_outcome_id` + `platform_event_id` in audit
+  (`opportunities.legs` / `placements`) so future naked incidents are recoverable.**
+- **A naked arb cannot be auto-rescued while the loop is armed:** the armed bot owns
+  the live BetWarrior Chrome session (:9224), so a second `InSessionTransport` would
+  corrupt the profile / contend on the coupon; the exposed CDP port is read-only for
+  the assistant; and per the daemon-durability rule, even stopping the bot can't be
+  followed by an agent-shell relaunch (reaped — only the operator's terminal can
+  relaunch). Net: a naked incident is an operator-manual hedge, full stop, until the
+  two follow-ups above land.
+
+## 2026-06-25 — Viewer line-buffering fix + hot-loop runbook; daemon-durability learning
+
+**Context:** Two operational problems across the 2026-06-24/25 redeploy marathon. (1) The
+viewer's `tail -f /tmp/arby_session_viewer.log` showed nothing for minutes after launch — the
+viewer uses bare `print()` and Python block-buffers stdout when redirected to a non-tty file,
+so output doesn't flush until ~4 KB accumulates (~30 min of ticks). (2) The armed bot kept
+dying ~6–44 min after launch (no crash, no traceback — SIGKILL mid-detection-poll): bots
+launched from the agent's bash shell get reaped by the harness, while the one the operator
+launched from their own terminal ran 2 h 52 m. (3) The viewer kept printing a stale
+`🛑 auto-placement OFF` across redeploys because it tails `arby_hot_loop.log` from offset 0 on
+startup and replays the previous run's `kill_switch_tripped`.
+
+**Decisions:**
+- **Viewer line-buffering (code):** added `sys.stdout.reconfigure(line_buffering=True)` as the
+  first statement of `view_hot_sessions.main()` (plus `import sys`) so every `print()` flushes
+  per newline regardless of tty/file — a `tail -f` now sees ticks live, with no `-u` flag
+  needed on any future launch. Syntax + ruff clean.
+- **Runbook (docs):** wrote `docs/hot_loop_runbook.md` — the canonical END / START (armed) /
+  RESTART procedures, health checks, tail commands, and gotchas (truncate the bot log on
+  redeploy for an honest kill-switch flag; restart the viewer whenever the bot is restarted;
+  don't minimize windows; UTC vs UTC−3 timestamps; zsh `disown` quirk).
+- **Durability (operational, not code):** the bot + viewer MUST be launched from the
+  **operator's terminal** (`nohup … &`), never from an agent shell — the harness reaps
+  agent-shell daemons. The runbook leads with this rule and the `ps -o ppi=` check.
+
+**State:** `scripts/view_hot_sessions.py` (`import sys` + `sys.stdout.reconfigure` in
+`main()`); `docs/hot_loop_runbook.md` (new). The bot + viewer are running parented to the
+operator's shell (PPID = operator's zsh), past the gate, detecting — durable, not reaped.
+
+**Errors/learnings:** (1) Block-buffered `print()` to a redirected file is the classic
+"my tail sees nothing" cause — for any long-running observer that prints, force line buffering
+(`reconfigure(line_buffering=True)`), don't rely on the operator passing `-u`. (2) A daemon's
+durability is determined by its *parent*, not by `nohup`/`disown` alone: agent-shell children
+get reaped; operator-terminal children survive. Diagnose "bot dies, no traceback" as an
+external reap, not a crash — and move the daemon to a durable parent. (3) Document the
+operational runbook the moment a procedure is non-obvious (log truncation, viewer-restart,
+gate file) — it saves the next redeploy.
+
+## 2026-06-25 — Betsson betslip-cleanup selector fix (sidebar `-REFERENCE` variant)
+
+**Context:** The cleanup deployed 2026-06-24 ran but removed nothing (no
+`transport.betsson_stale_betslip_cleared` log) — operator still saw "selección no disponible"
+leftovers and cleaned them manually. Root cause: the JS matched `tagName ===
+'OBG-M-BETSLIP-SELECTION'` (exact), but the **sidebar** betslip (inside `site-drawer#drawer`'s
+shadow DOM) renders selections as `OBG-M-BETSLIP-SELECTION-REFERENCE` — a different tag, so the
+walk excluded every sidebar entry. (The bare `-SELECTION` is a different view.) Also: the
+`-REFERENCE` element's class carries no `-error` marker, so the error-class filter would have
+excluded them even with the right tag — the unavailability is in the element's TEXT.
+
+**Decision:** Match `/^OBG-M-BETSLIP-SELECTION(-REFERENCE)?$/` (both variants) and classify by
+TEXT only (drop the error-class requirement) — remove iff UNAVAILABLE matches and ODDS_CHANGED
+doesn't, else keep (fail-safe). Dry-run on the live drawer confirmed the selector now finds the
+selections (previously 0) and correctly KEEPS the live odds-changed one ("Las cuotas han
+cambiado de 36.00 a 28.00"); a "no disponible" entry classifies REMOVE (no live sample to click
+— operator had cleaned them — so production-verification is pending the next stale entry via
+the `transport.betsson_stale_betslip_cleared` log). Redeployed armed (PID 23900); viewer log
+moved to a fresh timestamped file `/tmp/arby_session_viewer_<ts>.log` each redeploy so the
+operator's `tail` is never stale, and `arby_hot_loop.log` truncated on redeploy to clear the
+stale kill-switch state the viewer replays from offset 0 (root cause of the persistent stale
+"auto-placement OFF").
+
+**Errors/learnings:** (1) An exact-tag selector is fragile against Betsson's per-view component
+variants — the sidebar (`-REFERENCE`) and the betslip-preview (`-SELECTION`) are different
+elements; match a tag prefix/regex, not an exact tag. (2) Don't trust a class-based marker
+(`-error`) across variants — the sidebar variant doesn't carry it; classify on the visible text,
+which is the actual signal. (3) The viewer's "auto-placement OFF" staleness is the viewer
+replaying `arby_hot_loop.log` from offset 0 on every launch — clean (truncate) the bot log on
+redeploy, or (permanent fix, offered) make the viewer seek to end on startup.
+
+## 2026-06-24 — Betsson stale-betslip auto-cleanup (session transport)
+
+**Context:** The bot leaves stale selections in the Betsson betslip — `obg-m-betslip-selection`
+entries flagged `-error` ("selección no disponible" / suspended / market-closed / "Las cuotas
+han cambiado"). Placement is a direct `/api/sb/v2/coupons` POST (the bot never adds to the
+slip UI), but failed/moved coupon attempts leave **server-side slip residue**. Enough
+error-state selections re-validating keeps the SPA off `networkidle`, which starved
+`establish_betsson_context`'s `page.goto(wait_until="networkidle")` — the direct trigger of
+the heartbeat wedge fixed earlier today. Operator requested these be auto-removed.
+
+**Decisions:** Add `InSessionTransport.clear_stale_betslip()` — a bounded shadow-DOM walk
+(`_BETSSON_CLEAR_STALE_BETSLIP_JS`) that, per call, finds the first `-error` selection,
+classifies its innerText, and clicks its `obg-m-betslip-remove-selection-button` trashcan.
+Classification is CONSERVATIVE per operator decision: remove ONLY genuinely-unusable
+(no disponible / suspend / finalizado / mercado cerrado / settled); KEEP odds-changed
+("Las cuotas han cambiado" — still bettable); if neither regex clearly matches → KEEP
+(fail-safe, never over-removes). Removes ONE per call so the caller re-scans a fresh DOM
+between clicks (no stale element refs across mutations); capped at `_BETSSON_STALE_SLIP_MAX=12`;
+fail-soft (any page error → log + return partial, never raises). REAL BOOKMAKER INTERACTION
+(clicks trashcans in a logged-in window, operator-authorized 2026-06-24), like
+`attempt_reality_check_close`; it only removes slip entries the user can't use — never
+submits/changes/confirms a bet. Hooked at the START of `establish_betsson_context` (before
+the goto), so the slip is clean before each heartbeat's `networkidle` probe → directly
+prevents the wedge trigger (complements the probe-bound safety net). `clear_stale_betslip`
+takes its own `self._page_lock`, called BEFORE establish's lock block → no re-entrant
+acquisition. Reviewer (no BLOCKING findings) verified lock hygiene, the click target can
+only be the trashcan, classifier ordering (odds-changed-checked-first), and the cap.
+
+**State:** `src/execution/session.py` (`_BETSSON_STALE_SLIP_MAX`, `_BETSSON_CLEAR_STALE_BETSLIP_JS`,
+`clear_stale_betslip`, establish hook); `tests/unit/test_session_blocked.py` (`_FakePage`
+`stale_removed` + dispatch; 5 tests: removes-until-empty, cap, fail-soft, guards
+non-betsson/dry-run, clean-slip-noop). 720 unit tests pass; mypy strict + ruff clean.
+The JS classifier/selector is operator-validated against the live DOM (grounded in a
+real `-error` selection: "Las cuotas han cambiado de 4.10 a 3.55"); unit tests cover the
+Python method logic, not the JS DOM-walk (codebase convention). Verify in production via
+the `transport.betsson_stale_betslip_cleared removed=N` log on the next heartbeat after a
+stale selection appears.
+
+**Errors/learnings:** (1) My first instinct ("clear betslip on abort") was dropped as
+misdirected because the bot places via direct API — but the operator was still right that
+stale slip residue accumulates (server-side, from failed/moved coupons), so cleanup IS the
+bot's job. The lesson: "the bot doesn't click to add" ≠ "the bot leaves no slip residue";
+verify the actual symptom before dismissing. (2) Conservative classification (remove only
+clear unavailability, keep odds-changed, fail-safe keep) over aggressive cleanup — a wrong
+removal is irreversible operator-visible clutter-loss; a missed removal is benign.
+
+## 2026-06-24 — Heartbeat-wedge fix: bound readiness probes (hot_session)
+
+**Context:** After redeploying the favorable-resubmit change, the armed hot-loop's
+readiness **heartbeat wedged permanently** at 22:16:53Z: a Betsson
+`establish_betsson_context()` call hung on `page.goto(_BETSSON_HOME,
+wait_until="networkidle", timeout=60000)` and **Playwright's own 60s goto timeout did
+not fire** (a CDP/Playwright hang). The trigger was a stale, error-state betslip
+("Existen problemas con tu cupón … algunas de tus selecciones no se pueden combinar";
+leftover Morocco–Haití selections from operator/recon clicks — Betsson placement is a
+direct `/api/sb/v2/coupons` POST, the bot does NOT touch the betslip UI) that kept the
+SPA re-validating with constant network traffic, so `networkidle` was never reached. The
+heartbeat's `try/except` couldn't catch a hang (no exception — a blocked await), so the
+whole readiness/kill-switch task froze on one await. Detection (a separate task) kept
+polling, but the kill switch stayed tripped → **silent placement disablement, no
+self-heal** until a manual restart. Verified from logs: zero `betsson_context`/
+`hot_sessions.probe_error` events for 82 min after the trip (a thrown timeout would have
+logged `probe_error` every 5-min heartbeat; none did → it was a hang, not a timeout).
+
+**Decisions:** Bound each readiness probe with a hard `asyncio.wait_for` so a hang
+becomes a bounded `TimeoutError` the loop catches. `_safe()` (the per-platform probe
+wrapper in `_probe_readiness`) now does `await asyncio.wait_for(coro,
+timeout=_PROBE_TIMEOUT_S)`; on `TimeoutError` it logs `hot_sessions.probe_timeout` and
+returns False (not-ready). `_PROBE_TIMEOUT_S = 120.0` — generous vs the ~90s legit
+ceiling of a probe (60s networkidle goto + 30s passive ctx-poll) so a slow-but-healthy
+probe is never falsely killed, but a true hang is hard-cancelled. The heartbeat now
+survives any probe hang and the session auto-recovers (`kill_switch_reset` +
+`✅ Sessions ready again`) once the window is usable again. Reviewer verified
+`async with self._page_lock:` releases cleanly on `wait_for` cancellation (no lock
+deadlock) and that one platform's hang can't wedge the others (per-probe isolation,
+sequential probing continues).
+
+**Not done (deliberate):** "Clear betslip on abort" was proposed but **dropped as
+misdirected** — Betsson placement is a direct coupon API (`build_betsson_request` →
+`/api/sb/v2/coupons` with `betSelections` in the body); the bot never adds to the
+betslip UI (only Betano/Bplay use slip APIs). The stale selections came from
+operator/recon activity, so a bot-side betslip-clear wouldn't address the root cause.
+The robust fix is the probe bound (resilient regardless of betslip state). The
+`networkidle` wait strategy itself was left unchanged (it works when the SPA is healthy —
+established context successfully 22:01–22:11); changing it to `domcontentloaded`/`load`
+is a possible follow-up but needs live validation that the in-app "Mi cuenta" nav still
+fires the `ctx-` request, deferred to avoid an unvalidated behavior change.
+
+**State:** `src/execution/hot_session.py` (`_PROBE_TIMEOUT_S` + `_safe` wait_for),
+`tests/unit/test_hot_session.py` (`test_probe_hang_is_bounded_not_wedged`: a transport
+whose establish sleeps 3600s returns False in <2s with the probe-timeout monkeypatched
+to 0.3s — proves the fix; would hang without it). 715 unit tests pass; mypy strict +
+ruff clean; reviewer pass found no BLOCKING findings. Redeployed armed (PID 72742) with
+the fix.
+
+**Errors/learnings:** (1) try/except is useless against a hang — only a hard
+`asyncio.wait_for` (which cancels the coroutine) bounds a blocked await. (2) Don't trust
+a library's own timeout (Playwright's 60s goto timeout silently failed to fire); enforce
+an external asyncio bound on any operation that can hang the control loop. (3) The viewer
+read Betsson as "ok" throughout the wedge (a logged-in window with no popup) while the
+bot's probe hung — the documented "viewer ok ≠ placement-ready" gap, now compounded by a
+stale-betslip SPA state the viewer doesn't classify. (4) Verify a hypothesis before
+acting: "clear betslip on abort" sounded right but the bot places via direct API, so it
+was wrong — code-reading before implementing saved a misdirected change.
+
+## 2026-06-24 — Betsson favorable odds-change re-submit (placer layer)
+
+**Context:** Live arb `fx-d11b22fcc7f2|1x2` aborted: Betsson rejected leg A with
+`E_BETTING_ODDS_INVALID` + `validOdds: 4.45` while the bot submitted `4.35`. That reject is
+a price-confirmation handshake (Betsson returns the current valid price and expects
+re-submission), not a hard refusal — the body already sends `acceptOddsChanges: True` +
+`betslipOddChangeBehaviour: "CanAcceptOddChanges"` and the server still bounced the stale
+price. The move was FAVORABLE (+2.30%): same stake at higher odds → worst-case payout
+strictly non-decreasing, arb still held. The bot threw the opportunity away.
+
+**Decisions:** Add a bounded (single), favorable-only re-submit at the exact returned
+`validOdds` in `BetssonLegPlacer.place()`, and only there. Re-submit fires only when
+`betsson_odds_correction()` parses an `E_BETTING_ODDS_INVALID` reject (non-`Success`
+`couponStatusPollingResult`, no non-empty `couponId`, parseable `validOdds > 1.0`), the move
+is strictly favorable (`validOdds > submitted`) and within a 20% anomaly cap
+(`_BETSSON_RESUBMIT_MAX_UPLIFT_PCT`), and the correction's `marketSelectionTag` matches the
+leg's `platform_outcome_id` (or is empty). Everything else keeps today's fail-closed reject
+(executor aborts when nothing placed; flags naked once a leg is live). This is NOT a
+`src/risk/` decision: the single-leg coupon holds stake fixed, so "favorable in the arbitrage
+equation" collapses exactly to `validOdds > submitted` (worst-case payout non-decreasing);
+stake is never resized. Re-POST safety is enforced, not assumed: any reject carrying a
+`couponId` (a coupon may have been created) → no re-POST, so unlike BetWarrior's
+`LIVE_DELAY_PENDING` (a received bet that must never be re-POSTed) this only ever fires on an
+explicit pre-acceptance rejection. No executor / orchestrator / arb / risk / schema changes.
+
+**State:** `src/execution/placers.py` (`BetssonOddsCorrection` dataclass +
+`betsson_odds_correction` parser), `src/execution/leg_placer.py`
+(`_BETSSON_RESUBMIT_MAX_UPLIFT_PCT` + the re-submit tail of `place()`). Unit coverage in
+`tests/unit/test_placers.py` (7 parser cases) and `tests/unit/test_leg_placer.py` (7 placer
+cases incl. the `fx-d11b22fcc7f2` reproduction: 4.35 submit → 4.45 correction → accepted at
+4.45, exactly two POSTs, second body carries `"odds": "4.45"`). Full unit suite green
+(714 passed); mypy strict + ruff clean; reviewer pass found no BLOCKING findings.
+`docs/platform_failure_profiles.md` B2 updated.
+
+**Errors/learnings:** Corrected the prior implicit assumption that odds-change acceptance is
+governed by a single flag — `allowOddsChange=NO` is BetWarrior/Kambi's flag
+(`test_leg_placer.py` asserts it); Betsson already sends `acceptOddsChanges: True` and STILL
+bounces a stale price, so the handshake must be completed by re-submitting at `validOdds`.
+The re-submit clearing the reject is unverified live (single most likely contract given
+`validOdds` is returned); if it does not, the change is still strictly safe (bounded single
+retry → reject → today's abort/naked). Confirm the success path on the next live favorable
+reject via the `leg_placer.betsson_odds_resubmit` log. The 20% cap is deliberately NOT the
+1.0% `odds_tolerance_pct` (config) — that governs unfavorable drift and would re-reject the
+very +2.30% move this change exists to capture.
+
+## 2026-06-23 — BetWarrior promotions route trap: suspend + INICIO recovery
+
+**Context:** Live capture showed BetWarrior stuck on
+`https://pba.betwarrior.bet.ar/es-ar/promotions` with page heading `PROMOCIONES`.
+Viewer trace first saw the route at 18:07 and it persisted for hours. Kambi bearer
+readiness can still pass on that route, so bearer-only readiness does not prove the
+window is placeable.
+
+**Decisions:** Treat `/promotions` + `PROMOCIONES` as
+`SessionBlock(kind=\"promotions_page\")`. The heartbeat marks BetWarrior not-ready and
+trips the normal `session not ready` kill switch immediately, then schedules one
+background recovery attempt that clicks the top-nav `INICIO`. Recovery re-probes before
+resetting auto-placement. Failure leaves the existing suspend + alert path active. To
+reduce recurrence, keepalive no longer considers tag name alone sufficient for a safe
+click; it skips pointer-cursor, onclick, and interactive-ancestor targets because promo
+cards can be clickable DIVs.
+
+**State:** Implemented in `src/execution/session.py`, `src/execution/hot_session.py`, and
+`scripts/view_hot_sessions.py` with targeted unit coverage in
+`tests/unit/test_session_blocked.py` and `tests/unit/test_hot_session.py`. Runbook updated
+in `docs/platform_failure_profiles.md`.
+
+**Errors:** Root cause is not proven from logs; no hot-loop event explains the navigation.
+Most likely cause is SPA route drift from user/promo navigation or the old keepalive
+clicking a clickable non-button/non-anchor element.
+
+## 2026-06-23 — Betsson reality-check popup: auto-close `Cerrar`
+
+**Context:** Session viewer surfaced a persistent Betsson `reality_check` state:
+`¿Sabés qué hora es? / EL JUEGO COMPULSIVO ES PERJUDICIAL PARA VOS Y TU FAMILIA`.
+This was already visible in older captures (`20260622_124106`) and the live viewer log,
+but the bot only had Betano session-timer auto-extend; it did not detect Betsson's
+shadow-DOM reality-check in `check_session_blocked`.
+
+**Decisions:** Treat it as a distinct `SessionBlock(kind="reality_check")`, not as RG
+lockout, session expired, or session timer. It is a closeable responsible-gaming
+reminder, so the safe recovery is exactly the operator action: click the orange
+`Cerrar` button. Detection uses a bounded Betsson-only open-shadow-DOM scan for the
+grounded popup phrases. On detection the manager marks Betsson not-ready and trips the
+normal `session not ready` kill switch immediately, then a background task waits 5.25
+seconds for Betsson's observed `Cerrar` cooldown, clicks `Cerrar` only from the same
+document/shadow root where a grounded phrase is visible, and re-probes; success resets
+auto-placement after all platforms are ready, failure leaves the existing suspend + alert path active.
+
+**State:** Implemented in `src/execution/session.py` and `src/execution/hot_session.py`
+with targeted unit coverage in `tests/unit/test_session_blocked.py` and
+`tests/unit/test_hot_session.py`. Runbook updated in
+`docs/platform_failure_profiles.md`.
+
+**Errors:** The viewer comment said the bot auto-dismissed the reality-check variant,
+but source inspection showed only event names were pre-wired in `scripts/view_hot_sessions.py`;
+the backend clicker was missing.
+
 ## 2026-06-23 — First real arbitrage execution completed
 
 **Context:** The live armed bot completed the first verified real-money arbitrage execution.

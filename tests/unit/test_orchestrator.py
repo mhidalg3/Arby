@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
+from src.arbitrage.dutch_book import detect_arbitrage
 from src.arbitrage.quotes import OddsQuote
 from src.execution.executor import ExecutionOutcome, Executor, Leg, PlacementResult
 from src.execution.guardrails import Guardrails
-from src.execution.orchestrator import ArbOrchestrator
+from src.execution.orchestrator import ArbOrchestrator, format_arb_alert
 from src.risk.evaluator import RiskEvaluator
 from src.risk.policy import RiskPolicy
 
@@ -166,6 +167,26 @@ async def test_no_arb_market_does_nothing() -> None:
     assert results == [] and bp.calls == 0 and ap.calls == 0
 
 
+def test_format_arb_alert_shows_team_names_when_provided() -> None:
+    """The duck-typed `market_names` seam renders the fixture name in the alert
+    while keeping the canonical market id for cross-reference; without names the
+    alert falls back to the market id only (backwards-compatible)."""
+    opp = detect_arbitrage(
+        [_quote("betsson", "home", 2.1), _quote("betano", "away", 2.1)],
+        budget=1000.0,
+        min_margin_pct=0.5,
+    )
+    assert opp is not None
+
+    with_names = format_arb_alert("fx-abc123|1x2", opp, "Botafogo-PB", "Brusque-SC")
+    assert "Botafogo-PB vs Brusque-SC" in with_names
+    assert "fx-abc123|1x2" in with_names  # market id retained for cross-reference
+
+    plain = format_arb_alert("fx-abc123|1x2", opp)
+    assert "fx-abc123|1x2" in plain
+    assert " vs " not in plain  # no fixture line when names are absent
+
+
 async def test_market_executed_once_across_polls() -> None:
     g = _guard()
     bp, ap = _Placer(), _Placer()
@@ -216,8 +237,9 @@ async def test_run_forever_keeps_detecting_through_kill_switch() -> None:
 async def test_ingestion_stall_alerts_once_then_recovers() -> None:
     g, note = _guard(), _Notifier()
     empty = _FakeQuoteSource({})
-    orch = _orch(empty, g, {"betsson": _Placer(), "betano": _Placer()}, notifier=note,
-                 empty_alert_after=2)
+    orch = _orch(
+        empty, g, {"betsson": _Placer(), "betano": _Placer()}, notifier=note, empty_alert_after=2
+    )
     await orch.run_once()  # 1 empty
     await orch.run_once()  # 2 empty → alert
     await orch.run_once()  # 3 empty → no repeat alert

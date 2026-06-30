@@ -51,12 +51,18 @@ class QuoteCanonicalizer(Protocol):
 
 def assemble_partitions(
     by_market: dict[str, list[CanonicalQuote]], now: float, staleness_sec: float
-) -> dict[str, list[OddsQuote]]:
+) -> tuple[dict[str, list[OddsQuote]], dict[str, tuple[str, str]]]:
     """Per market: best (highest) odds per cell across platforms (fresh quotes
     only); keep a market only when its partition is COMPLETE. The completeness
     gate is a correctness guard — a partial would let detect_arbitrage 'find' a
-    book that loses on the uncovered outcome."""
+    book that loses on the uncovered outcome.
+
+    Returns the complete partitions plus a ``market_id -> (home, away)`` team-name
+    map derived from the SAME complete/fresh markets (every kept market's quotes
+    resolved to one canonical fixture), so callers can render fixture names
+    without re-resolving. The map is rebuilt on every call — never stale."""
     out: dict[str, list[OddsQuote]] = {}
+    names: dict[str, tuple[str, str]] = {}
     for market_id, cqs in by_market.items():
         expected = EXPECTED_CELLS.get(cqs[0].outcome.market.code)
         if expected is None:
@@ -71,7 +77,11 @@ def assemble_partitions(
                 best[cell] = cq
         if set(best.keys()) == expected:
             out[market_id] = [best[cell].odds_quote for cell in sorted(expected)]
-    return out
+            # All quotes of a canonical market share one fixture; carry its names
+            # so downstream alerts/audit can show them without the fixture object.
+            anchor = next(iter(best.values()))
+            names[market_id] = (anchor.fixture.home_team, anchor.fixture.away_team)
+    return out, names
 
 
 @dataclass
@@ -83,6 +93,9 @@ class CanonicalizingQuoteSource:
     canonicalizer: QuoteCanonicalizer
     staleness_sec: float = 30.0
     now_fn: Callable[[], float] = field(default=time.time)
+    # ``market_id -> (home_team, away_team)`` for the last fetch's markets (duck-typed
+    # by the orchestrator to render fixture names in alerts). Rebuilt every cycle.
+    market_names: dict[str, tuple[str, str]] = field(init=False, default_factory=dict)
 
     async def fetch(self) -> dict[str, list[OddsQuote]]:
         by_market: dict[str, list[CanonicalQuote]] = defaultdict(list)
@@ -95,7 +108,8 @@ class CanonicalizingQuoteSource:
             except Exception as exc:  # noqa: BLE001 — one scraper must not sink the cycle
                 log.warning("quote_source.scraper_error", error=str(exc))
 
-        return assemble_partitions(by_market, self.now_fn(), self.staleness_sec)
+        out, self.market_names = assemble_partitions(by_market, self.now_fn(), self.staleness_sec)
+        return out
 
 
 @dataclass
@@ -133,6 +147,10 @@ class OverlapQuoteSource:
     # INVISIBLE in the post-JOIN market count — the other books still overlap — so we
     # track each independently. `stale_platforms` reports the laggards to the orchestrator.
     _platform_last_fresh: dict[str, float] = field(init=False, default_factory=dict)
+    # ``market_id -> (home_team, away_team)`` for the markets returned by the last
+    # ``fetch()`` (rebuilt every cycle). Duck-typed by the orchestrator to render
+    # fixture names in alerts; empty when a cycle produced no markets.
+    market_names: dict[str, tuple[str, str]] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         # Seed each configured book at "now" so it isn't flagged stale before its first
@@ -174,6 +192,7 @@ class OverlapQuoteSource:
                 log.warning("quote_source.bulk_error", error=str(exc))
         if not targets:
             self._mark_fresh(fresh)  # record whoever DID respond before bailing
+            self.market_names = {}  # no markets this cycle → clear any prior names
             return {}  # no bulk data → nothing to link against
 
         # 2) Each linker: list fixtures (one cheap call), fetch odds ONLY for events a
@@ -236,10 +255,13 @@ class OverlapQuoteSource:
                         by_market[cq.odds_quote.market_id].append(cq)
 
         log.info(
-            "overlap_quote_source.fetched", bulk_fixtures=len(targets), overlap_events=overlap_events
+            "overlap_quote_source.fetched",
+            bulk_fixtures=len(targets),
+            overlap_events=overlap_events,
         )
         self._mark_fresh(fresh)
-        return assemble_partitions(by_market, self.now_fn(), self.staleness_sec)
+        out, self.market_names = assemble_partitions(by_market, self.now_fn(), self.staleness_sec)
+        return out
 
     def _mark_fresh(self, platforms: set[str]) -> None:
         """Stamp each book that produced data this cycle with the current time, so its

@@ -8,9 +8,11 @@ depends on it being right and fail-closed.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from src.execution.placers import (
     BetHistoryMatch,
+    betsson_odds_correction,
     build_betano_request,
     build_betsson_request,
     build_betwarrior_request,
@@ -184,6 +186,100 @@ def test_betsson_placement_errors_rejected() -> None:
         }
     )
     assert not r.accepted  # errors present → fail closed even if polling "Success"
+
+
+# ---- Betsson favorable odds correction (price-confirmation handshake) ----
+
+
+def _odds_invalid_resp(
+    valid_odds: object = "4.45",
+    tag: str = "s-m-f-WB0IdcdAsEeygVTwHrJMtA-MW3W-away",
+    coupon_id: str = "",
+) -> dict[str, Any]:
+    """The verbatim live reject shape (fx-d11b22fcc7f2, events.jsonl:17)."""
+    return {
+        "couponStatus": {
+            "couponStatusPollingResult": "Failure",
+            "couponId": coupon_id,
+            "couponPlacementErrors": [
+                {
+                    "code": "E_BETTING_ODDS_INVALID",
+                    "details": {
+                        "marketSelectionTag": tag,
+                        "validOdds": valid_odds,
+                        "combinedMarketSelections": "",
+                    },
+                }
+            ],
+        }
+    }
+
+
+def test_betsson_odds_correction_present() -> None:
+    # The live fx-d11b22fcc7f2 reject: validOdds 4.45 over a 4.35 submit.
+    c = betsson_odds_correction(_odds_invalid_resp("4.45"))
+    assert c is not None
+    assert c.valid_odds == 4.45
+    assert c.valid_odds_str == "4.45"  # exact string → re-submitted verbatim
+    assert c.selection_tag == "s-m-f-WB0IdcdAsEeygVTwHrJMtA-MW3W-away"
+
+
+def test_betsson_odds_correction_accepts_success_is_none() -> None:
+    # An accepted coupon is never an odds correction → never re-POST.
+    assert (
+        betsson_odds_correction(
+            {"couponStatus": {"couponStatusPollingResult": "Success", "couponPlacementErrors": []}}
+        )
+        is None
+    )
+
+
+def test_betsson_odds_correction_non_odds_error_is_none() -> None:
+    # A non-odds code is not a price-confirmation handshake.
+    assert (
+        betsson_odds_correction(
+            {
+                "couponStatus": {
+                    "couponStatusPollingResult": "Failure",
+                    "couponPlacementErrors": [{"code": "E_BETTING_COUPON_GENERAL"}],
+                }
+            }
+        )
+        is None
+    )
+
+
+def test_betsson_odds_correction_legacy_string_error_is_none() -> None:
+    # Legacy string errors (["X"], ["ODDS_CHANGED"]) are skipped → None (no behavior
+    # change for those — the isinstance(err, dict) guard).
+    assert (
+        betsson_odds_correction(
+            {
+                "couponStatus": {
+                    "couponStatusPollingResult": "Failure",
+                    "couponPlacementErrors": ["X"],
+                }
+            }
+        )
+        is None
+    )
+
+
+def test_betsson_odds_correction_unparseable_is_none() -> None:
+    # Missing / non-numeric validOdds → None.
+    assert betsson_odds_correction(_odds_invalid_resp(valid_odds=None)) is None
+    assert betsson_odds_correction(_odds_invalid_resp(valid_odds="abc")) is None
+
+
+def test_betsson_odds_correction_coupon_id_present_is_none() -> None:
+    # A coupon may have been created → never re-POST over it. The parser fails closed.
+    assert betsson_odds_correction(_odds_invalid_resp("4.45", coupon_id="C9")) is None
+
+
+def test_betsson_odds_correction_zero_coupon_id_still_corrects() -> None:
+    # couponId == "0" (Betsson's "no coupon" sentinel) → still a correction.
+    c = betsson_odds_correction(_odds_invalid_resp("4.45", coupon_id="0"))
+    assert c is not None and c.valid_odds == 4.45
 
 
 def test_unrecognized_shapes_fail_closed() -> None:

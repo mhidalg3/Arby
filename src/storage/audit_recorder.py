@@ -78,6 +78,8 @@ class PostgresAuditRecorder(AuditRecorder):
                         "outcome": q.outcome,
                         "decimal_odds": q.decimal_odds,
                         "target_stake": stake,
+                        "platform_outcome_id": q.platform_outcome_id,
+                        "platform_event_id": q.platform_event_id,
                     }
                     for q, stake in zip(opp.legs, opp.stakes, strict=True)
                 ],

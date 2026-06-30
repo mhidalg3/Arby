@@ -119,6 +119,7 @@ def _executor(
     reverify: Callable[[Leg], Awaitable[float]] | None = None,
     cap_refresh: Callable[[Leg], Awaitable[float | None]] | None = None,
     auth_precheck: Callable[[Leg], Awaitable[bool]] | None = None,
+    reauth: Callable[[Leg], Awaitable[bool]] | None = None,
 ) -> Executor:
     kw: dict[str, object] = {
         "guardrails": g,
@@ -132,6 +133,8 @@ def _executor(
         kw["cap_refresh"] = cap_refresh
     if auth_precheck is not None:
         kw["auth_precheck"] = auth_precheck
+    if reauth is not None:
+        kw["reauth"] = reauth
     return Executor(**kw)  # type: ignore[arg-type]
 
 
@@ -634,3 +637,230 @@ async def test_cap_refresh_not_called_when_no_revalidate() -> None:
     res = await ex.execute_n_leg("o", list(_three_legs()))  # NO revalidate= callback
     assert res.outcome is ExecutionOutcome.COMPLETED
     assert calls == 0  # cap_refresh never invoked without a revalidate callback
+
+
+# ---- BetWarrior auto re-auth + bounded retry (rescue on a placement 401) -----------
+
+
+class _ReauthStub:
+    """Async stand-in for the injected ReauthHandler. Records its call count."""
+
+    def __init__(self, returns: bool = True) -> None:
+        self.returns = returns
+        self.calls = 0
+
+    async def __call__(self, leg: Leg) -> bool:
+        self.calls += 1
+        return self.returns
+
+
+class _AuthFailFirstThenAccept:
+    """place() auth-fails (HTTP 401) on the FIRST call only, then accepts — simulates a
+    successful re-auth refreshing the bearer so the retry AND any later BW leg land."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def place(self, leg: Leg) -> PlacementResult:
+        i = self.calls
+        self.calls += 1
+        if i == 0:
+            return PlacementResult(
+                accepted=False, auth_failed=True, detail="HTTP 401: Unauthorized"
+            )
+        return PlacementResult(
+            accepted=True, stake_filled=leg.stake_ars, odds_filled=leg.odds, ref=f"ref{i}"
+        )
+
+
+class _AuthFailLegThenAccept:
+    """Auth-fails the first attempt of a chosen place() call index, then accepts — for
+    targeting a specific leg (e.g. leg C of a 3-leg arb)."""
+
+    def __init__(self, fail_index: int) -> None:
+        self.fail_index = fail_index
+        self.calls = 0
+        self._failed = False
+
+    async def place(self, leg: Leg) -> PlacementResult:
+        i = self.calls
+        self.calls += 1
+        if i == self.fail_index and not self._failed:
+            self._failed = True
+            return PlacementResult(
+                accepted=False, auth_failed=True, detail="HTTP 401: Unauthorized"
+            )
+        return PlacementResult(
+            accepted=True, stake_filled=leg.stake_ars, odds_filled=leg.odds, ref=f"ref{i}"
+        )
+
+
+class _AcceptFirstRejectRestAuth:
+    """Accepts the first place() (leg A goes live), auth-fails every later call —
+    simulates a re-auth that could NOT refresh the session (reauth returns False) or a
+    leg that keeps 401-ing after a successful re-auth."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def place(self, leg: Leg) -> PlacementResult:
+        i = self.calls
+        self.calls += 1
+        if i == 0:
+            return PlacementResult(
+                accepted=True, stake_filled=leg.stake_ars, odds_filled=leg.odds, ref="refA"
+            )
+        return PlacementResult(accepted=False, auth_failed=True, detail="HTTP 401")
+
+
+class _DriftOnBwRetryReverify:
+    """reverify that returns steady odds everywhere EXCEPT on the betwarrior-pba leg's
+    3rd+ reverify — its post-re-auth re-check (for that leg: upfront pass, pre-place,
+    then the retry gate) — where odds drift UNFAVORABLY (-50%, well beyond the 1%
+    tolerance, so ``odds_still_acceptable`` refuses) and the leg is NOT retried. Isolates
+    the retry-path tolerance check without aborting leg A or the bw leg's own pre-place."""
+
+    def __init__(self) -> None:
+        self.bw_calls = 0
+
+    async def __call__(self, leg: Leg) -> float:
+        if leg.platform == "betwarrior-pba":
+            self.bw_calls += 1
+            if self.bw_calls >= 3:
+                return leg.odds * 0.5
+        return leg.odds
+
+
+def _arb_betsson_bw() -> tuple[Leg, Leg]:
+    # 2-leg arb: leg A betsson (always succeeds), leg B betwarrior-pba.
+    return (
+        Leg("betsson", "m1", "1X2", "home", 100.0, 2.0),
+        Leg("betwarrior-pba", "m1", "1X2", "away", 100.0, 2.1),
+    )
+
+
+def _arb_two_bw() -> tuple[Leg, Leg]:
+    # 2-leg arb with BOTH legs betwarrior-pba — proves re-auth is bounded to once per
+    # execution (only the first failing leg triggers it).
+    return (
+        Leg("betwarrior-pba", "m1", "1X2", "home", 100.0, 2.0),
+        Leg("betwarrior-pba", "m1", "1X2", "away", 100.0, 2.1),
+    )
+
+
+def _arb_three_bw_last() -> tuple[Leg, Leg, Leg]:
+    # 3-leg 1X2 arb; leg C is betwarrior-pba (the 401'ing rescue target).
+    return (
+        Leg("betsson", "m1", "1X2", "home", 60.0, 3.0),
+        Leg("betano", "m1", "1X2", "draw", 60.0, 3.1, live_max_stake_ars=5000.0),
+        Leg("betwarrior-pba", "m1", "1X2", "away", 60.0, 3.2),
+    )
+
+
+async def test_reauth_retry_completes_arb() -> None:
+    """Leg-C (betwarrior-pba) 401s once with auth_failed; the injected re-auth returns
+    True, odds re-verify steady, the single retry is accepted → arb COMPLETED; re-auth
+    called exactly once."""
+    g, n = _guard(), _FakeNotifier()
+    reauth = _ReauthStub(returns=True)
+    placer = _AuthFailLegThenAccept(fail_index=2)  # leg C's first attempt 401s
+    ex = _executor(g, n, _FakeRecovery(), placer, reauth=reauth)
+    res = await ex.execute_n_leg("opp", list(_arb_three_bw_last()))
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert reauth.calls == 1
+    assert any("re-authenticating BetWarrior" in t for t in n.sent)
+    assert any("COMPLETE" in t for t in n.sent)
+
+
+class _AuthFailFirstAttemptPerLeg:
+    """Auth-fails the FIRST attempt of each distinct leg (keyed by outcome), then accepts
+    its retry — so a 2nd auth_failed leg proves the ``reauthed`` guard: only the FIRST
+    failing leg gets a re-auth + retry; the second's 401 must NOT re-invoke reauth."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self._seen: set[str] = set()
+
+    async def place(self, leg: Leg) -> PlacementResult:
+        i = self.calls
+        self.calls += 1
+        if leg.outcome not in self._seen:
+            self._seen.add(leg.outcome)
+            return PlacementResult(
+                accepted=False, auth_failed=True, detail="HTTP 401: Unauthorized"
+            )
+        return PlacementResult(
+            accepted=True, stake_filled=leg.stake_ars, odds_filled=leg.odds, ref=f"ref{i}"
+        )
+
+
+async def test_reauth_only_once_per_execution() -> None:
+    """Two betwarrior-pba legs: the first 401s and triggers the single re-auth; the
+    second succeeds on the now-fresh bearer WITHOUT a second 401 (happy single-failure
+    path). re-auth is called exactly once for the whole execution."""
+    g, n = _guard(), _FakeNotifier()
+    reauth = _ReauthStub(returns=True)
+    placer = _AuthFailFirstThenAccept()  # only the very first place() 401s
+    ex = _executor(g, n, _FakeRecovery(), placer, reauth=reauth)
+    res = await ex.execute_n_leg("opp", list(_arb_two_bw()))
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert reauth.calls == 1  # bounded: one re-auth for the whole execution
+
+
+async def test_second_auth_failed_leg_does_not_re_reauth() -> None:
+    """The ``reauthed`` guard bites on a SECOND auth_failed leg: when BOTH betwarrior-pba
+    legs 401, only the first triggers a re-auth (its retry lands, leg A live); the
+    second's 401 must NOT re-invoke reauth or retry — it falls through to naked. Proves
+    the per-execution bound is enforced, not just the happy single-401 path."""
+    g, n = _guard(), _FakeNotifier()
+    reauth = _ReauthStub(returns=True)
+    placer = _AuthFailFirstAttemptPerLeg()  # BOTH bw legs 401 on their first attempt
+    ex = _executor(g, n, _FakeRecovery(), placer, reauth=reauth)
+    res = await ex.execute_n_leg("opp", list(_arb_two_bw()))
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE  # leg A live, leg B rejected
+    assert reauth.calls == 1  # the second 401 did NOT re-invoke reauth
+    assert placer.calls == 3  # leg A (place + retry) + leg B (single failed attempt, NO retry)
+
+
+async def test_reauth_failure_falls_back_to_naked() -> None:
+    """≥1 leg already live, then a later betwarrior-pba leg 401s; the re-auth returns
+    False (challenge / failed). No retry → the leg rejects → NAKED_EXPOSURE (today's
+    behavior), exactly one re-auth attempt, a NAKED alert. The rescue never adds exposure."""
+    g, n = _guard(), _FakeNotifier()
+    reauth = _ReauthStub(returns=False)
+    placer = _AcceptFirstRejectRestAuth()  # leg A live, leg B keeps 401-ing
+    ex = _executor(g, n, _FakeRecovery(), placer, reauth=reauth)
+    res = await ex.execute_n_leg("opp", list(_arb_betsson_bw()))
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert reauth.calls == 1
+    assert any("NAKED" in t for t in n.sent)
+
+
+async def test_reauth_then_drift_aborts_or_naked() -> None:
+    """Re-auth succeeds, BUT the post-reauth re-verify drifts beyond tolerance → the
+    failed leg is NOT retried → it goes naked (leg A is live) exactly as today
+    (conservative: the rescue never hedges at unfavorable odds). No retry placement."""
+    g, n = _guard(), _FakeNotifier()
+    reauth = _ReauthStub(returns=True)
+    placer = _AcceptFirstRejectRestAuth()  # leg A live, leg B 401s
+    # reverify steady everywhere EXCEPT the bw leg's post-reauth re-check (its 3rd
+    # reverify: upfront pass, pre-place, then the retry gate), which drifts
+    # UNFAVORABLY (-50%) → tolerance fails → no retry → naked (leg A stays live).
+    reverify = _DriftOnBwRetryReverify()
+    ex = _executor(g, n, _FakeRecovery(), placer, reauth=reauth, reverify=reverify)
+    res = await ex.execute_n_leg("opp", list(_arb_betsson_bw()))
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert reauth.calls == 1
+    assert placer.calls == 2  # leg A placed + leg B's single (failed) attempt — NO retry
+
+
+async def test_non_auth_reject_does_not_reauth() -> None:
+    """A non-auth reject (auth_failed=False — e.g. odds invalid / suspended outcome) must
+    NOT trigger a re-auth: today's abort/naked runs unchanged."""
+    g, n = _guard(), _FakeNotifier()
+    reauth = _ReauthStub(returns=True)
+    placer = _CountingPlacer(reject_index=1)  # leg B rejected, auth_failed defaults False
+    ex = _executor(g, n, _FakeRecovery(), placer, reauth=reauth)
+    res = await ex.execute_n_leg("opp", list(_arb_betsson_bw()))
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert reauth.calls == 0  # never re-authed on a non-auth reject

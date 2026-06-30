@@ -42,6 +42,25 @@ log = structlog.get_logger(__name__)
 # trip when a session recovers — a hard trip (freeze / daily loss) carries a
 # different reason and is left alone.
 _NOT_READY_REASON = "session not ready"
+# Hard bound on a single readiness probe (establish_betsson_context can reach ~90s
+# legit: a 60s networkidle goto + a 30s passive ctx-poll). A probe that HANGS past
+# this — observed 2026-06-24: Betsson's page.goto(networkidle) wedged when a stale
+# betslip kept the SPA re-validating, and Playwright's own 60s goto timeout did NOT
+# fire, freezing the whole heartbeat loop on one await (try/except can't catch a
+# hang). asyncio.wait_for enforces a real cancellation so the loop survives + the
+# session auto-recovers once the window is usable again. Generous vs the ~90s legit
+# ceiling so a slow-but-healthy probe is never falsely killed.
+_PROBE_TIMEOUT_S = 120.0
+
+# Betsson's reality-check close is a real bookmaker-window click, so it stays bounded.
+# But one attempt is too brittle: a click can land during SPA animation/cooldown, the
+# custom element can ignore it once, or Playwright can miss the center point. Retry inside
+# the same background recovery task, not on every heartbeat, so a persistent popup gets a
+# few chances without creating an unbounded click loop.
+_REALITY_CHECK_MAX_CLOSE_ATTEMPTS = 3
+_REALITY_CHECK_CLOSE_RETRY_DELAY_S = 10.0
+_REALITY_CHECK_CLOSE_ATTEMPT_TIMEOUT_S = 20.0
+_REALITY_CHECK_RECHECK_TIMEOUT_S = 10.0
 
 
 class WarmTransport(Protocol):
@@ -61,6 +80,18 @@ class WarmTransport(Protocol):
     # button. Returns True iff the popup dismissed; False → manager falls back to alert.
     # Real bookmaker interaction — operator-authorized (see InSessionTransport.attempt_session_extend).
     async def attempt_session_extend(self) -> bool: ...
+    # Auto-close Betsson's reality-check reminder by clicking "Cerrar". Returns True
+    # iff the popup dismissed; False → manager falls back to alert.
+    # Real bookmaker interaction — operator-authorized (see InSessionTransport.attempt_reality_check_close).
+    async def attempt_reality_check_close(self) -> bool: ...
+    # Leave BetWarrior's promotions page by clicking top-nav "INICIO". Returns True iff
+    # the page leaves the promotions route; False → manager falls back to alert.
+    # Real bookmaker interaction — operator-authorized (see InSessionTransport.attempt_betwarrior_promotions_home).
+    async def attempt_betwarrior_promotions_home(self) -> bool: ...
+    # Full logout→login on BetWarrior's own window using keyring creds (a server-killed
+    # Kambi session is replaced + its bearer re-captured). True iff a fresh bearer lands.
+    # Real bookmaker interaction — operator-authorized (see InSessionTransport.attempt_betwarrior_relogin).
+    async def attempt_betwarrior_relogin(self) -> bool: ...
     # Minimal inactivity avoidance (mouse/scroll/occasional click). Best-effort;
     # never raises. See InSessionTransport.keepalive for the operator authorization
     # and the 2026-06-13 lab result on why mouse-alone isn't enough.
@@ -126,15 +157,25 @@ class HotSessionManager:
         # None ⇒ assume the persistent profiles are already logged in.
         self._login_gate = login_gate
         self._notifier = notifier or NullNotifier()
-        self._suspended_for_cold = False  # we tripped the switch for a cold session
+        self._suspended_for_cold = False  # we tripped the switch for a cold/session block
         self._readiness: dict[str, bool] = {}  # last probed per-platform readiness
-        self._blocks: dict[str, SessionBlock] = {}  # platforms with an RG block (overlay/banner)
-        # Per-platform "we already clicked extend for this popup episode" — prevents
-        # retrying the auto-extend click on every heartbeat when the popup persists and
-        # the click keeps failing (each click is a real bookmaker interaction; the
-        # operator authorization is for ONE attempt per episode, then alert). Pruned
-        # when the block clears so a future popup episode on the same platform re-tries.
+        self._blocks: dict[str, SessionBlock] = {}  # platforms with an overlay/banner block
+        # Per-platform popup-action guards. Session extension remains one-shot per
+        # episode. Betsson reality-check uses one background task per episode, and that
+        # task performs a small bounded retry loop; the guard prevents heartbeat-spawned
+        # duplicate tasks while the popup persists. Pruned when the block clears so a
+        # future popup episode gets a fresh recovery task.
         self._extend_attempted: set[str] = set()
+        self._reality_check_attempted: set[str] = set()
+        self._reality_check_tasks: dict[str, asyncio.Task[None]] = {}
+        self._promotions_attempted: set[str] = set()
+        self._promotions_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pending_reality_recoveries: dict[str, WarmTransport] = {}
+        self._pending_promotions_recoveries: dict[str, WarmTransport] = {}
+        self._session_reauth_attempted: set[str] = set()
+        self._session_reauth_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pending_session_reauth: dict[str, WarmTransport] = {}
+        self._stopping = False
         self._started_at = 0.0  # monotonic bot start (set in __aenter__), for block uptime
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._status_task: asyncio.Task[None] | None = None
@@ -158,7 +199,9 @@ class HotSessionManager:
         # Can't reach a placeable state on any platform at startup → suspend
         # auto-placement and alert, but DON'T halt: the heartbeat keeps probing and
         # resumes once the operator finishes logging in. Detection runs regardless.
-        await self._apply_health(await self._probe_readiness())
+        not_ready = await self._probe_readiness()
+        await self._apply_health(not_ready)
+        self._start_pending_recoveries()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._status_task = asyncio.create_task(self._status_loop())
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
@@ -171,11 +214,25 @@ class HotSessionManager:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        for task in (self._heartbeat_task, self._status_task, self._keepalive_task):
+        self._stopping = True
+        for task in (
+            self._heartbeat_task,
+            self._status_task,
+            self._keepalive_task,
+            *self._reality_check_tasks.values(),
+            *self._promotions_tasks.values(),
+            *self._session_reauth_tasks.values(),
+        ):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        self._reality_check_tasks.clear()
+        self._promotions_tasks.clear()
+        self._pending_reality_recoveries.clear()
+        self._pending_promotions_recoveries.clear()
+        self._session_reauth_tasks.clear()
+        self._pending_session_reauth.clear()
         # Last-known-good: persist READY sessions so a graceful restart can
         # re-inject them. Probe first so a session that's cold at shutdown is
         # skipped (keep the last good save). Best-effort — the bot is stopping.
@@ -215,11 +272,17 @@ class HotSessionManager:
         failures all surface in the alert, and "ready again" only fires when EVERY
         platform is placeable. Previously returned a single name, which masked
         concurrent failures (one platform's recovery hid another's still-down state)."""
+
         async def _safe(name: str, coro: Awaitable[bool]) -> bool:
             # A probe that raises (cross-origin fetch, nav fault) means NOT READY —
             # suspend + alert, never crash startup or the heartbeat loop.
             try:
-                return await coro
+                return await asyncio.wait_for(coro, timeout=_PROBE_TIMEOUT_S)
+            except TimeoutError:
+                # A HUNG probe (e.g. Betsson networkidle goto wedging — Playwright's
+                # own timeout didn't fire) means NOT READY, never a frozen heartbeat.
+                self._log.warning("hot_sessions.probe_timeout", platform=name)
+                return False
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("hot_sessions.probe_error", platform=name, error=str(exc))
                 return False
@@ -278,6 +341,42 @@ class HotSessionManager:
                 extended = await _try_extend(name, transport)
                 if extended:
                     block = await _block(name, transport)  # re-probe; expect None now
+            # Betsson reality-check path: record a pending cooldown close, but DO NOT
+            # start it inside the probe. _apply_health must trip the kill switch first.
+            if (
+                block is not None
+                and block.is_overlay
+                and block.kind == "reality_check"
+                and name not in self._reality_check_attempted
+                and name not in self._reality_check_tasks
+                and not self._stopping
+            ):
+                self._pending_reality_recoveries[name] = transport
+            # BetWarrior promotions route: record a pending INICIO recovery, but start it
+            # only after _apply_health has suspended placement for this known-bad route.
+            if (
+                block is not None
+                and block.is_overlay
+                and block.kind == "promotions_page"
+                and name not in self._promotions_attempted
+                and name not in self._promotions_tasks
+                and not self._stopping
+            ):
+                self._pending_promotions_recoveries[name] = transport
+            # BetWarrior session_expired (inactivity logout / server-side kill): record a
+            # pending re-auth, started after _apply_health suspends placement. The reactive
+            # path (Step 4) covers the silent 401 (no popup); this covers the popup case.
+            # Only betwarrior has an auto relogin.
+            if (
+                block is not None
+                and block.is_overlay
+                and block.kind == "session_expired"
+                and name == "betwarrior"
+                and name not in self._session_reauth_attempted
+                and name not in self._session_reauth_tasks
+                and not self._stopping
+            ):
+                self._pending_session_reauth[name] = transport
             if block is not None:
                 blocks[name] = block
             # Only a true blocking OVERLAY makes a platform not-placeable; a non-blocking
@@ -289,16 +388,221 @@ class HotSessionManager:
         # log NEW lockouts + capture their DOM (uses _blocks as the prior state)
         await self._record_new_blocks(blocks, transports)
         self._blocks = blocks
-        # Prune the extend-attempted set: any platform whose block has cleared is eligible
-        # for a fresh extend attempt on a future popup episode. (If the block persists,
-        # the platform stays in `blocks` and remains in the attempted set — no retry.)
+        # Prune popup-action guards: any platform whose block has cleared is eligible
+        # for a fresh click on a future popup episode. Persisting blocks keep their guard
+        # set, so failed clicks are not retried every heartbeat.
         self._extend_attempted &= blocks.keys()
+        self._reality_check_attempted &= blocks.keys()
+        self._promotions_attempted &= blocks.keys()
+        self._session_reauth_attempted &= blocks.keys()
         # Return ALL not-ready platform names — overlay-blocked first (actionable:
         # handle the popup), then plain cold. Overlay-blocked platforms are also in
         # `states` with value False, so exclude them from the cold list to avoid dupes.
         overlay_blocked = [p for p, b in blocks.items() if b.is_overlay]
         cold = [p for p, ok in states.items() if not ok and p not in overlay_blocked]
         return overlay_blocked + cold
+
+    def _start_pending_recoveries(self) -> None:
+        if self._stopping:
+            self._pending_reality_recoveries.clear()
+            self._pending_promotions_recoveries.clear()
+            self._pending_session_reauth.clear()
+            return
+        for name, transport in list(self._pending_reality_recoveries.items()):
+            self._pending_reality_recoveries.pop(name, None)
+            if name in self._reality_check_attempted or name in self._reality_check_tasks:
+                continue
+            self._reality_check_attempted.add(name)
+            self._schedule_reality_check_close(name, transport)
+        for name, transport in list(self._pending_promotions_recoveries.items()):
+            self._pending_promotions_recoveries.pop(name, None)
+            if name in self._promotions_attempted or name in self._promotions_tasks:
+                continue
+            self._promotions_attempted.add(name)
+            self._schedule_promotions_home(name, transport)
+        for name, transport in list(self._pending_session_reauth.items()):
+            self._pending_session_reauth.pop(name, None)
+            if name in self._session_reauth_attempted or name in self._session_reauth_tasks:
+                continue
+            self._session_reauth_attempted.add(name)
+            self._schedule_session_reauth(name, transport)
+
+    def _schedule_reality_check_close(self, name: str, transport: WarmTransport) -> None:
+        if name in self._reality_check_tasks:
+            return
+        self._reality_check_tasks[name] = asyncio.create_task(
+            self._close_reality_check_after_cooldown(name, transport)
+        )
+
+    async def _close_reality_check_after_cooldown(
+        self, name: str, transport: WarmTransport
+    ) -> None:
+        async def _apply_recovered(event: str, attempt: int) -> None:
+            self._log.info(event, platform=name, attempt=attempt)
+            if self._stopping:
+                return
+            try:
+                not_ready = await self._probe_readiness()
+            except Exception as exc:  # noqa: BLE001 — heartbeat will retry probe
+                self._log.warning(
+                    "hot_sessions.reality_check_reprobe_error",
+                    platform=name,
+                    error=str(exc),
+                )
+                return
+            await self._apply_health(not_ready)
+            self._start_pending_recoveries()
+
+        async def _reality_still_blocked(attempt: int) -> bool:
+            try:
+                block = await asyncio.wait_for(
+                    transport.check_session_blocked(),
+                    timeout=_REALITY_CHECK_RECHECK_TIMEOUT_S,
+                )
+            except TimeoutError:
+                self._log.warning(
+                    "hot_sessions.reality_check_recheck_timeout",
+                    platform=name,
+                    attempt=attempt,
+                    timeout_s=_REALITY_CHECK_RECHECK_TIMEOUT_S,
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001 — retry loop must stay fail-soft
+                self._log.warning(
+                    "hot_sessions.reality_check_recheck_error",
+                    platform=name,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                return True
+            return block is not None and block.kind == "reality_check" and block.is_overlay
+
+        try:
+            for attempt in range(1, _REALITY_CHECK_MAX_CLOSE_ATTEMPTS + 1):
+                if not await _reality_still_blocked(attempt):
+                    await _apply_recovered(
+                        "hot_sessions.reality_check_cleared_before_attempt",
+                        attempt,
+                    )
+                    return
+                try:
+                    ok = await asyncio.wait_for(
+                        transport.attempt_reality_check_close(),
+                        timeout=_REALITY_CHECK_CLOSE_ATTEMPT_TIMEOUT_S,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except TimeoutError:
+                    self._log.warning(
+                        "hot_sessions.reality_check_close_timeout",
+                        platform=name,
+                        attempt=attempt,
+                        max_attempts=_REALITY_CHECK_MAX_CLOSE_ATTEMPTS,
+                        timeout_s=_REALITY_CHECK_CLOSE_ATTEMPT_TIMEOUT_S,
+                    )
+                    ok = False
+                except Exception as exc:  # noqa: BLE001 — background recovery must never die noisily
+                    self._log.warning(
+                        "hot_sessions.reality_check_close_error",
+                        platform=name,
+                        attempt=attempt,
+                        max_attempts=_REALITY_CHECK_MAX_CLOSE_ATTEMPTS,
+                        error=str(exc),
+                    )
+                    ok = False
+                if ok:
+                    await _apply_recovered("hot_sessions.reality_check_closed", attempt)
+                    return
+                if not await _reality_still_blocked(attempt):
+                    await _apply_recovered(
+                        "hot_sessions.reality_check_cleared_before_retry",
+                        attempt,
+                    )
+                    return
+                if attempt < _REALITY_CHECK_MAX_CLOSE_ATTEMPTS:
+                    self._log.warning(
+                        "hot_sessions.reality_check_close_retrying",
+                        platform=name,
+                        attempt=attempt,
+                        max_attempts=_REALITY_CHECK_MAX_CLOSE_ATTEMPTS,
+                        retry_delay_s=_REALITY_CHECK_CLOSE_RETRY_DELAY_S,
+                    )
+                    await asyncio.sleep(_REALITY_CHECK_CLOSE_RETRY_DELAY_S)
+            self._log.warning(
+                "hot_sessions.reality_check_close_failed",
+                platform=name,
+                attempts=_REALITY_CHECK_MAX_CLOSE_ATTEMPTS,
+            )
+        finally:
+            self._reality_check_tasks.pop(name, None)
+
+    def _schedule_session_reauth(self, name: str, transport: WarmTransport) -> None:
+        if name in self._session_reauth_tasks:
+            return
+        self._session_reauth_tasks[name] = asyncio.create_task(
+            self._relogin_session(name, transport)
+        )
+
+    async def _relogin_session(self, name: str, transport: WarmTransport) -> None:
+        try:
+            ok = await transport.attempt_betwarrior_relogin()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — background recovery must never die noisily
+            self._log.warning("hot_sessions.session_reauth_error", platform=name, error=str(exc))
+            return
+        finally:
+            self._session_reauth_tasks.pop(name, None)
+        if not ok:
+            # Leave the existing suspend + alert — a failed/challenged re-auth degrades to
+            # today's behavior (operator finishes the login manually); never adds exposure.
+            self._log.warning("hot_sessions.session_reauth_failed", platform=name)
+            return
+        self._log.info("hot_sessions.session_reauth_ok", platform=name)
+        if self._stopping:
+            return
+        try:
+            not_ready = await self._probe_readiness()
+        except Exception as exc:  # noqa: BLE001 — recovery failed; heartbeat will retry probe
+            self._log.warning(
+                "hot_sessions.session_reauth_reprobe_error", platform=name, error=str(exc)
+            )
+            return
+        await self._apply_health(not_ready)
+        self._start_pending_recoveries()
+
+    def _schedule_promotions_home(self, name: str, transport: WarmTransport) -> None:
+        if name in self._promotions_tasks:
+            return
+        self._promotions_tasks[name] = asyncio.create_task(
+            self._return_from_promotions(name, transport)
+        )
+
+    async def _return_from_promotions(self, name: str, transport: WarmTransport) -> None:
+        try:
+            ok = await transport.attempt_betwarrior_promotions_home()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — background recovery must never die noisily
+            self._log.warning("hot_sessions.promotions_home_error", platform=name, error=str(exc))
+            return
+        finally:
+            self._promotions_tasks.pop(name, None)
+        if not ok:
+            self._log.warning("hot_sessions.promotions_home_failed", platform=name)
+            return
+        self._log.info("hot_sessions.promotions_home_recovered", platform=name)
+        if self._stopping:
+            return
+        try:
+            not_ready = await self._probe_readiness()
+        except Exception as exc:  # noqa: BLE001 — recovery failed; heartbeat will retry probe
+            self._log.warning(
+                "hot_sessions.promotions_reprobe_error", platform=name, error=str(exc)
+            )
+            return
+        await self._apply_health(not_ready)
+        self._start_pending_recoveries()
 
     async def _record_new_blocks(
         self, blocks: dict[str, SessionBlock], transports: dict[str, WarmTransport]
@@ -401,6 +705,7 @@ class HotSessionManager:
                 self._log.error("hot_sessions.heartbeat_error", error=str(exc))
                 not_ready = ["unknown"]
             await self._apply_health(not_ready)
+            self._start_pending_recoveries()
             # Persist READY sessions only — a cold session is skipped so we never
             # overwrite the last good save (see _save_sessions).
             await self._save_sessions(not_ready)
@@ -463,6 +768,10 @@ class HotSessionManager:
                     return f'{name} 🔌 SESSION EXPIRED ("{block.phrase}") — re-login'
                 if block.kind == "session_timer_warning":
                     return f'{name} ⏱️ SESSION TIMER ("{block.phrase}") — extend or re-login'
+                if block.kind == "reality_check":
+                    return f'{name} 🕒 REALITY CHECK ("{block.phrase}") — click Cerrar'
+                if block.kind == "promotions_page":
+                    return f'{name} 🎁 PROMOTIONS PAGE ("{block.phrase}") — click INICIO'
                 return f'{name} 🚫 RG LOCKOUT ("{block.phrase}") — handle the popup'
             return f"{name} (cold)"
 

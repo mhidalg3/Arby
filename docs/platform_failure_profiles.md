@@ -125,6 +125,16 @@ UI examples seen in viewer screenshots:
 - A rejected first leg aborts cleanly.
 - A rejected later leg becomes `NAKED_EXPOSURE` if prior legs were already live.
 - Betsson responses do not echo stake/odds; if accepted, the executor records requested stake/odds.
+- A FAVORABLE `E_BETTING_ODDS_INVALID` reject (Betsson returns the current `validOdds`
+  for our selection) is a price-confirmation handshake: `BetssonLegPlacer.place()` re-submits
+  ONCE at the exact returned odds when the move is strictly favorable
+  (`validOdds > submitted`, same fixed stake → worst-case payout strictly non-decreasing,
+  hedge can only improve) and within the `_BETSSON_RESUBMIT_MAX_UPLIFT_PCT` (20%) anomaly
+  cap. It fails closed (keeps the reject) on: an unfavorable move, an over-cap "valid"
+  price, a non-odds error, a selection-tag mismatch, or any reject carrying a non-empty
+  `couponId` (a coupon may exist → never re-POST). The retry is bounded single-shot; a
+  second price move on the retry returns the reject (no loop). This is hedge-safe, not a
+  `src/risk/` decision: the stake is never resized.
 
 **Operator recovery**
 
@@ -137,6 +147,60 @@ UI examples seen in viewer screenshots:
 - Pre-place coupon cleanup / stale slip sanitizer.
 - Better surface `couponPlacementErrors` values in viewer/postmortem.
 - Residual hedge recomputation after a changed filled leg remains deferred.
+
+### B3. Reality-check reminder popup
+
+**How it presents**
+
+Viewer/logs:
+
+```text
+c342 betsson: reality_check ⚠️
+```
+
+Shadow-DOM evidence:
+
+- `h1.reality-check-question`: `¿Sabés qué hora es?`
+- `p.reality-check-message`: `EL JUEGO COMPULSIVO ES PERJUDICIAL PARA VOS Y TU FAMILIA`
+
+UI:
+
+- Betsson overlays the sportsbook with a responsible-gaming reminder.
+- The orange `Cerrar` button at the bottom closes the popup.
+
+**Cause**
+
+Betsson periodically shows a reality-check / responsible-gaming reminder. It is not a
+hard responsible-gambling lockout and not a dead session; it is a dismissible modal that
+occludes the betting UI.
+
+**Current autonomous recovery**
+
+The heartbeat detects this Betsson-only popup through a bounded open-shadow-DOM scan,
+marks Betsson not-ready immediately, and schedules one background recovery click per
+popup episode:
+
+1. trip the normal `session not ready` kill switch before waiting through the cooldown,
+2. confirm one of the grounded reality-check phrases is visible in Betsson's shadow DOM,
+3. wait 5.25 seconds for the observed `Cerrar` cooldown to elapse,
+4. click one visible `Cerrar` button from the same document/shadow root as that phrase,
+5. re-probe until the shadow marker disappears,
+6. reset auto-placement after all platforms are ready again.
+
+Success logs `transport.reality_check_dismissed` and
+`hot_sessions.reality_check_closed`, followed by the normal `Sessions ready again` reset.
+If the click fails or the popup persists, the existing `session not ready` suspend path
+remains active with a `REALITY CHECK` alert telling the operator to click `Cerrar`.
+
+**Operator recovery**
+
+If automation fails, manually click the orange `Cerrar` button. The heartbeat will resume
+once the popup disappears.
+
+**Open gaps / improvements**
+
+- The selector is grounded on the current popup phrases, not class-only markers. Capture
+  any future Betsson wording/DOM variant before broadening it.
 
 ---
 
@@ -381,7 +445,61 @@ Server-side inactivity logout or bearer refresh stopped. The JWT `exp` can lag b
 - Active authenticated Kambi keepalive via `page.evaluate` or transport-level player API call.
 - Capture exact inactivity-popup DOM for any new variant.
 
-### W3. `LIVE_DELAY_PENDING` during execution
+### W3. Promotions page trap
+
+**How it presents**
+
+Viewer/capture:
+
+```text
+url: https://pba.betwarrior.bet.ar/es-ar/promotions
+page title/body: PROMOCIONES
+state: promotions_page
+```
+
+UI:
+
+- The BetWarrior window shows `PROMOCIONES` with promo cards.
+- Top navigation still shows `INICIO`.
+- The page can remain stuck there for hours while bearer readiness still appears live.
+
+Observed episode:
+
+- BetWarrior first entered `/es-ar/promotions` at 18:07 in
+  `recon/artifacts/session_viewer/20260623_125619/viewer.jsonl`.
+- It stayed there through the current capture.
+- Hot-loop logs did not show a promotions-specific event before this fix.
+
+**Cause**
+
+Likely SPA route drift from a user/promo navigation or from keepalive clicking a clickable
+promo/banner implemented as a non-`button`/non-`a` element. The old keepalive only skipped
+literal interactive tag names, so clickable `div` cards with `cursor:pointer` could still
+be clicked.
+
+**Current handling**
+
+- `check_session_blocked()` treats BetWarrior `/promotions` + `PROMOCIONES` as
+  `SessionBlock(kind=\"promotions_page\")`.
+- The heartbeat marks BetWarrior not-ready and trips the normal `session not ready` kill
+  switch before attempting recovery.
+- A background task clicks the visible top-nav `INICIO`, polls until the promotions marker
+  disappears, then re-probes and resets auto-placement only when all platforms are ready.
+- Keepalive now skips pointer-cursor/onclick/interactive-ancestor targets, not just
+  literal `button`/`a` tags, reducing the chance of navigating into promotions again.
+
+**Operator recovery**
+
+If automation fails, manually click the top-nav `INICIO` button. The heartbeat will resume
+once the page returns to a sportsbook route and all sessions are ready.
+
+**Open gaps / improvements**
+
+- If future captures show a different route/title for non-sportsbook pages, add explicit
+  route guards rather than relying on bearer liveness.
+- Active authenticated Kambi keepalive is still safer than synthetic clicks long-term.
+
+### W4. `LIVE_DELAY_PENDING` during execution
 
 **How it presents**
 
@@ -438,14 +556,15 @@ Effect:
 
 **Open gaps / improvements**
 
-- Live proof still pending: no natural `LIVE_DELAY_PENDING` has occurred since poll v2 deploy.
+- Live proof passed on 2026-06-23: two BetWarrior `LIVE_DELAY_PENDING` coupons resolved
+  via poll v2 to `betStatus=OPEN` during the first completed real arb.
 - BetWarrior-first leg ordering. If any platform must bear asynchronous uncertainty, it should be first so no earlier confirmed legs are exposed.
 - Residual hedge recomputation after a confirmed BetWarrior fill: if leg A accepted, reverify remaining legs and recompute stake/odds before hedging.
 - Keep `allowOddsChange* = NO` until residual hedge solver exists. Enabling YES without recomputing can accept a worse filled price and destroy the arb.
 - Potential active bearer-capture/keepalive so the bearer exists before an execution candidate appears.
 - More structured `body` logging for pending responses instead of truncated stringified dicts.
 
-### W4. Kambi HTTP errors / odds mismatch / suspended outcome
+### W5. Kambi HTTP errors / odds mismatch / suspended outcome
 
 **How it presents**
 

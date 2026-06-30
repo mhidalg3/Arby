@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import uuid
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -419,9 +420,7 @@ def match_betwarrior_coupon(
         # EXPLICITLY — never bets[0]: a multi-bet coupon could classify a different bet
         # (e.g. ACCEPT an OPEN sibling while our betRef is still WAITING_FOR_APPROVAL).
         if bet_ref is not None and isinstance(bets, list):
-            bet = next(
-                (b for b in bets if isinstance(b, dict) and b.get("betRef") == bet_ref), {}
-            )
+            bet = next((b for b in bets if isinstance(b, dict) and b.get("betRef") == bet_ref), {})
         else:
             bet = _first(bets)
         status = str(bet.get("betStatus", "")).upper()
@@ -448,6 +447,48 @@ def parse_betsson(resp: dict[str, Any]) -> PlacementResult:
         ref=str(status.get("couponId", "")),
         detail="" if accepted else f"betsson: {errors or status.get('couponStatusPollingResult')}",
     )
+
+
+@dataclass(frozen=True)
+class BetssonOddsCorrection:
+    """A Betsson ``E_BETTING_ODDS_INVALID`` price-confirmation: the server's current
+    valid odds for our selection. ``valid_odds_str`` is the EXACT string Betsson
+    returned (re-submitted verbatim so a >2-dp price isn't lost to rounding)."""
+
+    valid_odds: float
+    valid_odds_str: str
+    selection_tag: str
+
+
+def betsson_odds_correction(resp: dict[str, Any]) -> BetssonOddsCorrection | None:
+    """The valid-odds correction from an ``E_BETTING_ODDS_INVALID`` rejection, or None.
+
+    Fails closed (None) on an accepted coupon, any present ``couponId`` (a coupon may
+    exist → never re-POST), a non-odds error, or an unparseable ``validOdds``."""
+    status = _d(resp.get("couponStatus"))
+    if status.get("couponStatusPollingResult") == "Success":
+        return None
+    coupon_id = str(status.get("couponId", "") or "")
+    if coupon_id and coupon_id != "0":
+        return None  # a coupon may have been created — do not re-POST over it
+    for err in status.get("couponPlacementErrors") or []:
+        if not isinstance(err, dict) or err.get("code") != "E_BETTING_ODDS_INVALID":
+            continue
+        details = _d(err.get("details"))
+        raw = details.get("validOdds")
+        if raw is None:
+            continue
+        try:
+            vo = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if vo > 1.0:
+            return BetssonOddsCorrection(
+                valid_odds=vo,
+                valid_odds_str=str(raw),
+                selection_tag=str(details.get("marketSelectionTag", "")),
+            )
+    return None
 
 
 _PARSERS = {

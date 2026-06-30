@@ -29,6 +29,7 @@ from typing import Any, Final, Protocol
 import structlog
 
 from src.config import get_settings
+from src.credentials import get_credential
 
 log = structlog.get_logger(__name__)
 
@@ -96,6 +97,14 @@ _SESSION_TIMER_PHRASES: Final[tuple[str, ...]] = (
     "tu sesión está activa por",
 )
 
+# Betsson reality-check popup (open shadow DOM). This is not a lockout and not a dead
+# session: it is a responsible-gaming reminder that blocks the UI until the operator
+# clicks the orange "Cerrar" button. Grounded from session-viewer captures
+# 2026-06-22/23: h1.reality-check-question + p.reality-check-message.
+_REALITY_CHECK_PHRASES: Final[tuple[str, ...]] = (
+    "¿sabés qué hora es?",
+    "el juego compulsivo es perjudicial para vos y tu familia",
+)
 # Visible modal/overlay selector — used by capture_block_evidence to dump the block's
 # markup. A populated `dialogs` list means a true blocking OVERLAY; an empty one with a
 # phrase hit means a non-blocking BANNER (e.g. Betano's "12h descanso"). This is exactly
@@ -130,6 +139,97 @@ _SESSION_EXTEND_BUTTON_SELECTORS: Final[dict[str, str]] = {
     "betano": "#st-maintain-button",
 }
 
+# Betsson reality-check "Cerrar" has an observed cooldown after the popup appears/loads.
+# Wait through that window before each bounded manager retry; otherwise a click can land
+# on a disabled/no-op button. The manager bounds total attempts per popup episode.
+_BETSSON_REALITY_CHECK_CLOSE_COOLDOWN_S: Final[float] = 5.25
+# Max stale Betsson betslip selections cleared per heartbeat. A failed/moved direct-coupon
+# placement can leave server-side slip residue (an `obg-m-betslip-selection` flagged
+# `-error`); enough of them re-validating keeps the SPA off `networkidle` and wedges the
+# heartbeat's goto (2026-06-24 incident). Cap so a pathological slip can't loop the clear.
+_BETSSON_STALE_SLIP_MAX: Final[int] = 12
+
+# BetWarrior can drift into the promotions SPA route (`/es-ar/promotions`, title/body
+# "PROMOCIONES"). Kambi bearer liveness still passes there, but the sportsbook UI is not
+# placeable. The safe recovery is the operator action: click the top-nav "INICIO".
+_BETWARRIOR_PROMOTIONS_SCAN_JS = """() => {
+    const body = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim();
+    return {
+        url: location.href,
+        title: document.title || '',
+        bodyText: body.slice(0, 2000),
+    };
+}"""
+
+_BETWARRIOR_CLICK_INICIO_JS = """() => {
+    const vis = (el) => {
+        try {
+            const r = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+        } catch (_) {
+            return false;
+        }
+    };
+    const els = Array.from(document.querySelectorAll('a,button,[role=link],[role=button]'));
+    const target = els.find((el) => {
+        const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+        return vis(el) && text === 'inicio';
+    });
+    if (!target) return false;
+    target.click();
+    return true;
+}"""
+
+# BetWarrior auto re-auth (operator-authorized 2026-06-26). On a placement 401 / a
+# session_expired popup the transport drives a full logout→login on its OWN window using
+# keyring creds, so a server-killed Kambi session is replaced and its bearer re-captured.
+# Login-form selectors are STABLE test IDs captured live 2026-06-26 on the public
+# pba.betwarrior.bet.ar login modal; the session-expired CTA is from the recon DOM dump
+# (SessionInactivityModal, 2026-06-19). Success keys on a FRESH bearer (≠ the pre-login
+# token), NOT a balance element — a stale-but-valid-JWT bearer can fake the UI signal.
+# See InSessionTransport.attempt_betwarrior_relogin.
+_BETWARRIOR_RELOGIN_TIMEOUT_S: Final[float] = 45.0
+# The home/soccer promo overlay (Popup__PopupContainerCss) intercepts the login trigger;
+# dismiss its close icon first (fail-soft — absent on some routes). Captured 2026-06-26.
+_BW_PROMO_DISMISS_SEL: Final[str] = "[class*='Popup__IconContainerCss']"
+# Session-expired "INICIA SESIÓN AHORA" CTA (recon DOM dump 2026-06-19) — opens the same
+# login form the header trigger does; preferred when the dead-session popup is up.
+_BW_LOGIN_CTA_SEL: Final[str] = "[class*='SessionInactivityModal__CtaButtonCss']"
+_BW_LOGIN_TRIGGER_SEL: Final[str] = "[data-testid='login-button']"
+_BW_USER_SEL: Final[str] = "[data-testid='login-email']"
+_BW_PASS_SEL: Final[str] = "[data-testid='login-password']"
+_BW_SUBMIT_SEL: Final[str] = "[data-testid='login-submit-button']"
+# Sportsbook home — navigating here after a successful login forces the Kambi widget to
+# load and emit its session bearer (punter/session.json), which auth alone does NOT
+# surface (validated live 2026-06-26: a manual sportsbook nav made the bot capture the
+# bearer + flip "ready again"). The retry placement needs that bearer.
+_BW_SPORTSBOOK_HOME: Final[str] = "https://pba.betwarrior.bet.ar/es-ar/sports/home"
+# After the authenticated UI is reached + the sportsbook reloaded, wait this long for the
+# fresh bearer. If it still hasn't arrived the session is live anyway (the sportsbook is
+# active, so prepare_betwarrior_auth in the retry will capture it) — relogin returns True.
+_BW_FRESH_BEARER_WAIT_S: Final[float] = 15.0
+# "Is the logged-in account trigger visible?" — the reliable authenticated-UI signal (NOT
+# login-button, a wrapper ancestor). querySelectorAll+some so a hidden clone (BetWarrior
+# duplicates these test IDs) can't false-positive/negative.
+_BW_USER_TRIGGER_VISIBLE_JS = (
+    "() => [...document.querySelectorAll(\"[data-testid='user-trigger']\")]"
+    ".some(e => { const r = e.getBoundingClientRect();"
+    " return !!e.offsetParent && getComputedStyle(e).visibility !== 'hidden'"
+    " && r.width > 0 && r.height > 0; })"
+)
+# Challenge markers (conservative + fail-safe): a challenged login (OTP/captcha) is
+# escalated to the operator — relogin returns False → caller falls back to abort/naked.
+# An undetected challenge shape just waits out the timeout → False (still safe).
+_BW_CHALLENGE_JS = """() => ({
+    recaptcha: !!document.querySelector(
+        "iframe[src*='recaptcha'],.g-recaptcha,[data-sitekey]"
+    ),
+    otp: !!document.querySelector(
+        "input[autocomplete*='one-time-code' i],input[name*='code' i]"
+    )
+})"""
+
 # Returns the visible-overlay text and the full body text (both lowercased) so the
 # Python side can match RG phrases and classify overlay-vs-banner. Matching is kept in
 # Python (testable); the JS only extracts text.
@@ -158,6 +258,162 @@ _BLOCK_SCAN_JS = """({sel}) => {
         overlayText: overlayText.toLowerCase(),
         bodyText: (document.body && document.body.innerText || '').toLowerCase(),
     };
+}"""
+
+# Betsson renders the sportsbook in open shadow DOM. The generic light-DOM block scan
+# cannot see its reality-check popup. This bounded shadow walk detects the popup
+# EXCLUSIVELY: it requires BOTH a grounded reality-check phrase AND the popup's own close
+# button (fds-button[data-test-id^="reality-check"]), so responsible-gambling footer
+# text on promo/bonus/API pages (ofertas.pba.betsson.bet.ar, 502 error pages, etc.) does
+# NOT false-positive as a popup. Read-only.
+_BETSSON_REALITY_CHECK_SCAN_JS = """() => {
+    const PHRASES = [
+        '¿sabés qué hora es?',
+        'el juego compulsivo es perjudicial para vos y tu familia',
+    ];
+    const vis = (el) => {
+        try {
+            const r = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+        } catch (_) {
+            return false;
+        }
+    };
+    let visited = 0;
+    let foundPhrase = '';
+    let foundButton = false;
+    const walk = (root, depth) => {
+        if ((foundPhrase && foundButton) || !root || !root.querySelectorAll || depth > 12 || visited > 4000) return;
+        let els;
+        try { els = Array.from(root.querySelectorAll('*')); } catch (_) { return; }
+        for (const el of els) {
+            if ((foundPhrase && foundButton) || ++visited > 4000) return;
+            if (vis(el)) {
+                if (!foundPhrase) {
+                    const text = String(el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const phrase = PHRASES.find((p) => text.includes(p));
+                    if (phrase) foundPhrase = phrase;
+                }
+                if (!foundButton) {
+                    const tag = el.tagName.toLowerCase();
+                    const testId = el.getAttribute('data-test-id') || el.getAttribute('data-testid') || '';
+                    if (tag === 'fds-button' && testId.startsWith('reality-check')) foundButton = true;
+                }
+            }
+            if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+        }
+    };
+    walk(document, 0);
+    return (foundPhrase && foundButton)
+        ? {found: true, phrase: foundPhrase}
+        : {found: false, phrase: ''};
+}"""
+
+# Same bounded shadow walk, but target-finding: within the SAME document/shadow root
+# where one grounded Betsson reality-check phrase is visible, return the viewport center
+# of the visible orange "Cerrar" control. Current live DOM (2026-06-27) is
+# <fds-button data-test-id="reality-check-btn-1">Cerrar</fds-button>. The caller performs
+# a real pointer click at the returned coordinates (custom elements may ignore
+# synthetic DOM .click()). This is the operator-approved manual recovery and never
+# submits a bet.
+_BETSSON_REALITY_CHECK_CLOSE_JS = """() => {
+    const PHRASES = [
+        '¿sabés qué hora es?',
+        'el juego compulsivo es perjudicial para vos y tu familia',
+    ];
+    const vis = (el) => {
+        try {
+            const r = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+        } catch (_) {
+            return false;
+        }
+    };
+    let visited = 0;
+    const scanRoot = (root, depth) => {
+        if (!root || !root.querySelectorAll || depth > 12 || visited > 4000) return null;
+        let els;
+        try { els = Array.from(root.querySelectorAll('*')); } catch (_) { return null; }
+        let sawPhrase = false;
+        const candidates = [];
+        for (const el of els) {
+            if (++visited > 4000) return null;
+            const text = String(el.innerText || '').replace(/\\s+/g, ' ').trim();
+            const lower = text.toLowerCase();
+            if (vis(el) && PHRASES.some((p) => lower.includes(p))) {
+                sawPhrase = true;
+            }
+            const tag = el.tagName.toLowerCase();
+            const testId = el.getAttribute('data-test-id') || el.getAttribute('data-testid') || '';
+            const grounded = tag === 'fds-button' && testId === 'reality-check-btn-1' && lower === 'cerrar';
+            if (vis(el) && grounded) {
+                const r = el.getBoundingClientRect();
+                candidates.push({x: r.x + r.width / 2, y: r.y + r.height / 2, grounded});
+            }
+            if (el.shadowRoot) {
+                const nested = scanRoot(el.shadowRoot, depth + 1);
+                if (nested) return nested;
+            }
+        }
+        if (!sawPhrase || !candidates.length) return null;
+        const target = candidates.find((c) => c.grounded) || candidates[0];
+        return [target.x, target.y];
+    };
+    return scanRoot(document, 0);
+}"""
+
+# Betsson betslip cleanup. A failed/moved direct-coupon placement leaves server-side slip
+# residue in the sidebar betslip (site-drawer#drawer's shadow DOM): an
+# `obg-m-betslip-selection-REFERENCE` (the sidebar variant; the bare `obg-m-betslip-selection`
+# is a different view). We remove only the ones that are genuinely unusable (the selection is
+# no longer available / suspended / market closed / event finished) and KEEP odds-changed ones
+# ("Las cuotas han cambiado" — still bettable, operator may want to see them). The -REFERENCE
+# element's class carries NO -error marker — the unavailability is in its text — so we classify
+# by TEXT, conservatively (fail-safe: if it's neither clearly unavailable nor clearly
+# odds-changed, leave it). Side-effecting shadow walk like the reality-check close; never
+# submits a bet. Removes ONE per call so the caller can re-scan a fresh DOM between clicks.
+_BETSSON_CLEAR_STALE_BETSLIP_JS = """() => {
+    const UNAVAILABLE = /no disponible|no est[aá] disponible|suspend|finalizado|mercado cerrado|cerrad[oa]|no se puede apostar|resultado ya conocido|settled/i;
+    const ODDS_CHANGED = /cuotas han cambiado|odds(?: have)? changed/i;
+    const vis = (el) => {
+        try { const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+        } catch (_) { return false; }
+    };
+    const findRemoveBtn = (sel) => {
+        let btn = null;
+        const w = (root, d) => {
+            if (btn || d > 8) return;
+            let els; try { els = Array.from(root.querySelectorAll('*')); } catch (_) { return; }
+            for (const el of els) {
+                if (el.tagName === 'OBG-M-BETSLIP-REMOVE-SELECTION-BUTTON') { btn = el; return; }
+                if (el.shadowRoot) w(el.shadowRoot, d + 1);
+            }
+        };
+        w(sel, 0);
+        return btn;
+    };
+    let target = null;
+    const walk = (root, depth) => {
+        if (target || !root || !root.querySelectorAll || depth > 12) return;
+        let els; try { els = Array.from(root.querySelectorAll('*')); } catch (_) { return; }
+        for (const el of els) {
+            if (target) return;
+            if (vis(el) && /^OBG-M-BETSLIP-SELECTION(-REFERENCE)?$/.test(el.tagName)) {
+                const text = String(el.innerText || '').toLowerCase();
+                if (ODDS_CHANGED.test(text)) continue;     // keep odds-changed (still bettable)
+                if (!UNAVAILABLE.test(text)) continue;      // keep ambiguous — fail-safe
+                const btn = findRemoveBtn(el);
+                if (btn && vis(btn)) { target = btn; return; }
+            }
+            if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+        }
+    };
+    walk(document, 0);
+    if (target) { try { target.click(); return { removed: 1 }; } catch (_) {} }
+    return { removed: 0 };
 }"""
 
 
@@ -230,6 +486,8 @@ def _jwt_exp(token: str) -> float | None:
         return None
     exp = claims.get("exp") if isinstance(claims, dict) else None
     return float(exp) if isinstance(exp, (int, float)) else None
+
+
 # Betano's cookie-auth balance endpoint — same-origin, so the readiness probe's
 # in-page GET works (unlike BetWarrior's cross-origin PAM host).
 _BETANO_BALANCE_URL = "https://www.betano.bet.ar/api/balance"
@@ -519,9 +777,7 @@ class InSessionTransport:
             return None
         try:
             async with self._page_lock:
-                res = await self._page.evaluate(
-                    _BLOCK_SCAN_JS, {"sel": _RG_BLOCK_DIALOG_SELECTOR}
-                )
+                res = await self._page.evaluate(_BLOCK_SCAN_JS, {"sel": _RG_BLOCK_DIALOG_SELECTOR})
         except Exception as exc:  # noqa: BLE001 — a read must never crash the heartbeat
             self._log.warning("transport.block_probe_error", error=str(exc))
             return None
@@ -560,6 +816,45 @@ class InSessionTransport:
         for phrase in _SESSION_TIMER_PHRASES:
             if phrase in body_text:
                 return SessionBlock(phrase=phrase, is_overlay=False, kind="session_timer_warning")
+        # Betsson's reality-check popup lives in open shadow DOM, so the light-DOM scan
+        # above cannot see it. It is a closeable reminder, not a hard RG lockout, but it
+        # occludes placement until dismissed.
+        if self._platform == "betsson":
+            try:
+                async with self._page_lock:
+                    reality = await self._page.evaluate(_BETSSON_REALITY_CHECK_SCAN_JS)
+            except Exception as exc:  # noqa: BLE001 — a read must never crash the heartbeat
+                self._log.warning("transport.reality_check_probe_error", error=str(exc))
+                return None
+            if isinstance(reality, dict) and reality.get("found") is True:
+                raw_phrase = reality.get("phrase")
+                phrase = (
+                    raw_phrase if isinstance(raw_phrase, str) and raw_phrase else "reality-check"
+                )
+                return SessionBlock(phrase=phrase, is_overlay=True, kind="reality_check")
+        # BetWarrior promotions route is a non-placeable SPA page. Bearer readiness can
+        # still pass, so treat it as a blocking session state and let HotSessionManager
+        # recover by clicking the top-nav INICIO.
+        if self._platform == "betwarrior":
+            try:
+                async with self._page_lock:
+                    promo = await self._page.evaluate(_BETWARRIOR_PROMOTIONS_SCAN_JS)
+            except Exception as exc:  # noqa: BLE001 — a read must never crash the heartbeat
+                self._log.warning("transport.promotions_probe_error", error=str(exc))
+                return None
+            if isinstance(promo, dict):
+                url = promo.get("url")
+                title = promo.get("title")
+                text = promo.get("bodyText")
+                haystack = " ".join(
+                    part for part in (url, title, text) if isinstance(part, str)
+                ).lower()
+                if "/promotions" in haystack and "promociones" in haystack:
+                    return SessionBlock(
+                        phrase="promociones",
+                        is_overlay=True,
+                        kind="promotions_page",
+                    )
         return None
 
     async def attempt_session_extend(self) -> bool:
@@ -594,12 +889,349 @@ class InSessionTransport:
                         return True
                 self._log.warning(
                     "transport.session_extend_failed_popup_did_not_dismiss",
-                    platform=self._platform, selector=button_sel,
+                    platform=self._platform,
+                    selector=button_sel,
                 )
                 return False
         except Exception as exc:  # noqa: BLE001 — extend must never crash the heartbeat
             self._log.warning("transport.session_extend_error", error=str(exc))
             return False
+
+    async def attempt_reality_check_close(self) -> bool:
+        """Dismiss Betsson's reality-check reminder by clicking its orange ``Cerrar``.
+
+        REAL BOOKMAKER INTERACTION — clicks a close button in a logged-in betting
+        window. Operator-authorized 2026-06-23 after the live viewer showed the popup
+        blocking Betsson. The action only closes a responsible-gaming reminder; it never
+        places, changes, or confirms a bet. Betsson keeps ``Cerrar`` in a ~5s cooldown
+        after the popup appears, so wait through that window before each bounded manager
+        retry. Returns True iff the click landed and the shadow-DOM reality marker disappeared.
+        """
+        if self._dry_run or self._page is None or self._platform != "betsson":
+            return False
+        try:
+            async with self._page_lock:
+                reality = await self._page.evaluate(_BETSSON_REALITY_CHECK_SCAN_JS)
+                if not isinstance(reality, dict) or reality.get("found") is not True:
+                    return False
+                self._log.info(
+                    "transport.reality_check_cooldown_wait",
+                    platform=self._platform,
+                    seconds=_BETSSON_REALITY_CHECK_CLOSE_COOLDOWN_S,
+                )
+                await asyncio.sleep(_BETSSON_REALITY_CHECK_CLOSE_COOLDOWN_S)
+                target_xy = await self._page.evaluate(_BETSSON_REALITY_CHECK_CLOSE_JS)
+                if not isinstance(target_xy, list) or len(target_xy) != 2:
+                    self._log.warning(
+                        "transport.reality_check_target_missing",
+                        platform=self._platform,
+                    )
+                    return False
+                await self._page.mouse.move(target_xy[0], target_xy[1], steps=4)
+                await self._page.mouse.click(target_xy[0], target_xy[1])
+                for _ in range(10):
+                    await asyncio.sleep(0.1)
+                    reality = await self._page.evaluate(_BETSSON_REALITY_CHECK_SCAN_JS)
+                    if not isinstance(reality, dict) or reality.get("found") is not True:
+                        self._log.info("transport.reality_check_dismissed", platform=self._platform)
+                        return True
+                self._log.warning(
+                    "transport.reality_check_dismiss_error",
+                    platform=self._platform,
+                    error="popup did not dismiss",
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001 — close must never crash the heartbeat
+            self._log.warning(
+                "transport.reality_check_dismiss_error",
+                platform=self._platform,
+                error=str(exc),
+            )
+            return False
+
+    async def clear_stale_betslip(self) -> int:
+        """Remove UNAVAILABLE Betsson betslip selections (suspended / market closed /
+        event finished / "no disponible") left behind by failed or moved direct-coupon
+        placements. Odds-changed selections ("Las cuotas han cambiado") are KEPT.
+
+        REAL BOOKMAKER INTERACTION — clicks each stale selection's trashcan in a logged-in
+        window. Operator-authorized 2026-06-24: stale residue keeps the SPA re-validating,
+        which starves ``establish_betsson_context``'s ``networkidle`` goto (and wedged the
+        heartbeat before the probe-bound fix). Never submits/changes a bet — only removes
+        slip entries the user can't use anyway. Returns the count removed. Fail-soft: never
+        raises (called from the heartbeat)."""
+        if self._dry_run or self._page is None or self._platform != "betsson":
+            return 0
+        total = 0
+        try:
+            async with self._page_lock:
+                for _ in range(_BETSSON_STALE_SLIP_MAX):
+                    res = await self._page.evaluate(_BETSSON_CLEAR_STALE_BETSLIP_JS)
+                    n = res.get("removed", 0) if isinstance(res, dict) else 0
+                    if not n:
+                        break
+                    total += n
+                    await asyncio.sleep(0.15)  # let the SPA process the removal before re-scan
+            if total:
+                self._log.info(
+                    "transport.betsson_stale_betslip_cleared",
+                    platform=self._platform,
+                    removed=total,
+                )
+            return total
+        except Exception as exc:  # noqa: BLE001 — cleanup must never crash the heartbeat
+            self._log.warning(
+                "transport.betsson_stale_betslip_clear_error",
+                platform=self._platform,
+                error=str(exc),
+            )
+            return total
+
+    async def attempt_betwarrior_promotions_home(self) -> bool:
+        """Leave BetWarrior's promotions page by clicking the top-nav ``INICIO``.
+
+        REAL BOOKMAKER INTERACTION — clicks navigation in a logged-in betting window.
+        Operator-authorized 2026-06-23 after live capture showed BetWarrior stuck on
+        `/es-ar/promotions`. The action only navigates back to the sportsbook home; it
+        never places, changes, or confirms a bet. Returns True iff the promotions marker
+        disappears after the click.
+        """
+        if self._dry_run or self._page is None or self._platform != "betwarrior":
+            return False
+        try:
+            async with self._page_lock:
+                promo = await self._page.evaluate(_BETWARRIOR_PROMOTIONS_SCAN_JS)
+                if not isinstance(promo, dict):
+                    return False
+                url = promo.get("url")
+                text = promo.get("bodyText")
+                haystack = " ".join(part for part in (url, text) if isinstance(part, str)).lower()
+                if "/promotions" not in haystack or "promociones" not in haystack:
+                    return False
+                clicked = await self._page.evaluate(_BETWARRIOR_CLICK_INICIO_JS)
+                if clicked is not True:
+                    return False
+                for _ in range(20):
+                    await asyncio.sleep(0.25)
+                    promo = await self._page.evaluate(_BETWARRIOR_PROMOTIONS_SCAN_JS)
+                    if not isinstance(promo, dict):
+                        self._log.info(
+                            "transport.promotions_home_recovered", platform=self._platform
+                        )
+                        return True
+                    url = promo.get("url")
+                    text = promo.get("bodyText")
+                    haystack = " ".join(
+                        part for part in (url, text) if isinstance(part, str)
+                    ).lower()
+                    if "/promotions" not in haystack or "promociones" not in haystack:
+                        self._log.info(
+                            "transport.promotions_home_recovered", platform=self._platform
+                        )
+                        return True
+                self._log.warning(
+                    "transport.promotions_home_error",
+                    platform=self._platform,
+                    error="promotions page did not clear",
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001 — navigation recovery must not crash
+            self._log.warning(
+                "transport.promotions_home_error",
+                platform=self._platform,
+                error=str(exc),
+            )
+            return False
+
+    async def attempt_betwarrior_relogin(self) -> bool:
+        """Full logout→login on the BetWarrior window using keyring creds, so a
+        server-killed Kambi session is replaced and its bearer re-captured.
+
+        REAL BOOKMAKER INTERACTION — operator-authorized 2026-06-26 (the bot logs back
+        into its own window on a placement 401 / session_expired). True iff a FRESH
+        bearer (≠ the pre-login token) is captured within the timeout — the retry
+        placement's proof the new session works. False on missing creds, an OTP/captcha
+        challenge, or any error — the caller then falls back to abort/naked + alert, so a
+        failed/challenged re-auth NEVER adds exposure. Fail-soft: never raises.
+
+        The SPA keeps a stale (server-dead) session mounted that BLOCKS a fresh login
+        until an explicit logout (operator-confirmed 2026-06-26), so this logs out first
+        (account menu → 'Cerrar sesión', keyed on the account trigger disappearing), then
+        opens the login form and submits keyring creds. The challenge detector is
+        conservative (reCAPTCHA iframe / OTP input) and fail-safe."""
+        if self._dry_run or self._page is None or self._platform != "betwarrior":
+            return False
+        try:
+            async with self._page_lock:
+                # Credential lookup is INSIDE the fail-soft try: a keyring fault must return
+                # False (→ abort/naked), not escape and freeze the executor.
+                cred = get_credential("betwarrior")
+                if cred is None:
+                    self._log.warning("transport.betwarrior_relogin_no_creds")
+                    return False
+                stale = self._captured_bearer
+                # Invalidate the held bearer so the success gate can't be satisfied by a
+                # re-delivered stale (server-dead) token; a fresh one must arrive from the
+                # post-login SPA traffic (the _on_request listener).
+                self._captured_bearer = None
+                self._bearer_exp = None
+                # Clear a persisted (server-dead) session FIRST: BetWarrior's SPA keeps a
+                # stale session mounted after a server kill, which BLOCKS a fresh login
+                # until an explicit logout (operator-confirmed 2026-06-26). Best-effort —
+                # if it can't clear, the login step below is the real gate (a still-
+                # persisted session → no fresh bearer → abort/naked, never adds exposure).
+                if not await self._betwarrior_logout():
+                    self._log.warning("transport.betwarrior_relogin_logout_failed")
+                # Open the login form (dismiss the promo overlay first; after the logout
+                # above the header login trigger is exposed). If the form still won't open,
+                # reload once and retry (clears a wedged SPA state).
+                if not await self._open_betwarrior_login_form():
+                    await self._page.reload(wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(2.0)
+                    if not await self._open_betwarrior_login_form():
+                        self._log.warning("transport.betwarrior_relogin_no_form")
+                        return False
+                user = await self._page.query_selector(_BW_USER_SEL)
+                pwd = await self._page.query_selector(_BW_PASS_SEL)
+                submit = await self._page.query_selector(_BW_SUBMIT_SEL)
+                if user is None or pwd is None or submit is None:
+                    self._log.warning("transport.betwarrior_relogin_form_incomplete")
+                    return False
+                # Human-like pacing (anti-bot): type creds per-key with jittered timing
+                # and a short think-pause before submit, instead of instant fills + a
+                # dead-center click (the top behavioral tells — see recon/human.py).
+                await user.fill("")  # clear autofill/prefill so type() sets, not appends
+                await user.click()
+                await user.type(cred.username, delay=random.randint(70, 190))
+                await asyncio.sleep(random.uniform(0.4, 1.2))
+                await pwd.fill("")
+                await pwd.click()
+                await pwd.type(cred.password, delay=random.randint(70, 190))
+                await asyncio.sleep(random.uniform(0.4, 1.2))
+                await submit.click()
+                # Wait for the auth outcome: a challenge (OTP/captcha → False) OR the
+                # authenticated UI (user-trigger visible) — NOT the bearer, which the SPA
+                # does not emit on auth alone (validated 2026-06-26: a sportsbook nav is
+                # what surfaces it). Then navigate to the sportsbook to emit a fresh bearer
+                # for the retry placement.
+                deadline = time.monotonic() + _BETWARRIOR_RELOGIN_TIMEOUT_S
+                authed = False
+                while time.monotonic() < deadline:
+                    ch = await self._page.evaluate(_BW_CHALLENGE_JS)
+                    if isinstance(ch, dict) and (ch.get("recaptcha") or ch.get("otp")):
+                        self._log.warning("transport.betwarrior_relogin_challenged")
+                        return False
+                    if await self._page.evaluate(_BW_USER_TRIGGER_VISIBLE_JS):
+                        authed = True
+                        break
+                    await asyncio.sleep(0.5)
+                if not authed:
+                    self._log.warning("transport.betwarrior_relogin_timeout")
+                    return False
+                # Authenticated UI reached — navigate to the sportsbook so the Kambi widget
+                # loads + emits its session bearer (the retry placement needs it). The stale
+                # bearer was cleared, so any captured now is fresh.
+                with contextlib.suppress(Exception):
+                    await asyncio.sleep(1.0)
+                    await self._page.goto(
+                        _BW_SPORTSBOOK_HOME, wait_until="domcontentloaded", timeout=45000
+                    )
+                bearer_deadline = time.monotonic() + _BW_FRESH_BEARER_WAIT_S
+                while time.monotonic() < bearer_deadline:
+                    if self._captured_bearer is not None and self._captured_bearer != stale:
+                        self._log.info("transport.betwarrior_relogin_ok")
+                        return True
+                    await asyncio.sleep(0.5)
+                # UI authed + sportsbook reloaded but no bearer captured — do NOT claim
+                # success: the executor's retry would hit prepare_betwarrior_auth → None and
+                # fail the same way. Return False (→ abort/naked); the restored session is
+                # picked up by the next heartbeat (validated: a sportsbook nav surfaces the
+                # bearer, so the next readiness probe flips ready again).
+                self._log.warning("transport.betwarrior_relogin_no_bearer_after_nav")
+                return False
+        except Exception as exc:  # noqa: BLE001 — relogin must never crash the caller
+            self._log.warning("transport.betwarrior_relogin_error", error=str(exc))
+            return False
+
+    async def _betwarrior_logout(self) -> bool:
+        """Clear a persisted (server-dead) BetWarrior session so a fresh login is possible.
+
+        The SPA keeps a stale session mounted after a server-side kill, which BLOCKS a
+        fresh login until an explicit logout (operator-confirmed 2026-06-26). Opens the
+        account menu ([data-testid='user-trigger']) and clicks the visible 'Cerrar sesión'.
+        Returns True iff already logged out, or the logout landed AND the account trigger
+        is no longer visible — the reliable logged-out signal (NOT login-button, which is a
+        wrapper ancestor and proved misleading). Best-effort; must run under self._page_lock."""
+        if not await self._page.evaluate(_BW_USER_TRIGGER_VISIBLE_JS):
+            return True  # already logged out (e.g. session_expired popup already up)
+        # Open the account menu + click "Cerrar sesión" with REAL pointer clicks (a
+        # synthetic JS .click() does NOT open BetWarrior's React dropdown — operator-
+        # observed 2026-06-26: the menu never opened, the session persisted, and the
+        # relogin could not get a fresh login). Target each VISIBLE element's viewport
+        # center (query_selector can return a hidden clone; BetWarrior duplicates these).
+        trig_xy = await self._page.evaluate(
+            "() => { const el=[...document.querySelectorAll(\"[data-testid='user-trigger']\")]"
+            ".find(e=>{const r=e.getBoundingClientRect();return !!e.offsetParent"
+            "&&getComputedStyle(e).visibility!=='hidden'&&r.width>0&&r.height>0;});"
+            " if(!el) return null; el.scrollIntoView({block:'center'});"
+            " const r=el.getBoundingClientRect(); return [r.x+r.width/2, r.y+r.height/2]; }"
+        )
+        if not isinstance(trig_xy, list) or len(trig_xy) != 2:
+            self._log.warning("transport.betwarrior_relogin_logout_no_trigger")
+            return False
+        with contextlib.suppress(Exception):
+            await self._page.mouse.move(trig_xy[0], trig_xy[1], steps=4)
+            await self._page.mouse.click(trig_xy[0], trig_xy[1])
+            await asyncio.sleep(0.9)
+        # Click the visible logout ICON (now in the open menu) with a real pointer. The
+        # logout control is an icon (class ...icon-logout) — NO text, NO testid
+        # (operator-inspected 2026-06-26) — so target its stable icon class, not "cerrar
+        # sesión" text (which never matched, so the logout never fired → session persisted).
+        cerrar_xy = await self._page.evaluate(
+            "() => { const el=[...document.querySelectorAll(\"[class*='icon-logout']\")]"
+            ".find(e=>{const r=e.getBoundingClientRect();return !!e.offsetParent"
+            "&&getComputedStyle(e).visibility!=='hidden'&&r.width>0&&r.height>0;});"
+            " if(!el) return null; const r=el.getBoundingClientRect();"
+            " return [r.x+r.width/2, r.y+r.height/2]; }"
+        )
+        if not isinstance(cerrar_xy, list) or len(cerrar_xy) != 2:
+            self._log.warning("transport.betwarrior_relogin_logout_no_cerrar")
+            return False  # menu didn't open / no visible logout icon
+        with contextlib.suppress(Exception):
+            await self._page.mouse.move(cerrar_xy[0], cerrar_xy[1], steps=4)
+            await self._page.mouse.click(cerrar_xy[0], cerrar_xy[1])
+        for _ in range(10):  # up to ~5s for the account trigger to disappear
+            await asyncio.sleep(0.5)
+            if not await self._page.evaluate(_BW_USER_TRIGGER_VISIBLE_JS):
+                return True
+        self._log.warning("transport.betwarrior_relogin_logout_persisted")
+        return False  # account trigger still visible → not confidently logged out
+
+    async def _open_betwarrior_login_form(self) -> bool:
+        """Dismiss BetWarrior's promo overlay, then click whichever control opens the
+        login form — the session-expired 'INICIA SESIÓN AHORA' CTA if the dead-session
+        popup is up, else the header login trigger. True iff the email input appears
+        within ~8s. Must run under ``self._page_lock``."""
+        # The promo overlay intercepts the login trigger (captured 2026-06-26); dismiss
+        # its close icon fail-soft (absent on some routes).
+        promo = await self._page.query_selector(_BW_PROMO_DISMISS_SEL)
+        if promo is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.sleep(random.uniform(0.3, 0.9))
+                await promo.click()
+                await asyncio.sleep(0.4)
+        cta = await self._page.query_selector(_BW_LOGIN_CTA_SEL)
+        target = cta if cta is not None else await self._page.query_selector(_BW_LOGIN_TRIGGER_SEL)
+        if target is None:
+            return False
+        with contextlib.suppress(Exception):
+            await asyncio.sleep(random.uniform(0.3, 0.9))
+            await target.click()
+        for _ in range(16):  # up to ~8s for the login modal to render
+            await asyncio.sleep(0.5)
+            if await self._page.query_selector(_BW_USER_SEL) is not None:
+                return True
+        return False
 
     async def keepalive(self) -> None:
         """Minimal inactivity avoidance — mouse move + scroll nudge + an occasional
@@ -630,20 +1262,29 @@ class InSessionTransport:
                 await self._page.mouse.wheel(0, 120)
                 await asyncio.sleep(0.3)
                 await self._page.mouse.wheel(0, -120)
-                # Occasional click on a non-interactive area. The element-from-point
-                # check skips clicks that would land on a button/link/input/select —
-                # we only want the activity signal, never to trigger a real action.
+                # Occasional click on a truly inert area. BetWarrior promo banners/cards
+                # can be clickable DIVs, so tag-name-only checks are insufficient and can
+                # drift the SPA into /promotions. Treat pointer cursors, onclick handlers,
+                # and interactive ancestors as unsafe.
                 if random.random() < 0.34:
                     cx = random.randint(200, 800)
                     cy = random.randint(200, 500)
-                    tag = await self._page.evaluate(
-                        "({x, y}) => {"
-                        "  const e = document.elementFromPoint(x, y);"
-                        "  return e ? e.tagName.toLowerCase() : '';"
-                        "}",
+                    unsafe = await self._page.evaluate(
+                        """({x, y}) => {
+                            let e = document.elementFromPoint(x, y);
+                            for (let i = 0; e && i < 8; i++, e = e.parentElement) {
+                                const tag = e.tagName.toLowerCase();
+                                const role = (e.getAttribute('role') || '').toLowerCase();
+                                const cs = getComputedStyle(e);
+                                if (['button', 'a', 'input', 'select', 'textarea'].includes(tag)) return true;
+                                if (role === 'button' || role === 'link') return true;
+                                if (e.onclick || cs.cursor === 'pointer') return true;
+                            }
+                            return false;
+                        }""",
                         {"x": cx, "y": cy},
                     )
-                    if tag not in {"button", "a", "input", "select", "textarea"}:
+                    if unsafe is not True:
                         await self._page.mouse.click(cx, cy, delay=50)
         except Exception as exc:  # noqa: BLE001 — keepalive must never crash the bot
             self._log.warning("transport.keepalive_error", platform=self._platform, error=str(exc))
@@ -719,7 +1360,22 @@ class InSessionTransport:
         if self._dry_run:
             self._log.info("transport.dry_run_establish")
             return False
+        # If Betsson's reality-check popup is up, do NOT reload the page. A goto cannot
+        # dismiss it (only the orange "Cerrar" / fds-button[data-test-id=reality-check-
+        # btn-1] does), and reloading every heartbeat fights the close recovery and can
+        # re-trigger the SPA after a successful close. Return not-ready; the manager
+        # detects the block separately via check_session_blocked() and runs
+        # attempt_reality_check_close() to click Cerrar. (Non-reality-check blocks — RG
+        # lockout, session_expired, etc. — fall through to the goto as before.)
+        block = await self.check_session_blocked()
+        if block is not None and block.is_overlay and block.kind == "reality_check":
+            self._log.info("transport.betsson_context_skipped_reality_check")
+            return False
         self._captured_ctx = None
+        # Clear stale (unavailable) betslip residue BEFORE the goto: enough error-state
+        # selections re-validating starves the networkidle wait below (root cause of the
+        # 2026-06-24 heartbeat wedge). clear_stale_betslip takes its own page lock.
+        await self.clear_stale_betslip()
         # Hold the page lock only for the navigation (a placement fetch must not run
         # mid-nav); the passive ctx-poll below doesn't touch the page, so leave it
         # unlocked to keep the hold short.

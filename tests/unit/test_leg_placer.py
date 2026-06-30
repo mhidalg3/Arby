@@ -58,6 +58,11 @@ class SeqTransport:
     def __init__(self, responses: list[tuple[int, dict[str, Any]]]) -> None:
         self._responses = responses
         self.calls: list[dict[str, Any]] = []
+        self.prepared = 0
+
+    async def prepare_betsson_context(self) -> dict[str, str] | None:
+        self.prepared += 1
+        return _FAKE_CTX
 
     async def fetch(self, method, url, *, json_body=None, headers=None):  # type: ignore[no-untyped-def]
         self.calls.append({"method": method, "url": url, "json": json_body, "headers": headers})
@@ -123,6 +128,40 @@ def _leg_betano(outcome_id: str, event_id: str, stake: float, odds: float) -> Le
     )
 
 
+def _betsson_odds_invalid(
+    valid_odds: str,
+    tag: str = "s-m-f-EVT-MW3W-away",
+    coupon_id: str = "",
+) -> dict[str, Any]:
+    """The verbatim live E_BETTING_ODDS_INVALID reject shape (events.jsonl:17)."""
+    return {
+        "couponStatus": {
+            "couponStatusPollingResult": "Failure",
+            "couponId": coupon_id,
+            "couponPlacementErrors": [
+                {
+                    "code": "E_BETTING_ODDS_INVALID",
+                    "details": {
+                        "marketSelectionTag": tag,
+                        "validOdds": valid_odds,
+                        "combinedMarketSelections": "",
+                    },
+                }
+            ],
+        }
+    }
+
+
+def _betsson_success(coupon_id: str = "C1") -> dict[str, Any]:
+    return {
+        "couponStatus": {
+            "couponStatusPollingResult": "Success",
+            "couponId": coupon_id,
+            "couponPlacementErrors": [],
+        }
+    }
+
+
 async def test_betsson_placer_builds_request_and_parses_success() -> None:
     t = FakeTransport(
         200,
@@ -176,6 +215,87 @@ async def test_betsson_fails_closed_when_context_not_resolved() -> None:
     assert not t.calls  # never POSTed
 
 
+async def test_betsson_favorable_odds_resubmit_accepts_at_valid_odds() -> None:
+    # Reproduces fx-d11b22fcc7f2: first POST rejected at submitted 4.35 with
+    # validOdds 4.45 (a favorable price-confirmation); the bounded re-submit at 4.45
+    # is accepted. The new-behavior proof.
+    t = SeqTransport([(200, _betsson_odds_invalid("4.45")), (200, _betsson_success())])
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-away", 500.0, 4.35))
+    assert res.accepted
+    assert res.odds_filled == 4.45  # the corrected price, not the stale 4.35
+    assert res.stake_filled == 500.0  # stake unchanged (exposure recorded correctly)
+    assert len(t.calls) == 2  # original + exactly one re-submit
+    # the re-submit body carries the exact returned validOdds string
+    assert t.calls[1]["json"]["bets"][0]["betSelections"][0]["odds"] == "4.45"
+    assert (
+        t.calls[1]["json"]["bets"][0]["betSelections"][0]["marketSelectionId"]
+        == "s-m-f-EVT-MW3W-away"
+    )
+
+
+async def test_betsson_unfavorable_odds_no_resubmit() -> None:
+    # validOdds BELOW the submitted price → worse for us → no re-submit (keep reject).
+    t = FakeTransport(200, _betsson_odds_invalid("4.25"))
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-away", 500.0, 4.35))
+    assert not res.accepted
+    assert len(t.calls) == 1
+    assert "E_BETTING_ODDS_INVALID" in res.detail
+
+
+async def test_betsson_favorable_beyond_cap_no_resubmit() -> None:
+    # validOdds 10.0 is ≈+130% over a 4.35 submit — past the 20% anomaly cap → fail
+    # closed (a multiple-of-price "valid" odds is a data/selection anomaly).
+    t = FakeTransport(200, _betsson_odds_invalid("10.0"))
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-away", 500.0, 4.35))
+    assert not res.accepted
+    assert len(t.calls) == 1
+
+
+async def test_betsson_resubmit_is_bounded_single_retry() -> None:
+    # A second odds move on the re-submit (4.45 → 4.55) is NOT retried again: the
+    # retry path never calls betsson_odds_correction, so a second reject returns the
+    # reject — no loop, no third POST.
+    t = SeqTransport([(200, _betsson_odds_invalid("4.45")), (200, _betsson_odds_invalid("4.55"))])
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-away", 500.0, 4.35))
+    assert not res.accepted
+    assert len(t.calls) == 2  # no third POST
+    assert "E_BETTING_ODDS_INVALID" in res.detail  # the second error
+
+
+async def test_betsson_non_odds_error_no_resubmit() -> None:
+    # A non-odds reject code is not a price-confirmation handshake → no re-submit.
+    t = FakeTransport(
+        200,
+        {
+            "couponStatus": {
+                "couponStatusPollingResult": "Failure",
+                "couponPlacementErrors": [{"code": "E_BETTING_COUPON_GENERAL"}],
+            }
+        },
+    )
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-away", 500.0, 4.35))
+    assert not res.accepted
+    assert len(t.calls) == 1
+
+
+async def test_betsson_coupon_id_present_no_resubmit() -> None:
+    # An odds-invalid error that ALSO carries a couponId → a coupon may have been
+    # created → never re-POST over it. The parser fails closed.
+    t = FakeTransport(200, _betsson_odds_invalid("4.45", coupon_id="C9"))
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-away", 500.0, 4.35))
+    assert not res.accepted
+    assert len(t.calls) == 1
+
+
+async def test_betsson_favorable_selection_tag_mismatch_no_resubmit() -> None:
+    # The correction's tag is for a DIFFERENT selection than our single-leg coupon →
+    # the market/line changed underneath us → identity gate fails closed.
+    t = FakeTransport(200, _betsson_odds_invalid("4.45", tag="s-m-f-OTHER-MW3W-home"))
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-away", 500.0, 4.35))
+    assert not res.accepted
+    assert len(t.calls) == 1
+
+
 async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
     t = FakeTransport(
         200,
@@ -202,7 +322,25 @@ async def test_betwarrior_fails_closed_when_bearer_not_captured() -> None:
     t = FakeTransport(bearer=None)  # not logged in → no session bearer
     res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
     assert not res.accepted and "bearer not captured" in res.detail
+    assert res.auth_failed is True  # no bearer ⇒ eligible for one auto re-auth + retry
     assert not t.calls  # never POSTed
+
+
+async def test_betwarrior_401_sets_auth_failed() -> None:
+    # A placement HTTP 401 (server-side session death) is flagged auth_failed so the
+    # executor's bounded re-auth + retry can rescue it; the body is surfaced for diagnosis.
+    t = FakeTransport(status=401, body={"reason": "Unauthorized"})
+    res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
+    assert not res.accepted and res.auth_failed is True
+    assert "HTTP 401" in res.detail
+
+
+async def test_betwarrior_non_401_error_is_not_auth_failed() -> None:
+    # A non-auth HTTP ≥400 (odds invalid, suspended outcome, validation) stays
+    # auth_failed=False — today's abort/naked, never a re-auth.
+    t = FakeTransport(status=400, body={"reason": "Invalid odds specified"})
+    res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
+    assert not res.accepted and res.auth_failed is False
 
 
 async def test_betwarrior_live_delay_poll_resolves_to_open() -> None:

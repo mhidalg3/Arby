@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 
 import httpx
 import structlog
 
-from src.execution.executor import DryRunPlacer, Executor
+from src.execution.executor import DryRunPlacer, Executor, Leg
 from src.execution.guardrails import Guardrails
 from src.execution.hot_session import HotSessionManager
 from src.execution.notify import build_notifier
@@ -31,7 +32,7 @@ from src.execution.orchestrator import ArbOrchestrator
 from src.execution.quote_source import OverlapQuoteSource
 from src.execution.recovery import HumanRecoveryHandler
 from src.execution.reverify import BetanoCapRefresher, LiveOddsReverifier
-from src.execution.session import InSessionTransport
+from src.execution.session import _BW_SPORTSBOOK_HOME, InSessionTransport
 from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
 from src.ingestion.scrapers.betwarrior import BetWarriorPbaDepthScraper, BetWarriorPbaScraper
@@ -54,6 +55,14 @@ _UA = (
 _BETANO_HOME = "https://www.betano.bet.ar/"
 _BETSSON_HOME = "https://pba.betsson.bet.ar/apuestas-deportivas"
 _BETWARRIOR_HOME = "https://pba.betwarrior.bet.ar/"
+
+
+def _truncate_viewer_log() -> None:
+    """Truncate the read-only session-viewer log (the operator's observation tool) so a
+    fresh redeploy/restart starts clean. Called from the bot's shutdown path (incl. Ctrl+C);
+    the END runbook block truncates too (pkill -9 can't run this handler)."""
+    with contextlib.suppress(Exception):
+        open("/tmp/arby_session_viewer.log", "w").close()
 
 
 async def main() -> int:
@@ -111,7 +120,8 @@ async def main() -> int:
                 input,
                 f"\n  ▶ Log into {windows} (Betano: complete any challenge; Betsson: log "
                 "in, stay on PBA — the manager will do the My-Account nav; BetWarrior: "
-                "log in). When all show your balance, press ENTER… ",
+                "log in — the bot opens its sportsbook after). When all show your "
+                "balance, press ENTER… ",
             )
         except EOFError:
             # Background launch: stdin is the gate feeder
@@ -124,6 +134,13 @@ async def main() -> int:
                     "login gate: stdin EOF but /tmp/arby_login_done absent — feeder died "
                     "before the operator signaled ready; aborting (sessions not logged in)"
                 ) from None
+        # BetWarrior emits its Kambi placement bearer ONLY when the sportsbook widget
+        # loads (validated live during the reauth work — auth alone on the root page
+        # does NOT surface it). After the operator logs in, navigate BW to the
+        # sportsbook home so the first readiness probe captures the bearer; otherwise
+        # BW reads cold and disables auto-placement until a manual force-reauth.
+        if betwarrior_t is not None:
+            await betwarrior_t.goto(_BW_SPORTSBOOK_HOME)
 
     async with httpx.AsyncClient(headers=headers, timeout=25.0) as client:
         # Real notifier if Telegram creds are in the keychain, else a NullNotifier.
@@ -174,6 +191,18 @@ async def main() -> int:
                     ),
                 }
             )
+
+            # Reactive re-auth: on a BetWarrior placement 401 (server-killed Kambi
+            # session), drive a logout→login on the bot's OWN BW window (keyring creds)
+            # so the executor's single retry completes the arb instead of aborting/going
+            # naked. Gated to live + betwarrior-pba + a wired BW transport; dry-run, an
+            # unwired transport, or a missing/challenged re-auth returns False → today's
+            # abort/naked (the rescue never adds exposure).
+            async def _reauth(leg: Leg) -> bool:
+                if leg.platform != "betwarrior-pba" or betwarrior_t is None or not live:
+                    return False
+                return await betwarrior_t.attempt_betwarrior_relogin()
+
             executor = Executor(
                 guardrails=guard,
                 notifier=notifier,
@@ -182,6 +211,7 @@ async def main() -> int:
                 reverify=reverify,
                 cap_refresh=BetanoCapRefresher(betano_t),
                 dry_run=not live,
+                reauth=_reauth,
             )
             orch = ArbOrchestrator(
                 quote_source=source,
@@ -194,7 +224,60 @@ async def main() -> int:
                 recorder=PostgresAuditRecorder() if live else None,
             )
             log.warning("hot_loop.start", live=live, budget=budget, poll=poll)
-            await orch.run_forever(poll_interval_sec=poll)  # until Ctrl-C (never self-halts)
+            # Controlled re-auth drill trigger (operator-authorized; removable after the
+            # live validation): touch /tmp/arby_force_bw_reauth to run
+            # attempt_betwarrior_relogin() once on the bot's LIVE BetWarrior transport.
+            # Log out BW via the window UI → touch the sentinel → read the log for
+            # bw_reauth_trigger_result. Live-only (betwarrior_t is None in dry-run).
+            reauth_trigger: asyncio.Task[None] | None = None
+            if betwarrior_t is not None:
+
+                async def _bw_reauth_trigger(bw: InSessionTransport) -> None:
+                    sentinel = "/tmp/arby_force_bw_reauth"
+                    while True:
+                        await asyncio.sleep(2.0)
+                        try:
+                            if not await asyncio.to_thread(os.path.exists, sentinel):
+                                continue
+                            await asyncio.to_thread(os.unlink, sentinel)
+                        except FileNotFoundError:
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("hot_loop.bw_reauth_trigger_error", error=str(exc))
+                            continue
+                        log.warning("hot_loop.bw_reauth_trigger_fired")
+                        await notifier.send(
+                            "🔧 BW re-auth drill: running attempt_betwarrior_relogin…"
+                        )
+                        try:
+                            ok = await bw.attempt_betwarrior_relogin()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("hot_loop.bw_reauth_trigger_error", error=str(exc))
+                            await notifier.send("🔧 BW re-auth drill: ERROR (see log)")
+                            continue
+                        log.warning("hot_loop.bw_reauth_trigger_result", ok=ok)
+                        await notifier.send(
+                            "🔧 BW re-auth drill: "
+                            + (
+                                "✅ OK — fresh bearer captured"
+                                if ok
+                                else "❌ FAILED/challenged — BW may now be logged out (sign in manually)"
+                            )
+                        )
+
+                reauth_trigger = asyncio.create_task(_bw_reauth_trigger(betwarrior_t))
+            try:
+                await orch.run_forever(poll_interval_sec=poll)  # until Ctrl-C (never self-halts)
+            finally:
+                if reauth_trigger is not None:
+                    reauth_trigger.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await reauth_trigger
+                # Clean the observer log on graceful shutdown (incl. Ctrl+C / SIGTERM) so the
+                # operator's tail clears when the bot stops. (pkill -9 in END can't run this.)
+                await asyncio.to_thread(_truncate_viewer_log)
     log.info("hot_loop.stopped")
     return 0
 

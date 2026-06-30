@@ -39,12 +39,19 @@ from src.risk.evaluator import RiskEvaluator
 log = structlog.get_logger(__name__)
 
 
-def format_arb_alert(opp_id: str, opp: ArbitrageOpportunity) -> str:
+def format_arb_alert(
+    opp_id: str, opp: ArbitrageOpportunity, home_team: str = "", away_team: str = ""
+) -> str:
     """Operator-facing arb alert: enough to place it manually if auto-placement
-    is suspended (each leg's platform, outcome, odds and stake)."""
+    is suspended (each leg's platform, outcome, odds and stake). Team names are
+    shown when the quote source exposes them (duck-typed ``market_names``); the
+    canonical ``opp_id`` is always included so the operator can cross-reference."""
+    fixture = f"{home_team} vs {away_team}" if home_team and away_team else opp_id
     lines = [
-        f"🎯 ARB {opp_id} | ROI {opp.realized_roi_pct:.2f}% | stake {sum(opp.stakes):.0f} ARS"
+        f"🎯 ARB {fixture} | ROI {opp.realized_roi_pct:.2f}% | stake {sum(opp.stakes):.0f} ARS"
     ]
+    if home_team and away_team:
+        lines.append(f"  market {opp_id}")
     for q, stake in zip(opp.legs, opp.stakes, strict=True):
         lines.append(f"  • {q.platform} {q.outcome} @ {q.decimal_odds} — {stake:.0f} ARS")
     return "\n".join(lines)
@@ -111,6 +118,9 @@ class ArbOrchestrator:
         Returns the execution results auto-placed this pass."""
         results: list[ExecutionResult] = []
         by_market = await self._quotes.fetch()
+        # Team names for human-readable alerts (duck-typed like `stale_platforms`;
+        # the source rebuilds this on every fetch, so it is never stale across cycles).
+        market_names: dict[str, tuple[str, str]] = getattr(self._quotes, "market_names", {})
         await self._track_ingestion(len(by_market))
         await self._track_platform_freshness()
         for market_id, quotes in by_market.items():
@@ -129,8 +139,11 @@ class ArbOrchestrator:
                 continue
             # Approved. Act once per market (dedup) — alert the operator either way.
             self._executed.add(market_id)
-            self._log.info("orchestrator.arb_found", market_id=market_id, roi_pct=opp.realized_roi_pct)
-            await self._notifier.send(format_arb_alert(market_id, opp))
+            self._log.info(
+                "orchestrator.arb_found", market_id=market_id, roi_pct=opp.realized_roi_pct
+            )
+            home, away = market_names.get(market_id, ("", ""))
+            await self._notifier.send(format_arb_alert(market_id, opp, home, away))
             opp_db_id = await self._recorder.record_opportunity(market_id, opp, decision)
             if self._guardrails.kill_switch_tripped:
                 # Auto-placement suspended (cold session / freeze / daily loss) →

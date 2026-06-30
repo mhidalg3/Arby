@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
+import pytest
+
+import src.execution.hot_session as hot_session_mod
 from src.execution.guardrails import Guardrails
 from src.execution.hot_session import HotSessionManager
 from src.execution.session import SessionBlock
@@ -23,12 +27,29 @@ class _FakeTransport:
         self.context_ok = context_ok  # Betsson readiness (establish context)
         self.ready = ready  # Betano / BetWarrior readiness probes
         self.blocked = blocked  # a SessionBlock (overlay/banner), or None when usable
+        self.session_block_checks = 0
+        self.session_block_check_delay_s = 0.0
         self.establish_calls = 0
         self.capture_calls: list[str] = []  # capture_block_evidence reasons
         # Auto-extend behavior: when True, the next attempt_session_extend() call clears
         # `blocked` (simulates the popup dismissing after the click) and returns True.
         self.extend_ok = False
         self.extend_calls = 0
+        # Betsson reality-check behavior: when True, the next
+        # attempt_reality_check_close() call clears `blocked` and returns True.
+        self.reality_close_ok = False
+        self.reality_close_calls = 0
+        self.reality_close_failures_before_success: int | None = None
+        self.reality_clear_after_failed_attempt = False
+        self.reality_close_delay_s = 0.0
+        # BetWarrior promotions behavior: when True, the next
+        # attempt_betwarrior_promotions_home() call clears `blocked` and returns True.
+        self.promotions_home_ok = False
+        self.promotions_home_calls = 0
+        # BetWarrior relogin behavior: when True, the next attempt_betwarrior_relogin()
+        # call clears `blocked` (session recovered) and returns True.
+        self.relogin_ok = False
+        self.relogin_calls = 0
         # Keepalive behavior: count calls so tests can assert the loop fired.
         self.keepalive_calls = 0
         # Session-persist behavior: count save_session calls (heartbeat + shutdown).
@@ -55,6 +76,9 @@ class _FakeTransport:
         return self.ready
 
     async def check_session_blocked(self) -> SessionBlock | None:
+        if self.session_block_check_delay_s:
+            await asyncio.sleep(self.session_block_check_delay_s)
+        self.session_block_checks += 1
         return self.blocked
 
     async def capture_block_evidence(self, reason: str) -> str | None:
@@ -65,6 +89,39 @@ class _FakeTransport:
         self.extend_calls += 1
         if self.extend_ok:
             self.blocked = None  # the click dismissed the popup; re-probe returns None
+            return True
+        return False
+
+    async def attempt_reality_check_close(self) -> bool:
+        self.reality_close_calls += 1
+        if self.reality_close_delay_s:
+            await asyncio.sleep(self.reality_close_delay_s)
+        if self.blocked is None:
+            return True
+        if (
+            self.reality_close_failures_before_success is not None
+            and self.reality_close_calls > self.reality_close_failures_before_success
+        ):
+            self.blocked = None
+            return True
+        if self.reality_close_ok:
+            self.blocked = None
+            return True
+        if self.reality_clear_after_failed_attempt:
+            self.blocked = None
+        return False
+
+    async def attempt_betwarrior_promotions_home(self) -> bool:
+        self.promotions_home_calls += 1
+        if self.promotions_home_ok:
+            self.blocked = None
+            return True
+        return False
+
+    async def attempt_betwarrior_relogin(self) -> bool:
+        self.relogin_calls += 1
+        if self.relogin_ok:
+            self.blocked = None  # session recovered → re-probe clears the block
             return True
         return False
 
@@ -137,6 +194,28 @@ async def test_heartbeat_loop_trips_kill_switch_when_session_dies() -> None:
         bsn.context_ok = False  # next heartbeat finds it cold
         await asyncio.sleep(0.05)  # let the loop fire
         assert g.kill_switch_tripped
+
+
+async def test_probe_hang_is_bounded_not_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A readiness probe that HANGS (observed 2026-06-24: Betsson's
+    page.goto(networkidle) wedged when a stale betslip kept the SPA re-validating,
+    and Playwright's own 60s goto timeout did not fire) must be hard-bounded so the
+    heartbeat survives and the session auto-recovers — never freeze the loop."""
+    monkeypatch.setattr(hot_session_mod, "_PROBE_TIMEOUT_S", 0.3)
+
+    class _HangingBetsson(_FakeTransport):
+        async def establish_betsson_context(self) -> bool:
+            await asyncio.sleep(3600)  # simulates the networkidle goto hang
+            return True
+
+    bano, bsn, g = _FakeTransport(), _HangingBetsson(), _guard()
+    started = time.monotonic()
+    async with _mgr(bano, bsn, g) as m:
+        # Must return (False: betsson hung → not ready) within a bounded time, not hang.
+        ready = await asyncio.wait_for(m.heartbeat(), timeout=5.0)
+    elapsed = time.monotonic() - started
+    assert ready is False
+    assert elapsed < 2.0  # bounded by the 0.3s probe timeout, not the 3600s hang
 
 
 async def test_heartbeat_saves_ready_sessions() -> None:
@@ -550,6 +629,289 @@ async def test_extend_not_retried_across_heartbeats_per_episode() -> None:
         assert bano.extend_calls == 2  # fresh attempt for the new episode
 
 
+async def test_betsson_reality_check_suspends_then_auto_closes() -> None:
+    """Betsson's reality-check reminder is closeable, but it is still a blocking popup.
+    The heartbeat must suspend first, then let the background cooldown close recover."""
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_ok = True
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        await asyncio.sleep(0.05)
+        assert bsn.reality_close_calls >= 1
+        assert not g.kill_switch_tripped
+        suspended_at = next(
+            i for i, s in enumerate(note.sent) if "NOT READY" in s and "REALITY CHECK" in s
+        )
+        ready_at = next(i for i, s in enumerate(note.sent) if "ready again" in s)
+        assert suspended_at < ready_at
+
+
+async def test_reality_check_close_failure_retries_then_falls_back_to_suspend_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If Cerrar misses or the popup persists, retry a small bounded number of times,
+    then keep the suspend+alert path for the operator."""
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_ok = False
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_CLOSE_RETRY_DELAY_S", 0.001)
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        await asyncio.sleep(0.05)
+        assert bsn.reality_close_calls == hot_session_mod._REALITY_CHECK_MAX_CLOSE_ATTEMPTS
+        assert g.kill_switch_tripped
+        alert = next(s for s in note.sent if "betsson" in s and "REALITY CHECK" in s)
+        assert "click Cerrar" in alert
+
+
+async def test_reality_check_close_retries_transient_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single missed/ignored Cerrar click must not wedge Betsson for the popup episode."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_CLOSE_RETRY_DELAY_S", 0.001)
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_failures_before_success = 1
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        await asyncio.sleep(0.08)
+        assert bsn.reality_close_calls == 2
+        assert not g.kill_switch_tripped
+        suspended_at = next(
+            i for i, s in enumerate(note.sent) if "NOT READY" in s and "REALITY CHECK" in s
+        )
+        ready_at = next(i for i, s in enumerate(note.sent) if "ready again" in s)
+        assert suspended_at < ready_at
+
+
+async def test_reality_check_new_episode_gets_fresh_close_budget() -> None:
+    """After one reality-check popup clears, a later popup must get a fresh close task."""
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_ok = True
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        await asyncio.sleep(0.05)
+        assert bsn.reality_close_calls == 1
+        assert bsn.blocked is None
+
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        await asyncio.sleep(0.05)
+        assert bsn.reality_close_calls == 2
+        assert bsn.blocked is None
+        assert not g.kill_switch_tripped
+
+
+async def test_reality_check_manual_clear_before_retry_resets_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the popup clears after a failed attempt but before retry, re-probe instead of clicking again."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_CLOSE_RETRY_DELAY_S", 0.05)
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_ok = False
+    bsn.reality_clear_after_failed_attempt = True
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        await asyncio.sleep(0.05)
+        assert bsn.reality_close_calls == 1
+        assert bsn.blocked is None
+        assert not g.kill_switch_tripped
+        assert any("ready again" in s for s in note.sent)
+
+
+async def test_reality_check_close_timeout_consumes_bounded_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung close click must consume retry budget instead of wedging the recovery task."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_CLOSE_RETRY_DELAY_S", 0.001)
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_CLOSE_ATTEMPT_TIMEOUT_S", 0.001)
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_delay_s = 0.05
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        await asyncio.sleep(0.06)
+        assert bsn.reality_close_calls == hot_session_mod._REALITY_CHECK_MAX_CLOSE_ATTEMPTS
+        assert g.kill_switch_tripped
+        alert = next(s for s in note.sent if "betsson" in s and "REALITY CHECK" in s)
+        assert "click Cerrar" in alert
+
+
+async def test_reality_check_recheck_timeout_consumes_bounded_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung block recheck must not wedge the bounded reality-check recovery task."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_CLOSE_RETRY_DELAY_S", 0.001)
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_RECHECK_TIMEOUT_S", 0.001)
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.session_block_check_delay_s = 0.05
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=999.0,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        not_ready = await m._probe_readiness()  # noqa: SLF001 - isolate recovery task path
+        await m._apply_health(not_ready)  # noqa: SLF001 - mirrors heartbeat flow
+        bsn.session_block_check_delay_s = 0.05
+        m._start_pending_recoveries()  # noqa: SLF001 - start exactly one close task
+        await asyncio.sleep(0.2)
+        assert bsn.reality_close_calls == hot_session_mod._REALITY_CHECK_MAX_CLOSE_ATTEMPTS
+        assert g.kill_switch_tripped
+        alert = next(s for s in note.sent if "betsson" in s and "REALITY CHECK" in s)
+        assert "click Cerrar" in alert
+
+
+async def test_reality_check_clear_during_retry_delay_skips_next_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the popup clears during retry backoff, the next cycle re-probes before clicking."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_CLOSE_RETRY_DELAY_S", 0.05)
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_ok = False
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=999.0,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        baseline_checks = bsn.session_block_checks
+        bsn.blocked = SessionBlock(
+            phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check"
+        )
+        not_ready = await m._probe_readiness()  # noqa: SLF001 - isolate recovery task path
+        await m._apply_health(not_ready)  # noqa: SLF001 - mirrors heartbeat flow
+        m._start_pending_recoveries()  # noqa: SLF001 - start exactly one close task
+
+        deadline = time.monotonic() + 0.2
+        while bsn.reality_close_calls < 1 or bsn.session_block_checks < baseline_checks + 2:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.001)
+
+        bsn.blocked = None
+        await asyncio.sleep(0.06)
+        assert bsn.reality_close_calls == 1
+        assert bsn.blocked is None
+        assert not g.kill_switch_tripped
+        assert any("ready again" in s for s in note.sent)
+
+
+async def test_betwarrior_promotions_page_suspends_then_clicks_inicio() -> None:
+    """Promotions is a non-placeable SPA route: suspend first, recover by INICIO click,
+    then reset only after the route clears."""
+    bano, bsn, bw, g, note = (
+        _FakeTransport(),
+        _FakeTransport(),
+        _FakeTransport(),
+        _guard(),
+        _RecordingNotifier(),
+    )
+    bw.promotions_home_ok = True
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        betwarrior=bw,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bw.blocked = SessionBlock(phrase="promociones", is_overlay=True, kind="promotions_page")
+        await asyncio.sleep(0.05)
+        assert bw.promotions_home_calls >= 1
+        assert not g.kill_switch_tripped
+        suspended_at = next(
+            i for i, s in enumerate(note.sent) if "NOT READY" in s and "PROMOTIONS PAGE" in s
+        )
+        ready_at = next(i for i, s in enumerate(note.sent) if "ready again" in s)
+        assert suspended_at < ready_at
+
+
+async def test_betwarrior_promotions_home_failure_stays_suspended() -> None:
+    bano, bsn, bw, g, note = (
+        _FakeTransport(),
+        _FakeTransport(),
+        _FakeTransport(),
+        _guard(),
+        _RecordingNotifier(),
+    )
+    bw.promotions_home_ok = False
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        betwarrior=bw,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bw.blocked = SessionBlock(phrase="promociones", is_overlay=True, kind="promotions_page")
+        await asyncio.sleep(0.05)
+        assert bw.promotions_home_calls == 1
+        assert g.kill_switch_tripped
+        alert = next(s for s in note.sent if "betwarrior" in s and "PROMOTIONS PAGE" in s)
+        assert "click INICIO" in alert
+
+
 async def test_keepalive_loop_dispatches_to_every_wired_transport() -> None:
     """The keepalive loop fires ``transport.keepalive()`` on every wired platform on
     every tick — BetWarrior's passive readiness probe doesn't register as server-side
@@ -563,7 +925,7 @@ async def test_keepalive_loop_dispatches_to_every_wired_transport() -> None:
         betwarrior=bw,  # type: ignore[arg-type]
         guardrails=g,
         heartbeat_sec=3600.0,  # don't fire the readiness heartbeat during this test
-        keepalive_sec=0.01,    # fire keepalive rapidly
+        keepalive_sec=0.01,  # fire keepalive rapidly
         notifier=note,  # type: ignore[arg-type]
     )
     async with m:
@@ -571,3 +933,66 @@ async def test_keepalive_loop_dispatches_to_every_wired_transport() -> None:
         assert bano.keepalive_calls >= 1
         assert bsn.keepalive_calls >= 1
         assert bw.keepalive_calls >= 1
+
+
+async def test_betwarrior_session_expired_suspends_then_auto_relogs() -> None:
+    """A session_expired overlay on BetWarrior suspends first, then the background
+    relogin (logout→login→fresh bearer) recovers and readiness resets."""
+    bano, bsn, bw, g, note = (
+        _FakeTransport(),
+        _FakeTransport(),
+        _FakeTransport(),
+        _guard(),
+        _RecordingNotifier(),
+    )
+    bw.relogin_ok = True
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        betwarrior=bw,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bw.blocked = SessionBlock(
+            phrase="Su sesión se terminó por inactividad", is_overlay=True, kind="session_expired"
+        )
+        await asyncio.sleep(0.05)
+        assert bw.relogin_calls >= 1
+        assert not g.kill_switch_tripped
+        suspended_at = next(
+            i for i, s in enumerate(note.sent) if "NOT READY" in s and "SESSION EXPIRED" in s
+        )
+        ready_at = next(i for i, s in enumerate(note.sent) if "ready again" in s)
+        assert suspended_at < ready_at
+
+
+async def test_betwarrior_session_expired_relogin_failure_stays_suspended() -> None:
+    """A challenged/failed relogin degrades to today's behavior: one attempt per episode,
+    stays suspended, the session-expired alert remains (operator finishes login manually)."""
+    bano, bsn, bw, g, note = (
+        _FakeTransport(),
+        _FakeTransport(),
+        _FakeTransport(),
+        _guard(),
+        _RecordingNotifier(),
+    )
+    bw.relogin_ok = False
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        betwarrior=bw,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bw.blocked = SessionBlock(
+            phrase="Su sesión se terminó por inactividad", is_overlay=True, kind="session_expired"
+        )
+        await asyncio.sleep(0.05)
+        assert bw.relogin_calls == 1  # one attempt per episode
+        assert g.kill_switch_tripped
+        alert = next(s for s in note.sent if "betwarrior" in s and "SESSION EXPIRED" in s)
+        assert "re-login" in alert
