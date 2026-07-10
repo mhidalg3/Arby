@@ -13,6 +13,7 @@ from src.ingestion.redis_sink import (
     STREAM_NAME,
     RedisSnapshotSink,
     snapshot_to_stream_fields,
+    stream_fields_to_snapshot,
 )
 from src.ingestion.scrapers.base import RawOddsSnapshot
 
@@ -58,6 +59,8 @@ class TestSnapshotSerialization:
             "decimal_odds",
             "max_stake",
             "timestamp",
+            "kickoff_utc",
+            "transport",
         }
         assert set(fields.keys()) == expected
 
@@ -76,7 +79,82 @@ class TestSnapshotSerialization:
     def test_present_max_stake_is_serialized(self) -> None:
         fields = snapshot_to_stream_fields(_snapshot(max_stake=1500.0))
         assert fields["max_stake"] == "1500.0"
-        assert float(fields["max_stake"]) == 1500.0
+
+    def test_missing_kickoff_becomes_empty_string(self) -> None:
+        snap = _snapshot()
+        assert snap.kickoff_utc is None
+        fields = snapshot_to_stream_fields(snap)
+        assert fields["kickoff_utc"] == ""
+
+    def test_present_kickoff_is_serialized(self) -> None:
+        snap = RawOddsSnapshot(
+            platform="betano",
+            platform_event_id="e1",
+            platform_market_id="m1",
+            platform_outcome_id="o1",
+            raw_event_name="A vs B",
+            raw_market_name="1X2",
+            raw_outcome_name="A",
+            decimal_odds=2.0,
+            max_stake=None,
+            timestamp=1000.0,
+            kickoff_utc=1779742576.0,
+        )
+        fields = snapshot_to_stream_fields(snap)
+        assert float(fields["kickoff_utc"]) == 1779742576.0
+
+    def test_kickoff_and_transport_round_trip(self) -> None:
+        """Round-trip: kickoff_utc=None and transport='push' survive."""
+        original = RawOddsSnapshot(
+            platform="betsson-pba",
+            platform_event_id="e1",
+            platform_market_id="m1",
+            platform_outcome_id="o1",
+            raw_event_name="A vs B",
+            raw_market_name="1X2",
+            raw_outcome_name="A",
+            decimal_odds=2.0,
+            max_stake=None,
+            timestamp=1000.0,
+            kickoff_utc=None,
+            transport="push",
+        )
+        fields = snapshot_to_stream_fields(original)
+        restored = stream_fields_to_snapshot(fields)
+        assert restored is not None
+        assert restored.kickoff_utc is None
+        assert restored.transport == "push"
+
+    def test_kickoff_value_round_trips(self) -> None:
+        original = RawOddsSnapshot(
+            platform="betano",
+            platform_event_id="e1",
+            platform_market_id="m1",
+            platform_outcome_id="o1",
+            raw_event_name="A vs B",
+            raw_market_name="1X2",
+            raw_outcome_name="A",
+            decimal_odds=2.0,
+            max_stake=None,
+            timestamp=1000.0,
+            kickoff_utc=1779742576.5,
+            transport="poll",
+        )
+        restored = stream_fields_to_snapshot(snapshot_to_stream_fields(original))
+        assert restored is not None
+        assert restored.kickoff_utc == 1779742576.5
+        assert restored.transport == "poll"
+
+    def test_transport_defaults_poll_on_missing_field(self) -> None:
+        """Old stream entries (pre-kickoff_utc) should default transport='poll'."""
+        snap = _snapshot()
+        fields = snapshot_to_stream_fields(snap)
+        del fields["kickoff_utc"]
+        del fields["transport"]
+        restored = stream_fields_to_snapshot(fields)
+        assert restored is not None
+        assert restored.transport == "poll"
+        assert restored.kickoff_utc is None
 
 
 def _mock_redis() -> MagicMock:
@@ -150,6 +228,7 @@ class TestSinkLoop:
         assert call.args[1] == "betsson-pba:s-out-1"
         # Value is JSON-encoded snapshot fields
         import json
+
         value_decoded = json.loads(call.args[2])
         assert value_decoded["platform"] == "betsson-pba"
         assert value_decoded["platform_outcome_id"] == "s-out-1"

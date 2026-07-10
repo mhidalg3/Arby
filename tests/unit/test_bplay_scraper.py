@@ -389,8 +389,7 @@ class TestRequestShape:
             pass
         # One GET per competition in the default list
         assert sorted(seen) == sorted(
-            f"/oddsfeeds/odds-competition{cid}.xml"
-            for cid in (6674, 36146, 36148, 63057, 42958)
+            f"/oddsfeeds/odds-competition{cid}.xml" for cid in (6674, 36146, 36148, 63057, 42958)
         )
         await client.aclose()
 

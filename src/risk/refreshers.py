@@ -260,9 +260,7 @@ class MultiPlatformRefresher:
         results = await self.refresh_batch([leg])
         return results[0]
 
-    async def refresh_batch(
-        self, legs: Sequence[OddsQuote]
-    ) -> list[FreshQuote]:
+    async def refresh_batch(self, legs: Sequence[OddsQuote]) -> list[FreshQuote]:
         """Two-phase: Tier-2 in parallel for eligible legs, then
         Tier-1 batched fallback for the rest.
         """

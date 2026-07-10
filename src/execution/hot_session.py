@@ -61,6 +61,12 @@ _REALITY_CHECK_MAX_CLOSE_ATTEMPTS = 3
 _REALITY_CHECK_CLOSE_RETRY_DELAY_S = 10.0
 _REALITY_CHECK_CLOSE_ATTEMPT_TIMEOUT_S = 20.0
 _REALITY_CHECK_RECHECK_TIMEOUT_S = 10.0
+# After a successful close, the immediate re-probe can race the SPA (the ctx-
+# context can take a few seconds to be placeable again after Cerrar). Retry the probe
+# a few times at a short interval before falling back to the periodic heartbeat, so a
+# recovered Betsson resumes placement in seconds, not up to heartbeat_sec later.
+_REALITY_CHECK_RESUME_REPROBES = 3  # extra probes after the immediate one
+_REALITY_CHECK_RESUME_REPROBE_DELAY_S = 15.0
 
 
 class WarmTransport(Protocol):
@@ -92,6 +98,11 @@ class WarmTransport(Protocol):
     # Kambi session is replaced + its bearer re-captured). True iff a fresh bearer lands.
     # Real bookmaker interaction — operator-authorized (see InSessionTransport.attempt_betwarrior_relogin).
     async def attempt_betwarrior_relogin(self) -> bool: ...
+    # Full logout→login on Betsson's own window using keyring creds (a server-killed
+    # session is replaced + its ctx- re-captured). Scan-first: a healthy session is
+    # re-established, not logged out. True iff the logged-in UI + a fresh ctx- land.
+    # Real bookmaker interaction — operator-authorized (see InSessionTransport.attempt_betsson_relogin).
+    async def attempt_betsson_relogin(self) -> bool: ...
     # Minimal inactivity avoidance (mouse/scroll/occasional click). Best-effort;
     # never raises. See InSessionTransport.keepalive for the operator authorization
     # and the 2026-06-13 lab result on why mouse-alone isn't enough.
@@ -363,15 +374,15 @@ class HotSessionManager:
                 and not self._stopping
             ):
                 self._pending_promotions_recoveries[name] = transport
-            # BetWarrior session_expired (inactivity logout / server-side kill): record a
-            # pending re-auth, started after _apply_health suspends placement. The reactive
-            # path (Step 4) covers the silent 401 (no popup); this covers the popup case.
-            # Only betwarrior has an auto relogin.
+            # session_expired (inactivity logout / server-side kill): record a pending
+            # re-auth, started after _apply_health suspends placement. The reactive path
+            # (executor) covers the silent 401 (no popup); this covers the popup /
+            # header-logged-out case. Both betwarrior and betsson have an auto relogin.
             if (
                 block is not None
                 and block.is_overlay
                 and block.kind == "session_expired"
-                and name == "betwarrior"
+                and name in ("betwarrior", "betsson")
                 and name not in self._session_reauth_attempted
                 and name not in self._session_reauth_tasks
                 and not self._stopping
@@ -439,19 +450,38 @@ class HotSessionManager:
     ) -> None:
         async def _apply_recovered(event: str, attempt: int) -> None:
             self._log.info(event, platform=name, attempt=attempt)
-            if self._stopping:
-                return
-            try:
-                not_ready = await self._probe_readiness()
-            except Exception as exc:  # noqa: BLE001 — heartbeat will retry probe
-                self._log.warning(
-                    "hot_sessions.reality_check_reprobe_error",
-                    platform=name,
-                    error=str(exc),
-                )
-                return
-            await self._apply_health(not_ready)
-            self._start_pending_recoveries()
+            # The popup is gone, but the SPA may need a few seconds before the betting
+            # context is placeable again. A settle sleep before EVERY probe (including
+            # the first — the old immediate probe ran establish's hard goto into the
+            # still-settling SPA, whose pre-hydration header misread as logged-out and
+            # triggered the relogin regression, 2026-07-05) + a small bounded retry
+            # budget; each iteration mirrors the heartbeat's probe→health→recoveries
+            # sequence. _apply_health alerts only on transitions, so repeated
+            # still-not-ready probes never spam. Give up to the periodic heartbeat
+            # after the budget (never loop forever). The transport-side auth-scan
+            # debounce (session.py _betsson_auth_settled) is the second line of defense.
+            for _ in range(1 + _REALITY_CHECK_RESUME_REPROBES):
+                if self._stopping:
+                    return
+                await asyncio.sleep(_REALITY_CHECK_RESUME_REPROBE_DELAY_S)
+                try:
+                    not_ready = await self._probe_readiness()
+                except Exception as exc:  # noqa: BLE001 — consume the attempt; retry
+                    self._log.warning(
+                        "hot_sessions.reality_check_reprobe_error",
+                        platform=name,
+                        error=str(exc),
+                    )
+                    continue
+                await self._apply_health(not_ready)
+                self._start_pending_recoveries()
+                if name not in not_ready:
+                    return  # this platform is placeable again — our job is done
+            self._log.warning(
+                "hot_sessions.reality_check_resume_reprobes_exhausted",
+                platform=name,
+                reprobes=_REALITY_CHECK_RESUME_REPROBES,
+            )
 
         async def _reality_still_blocked(attempt: int) -> bool:
             try:
@@ -545,7 +575,11 @@ class HotSessionManager:
 
     async def _relogin_session(self, name: str, transport: WarmTransport) -> None:
         try:
-            ok = await transport.attempt_betwarrior_relogin()
+            ok = await (
+                transport.attempt_betsson_relogin()
+                if name == "betsson"
+                else transport.attempt_betwarrior_relogin()
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — background recovery must never die noisily
@@ -554,6 +588,17 @@ class HotSessionManager:
         finally:
             self._session_reauth_tasks.pop(name, None)
         if not ok:
+            if getattr(transport, "betsson_relogin_unreadable", False):
+                # The transport gave up WITHOUT touching the session because the header
+                # never settled (transport.betsson_relogin_auth_unreadable) — a one-shot
+                # flag reset at the start of every attempt_betsson_relogin call. Do NOT
+                # consume the episode's single reauth attempt on that outcome: the block
+                # persists, so the attempted-guard would otherwise stay set and strand a
+                # genuinely dead session until manual login. With the guard cleared, the
+                # next heartbeat (bounded cadence) reschedules once the SPA settles.
+                self._session_reauth_attempted.discard(name)
+                self._log.warning("hot_sessions.session_reauth_deferred", platform=name)
+                return
             # Leave the existing suspend + alert — a failed/challenged re-auth degrades to
             # today's behavior (operator finishes the login manually); never adds exposure.
             self._log.warning("hot_sessions.session_reauth_failed", platform=name)

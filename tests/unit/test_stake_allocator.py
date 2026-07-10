@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from src.arbitrage.quotes import OddsQuote
-from src.arbitrage.stake_allocator import allocate_maxmin
+from src.arbitrage.stake_allocator import allocate_maxmin, allocate_residual
 
 
 def make_quote(
@@ -278,3 +278,153 @@ class TestNWayLarger:
             assert s == pytest.approx(stakes[0], rel=1e-9)
         # Budget fully consumed in the uncapped, unrounded case.
         assert sum(stakes) == pytest.approx(1000.0, rel=1e-9)
+
+
+# ---- residual allocation (hedge around already-filled legs) ----
+
+
+class TestResidualAllocator:
+    """allocate_residual sizes remaining legs so the worst case (pinned by the
+    placed legs) still locks a profit. All numbers below are hand-computed."""
+
+    def test_one_placed_leg_equal_payout_and_profit(self) -> None:
+        # placed payout 1000 (stake 700 @ ~1.43), one remaining leg @ 4.0, budget 1000.
+        # target = min(1000, 1000/0.25) = 1000 → s = 250; profit = 1000 − (700+250) = 50.
+        alloc = allocate_residual([1000.0], 700.0, [make_quote(decimal_odds=4.0)], 1000.0)
+        assert alloc is not None
+        assert alloc.stakes == (250.0,)
+        assert alloc.total_stake == pytest.approx(950.0)
+        assert alloc.guaranteed_profit == pytest.approx(50.0)
+
+    def test_two_remaining_legs_equal_payout(self) -> None:
+        # placed payout 1000 (stake 200 @ 5.0); two remaining legs @ 2.0 and 4.0.
+        # inv = 0.75; target = min(1000, 2000/0.75) = 1000 → s = (500, 250).
+        # both remaining outcomes + the placed leg each pay 1000; profit = 50.
+        alloc = allocate_residual(
+            [1000.0],
+            200.0,
+            [
+                make_quote(platform="A", outcome="x", decimal_odds=2.0),
+                make_quote(platform="B", outcome="y", decimal_odds=4.0),
+            ],
+            2000.0,
+        )
+        assert alloc is not None
+        assert alloc.stakes == pytest.approx((500.0, 250.0))
+        assert alloc.total_stake == pytest.approx(950.0)
+        assert alloc.guaranteed_profit == pytest.approx(50.0)
+
+    def test_cap_bound_target_clamps_stake_to_cap(self) -> None:
+        # placed payout 2000; remaining @ 4.0 capped at max_stake 300 → target bound
+        # by the cap term (300·4 = 1200 < placed 2000, < budget 4000) → s = 300 == cap.
+        alloc = allocate_residual(
+            [2000.0], 700.0, [make_quote(decimal_odds=4.0, max_stake=300.0)], 1000.0
+        )
+        assert alloc is not None
+        assert alloc.stakes == (300.0,)  # exactly the cap
+        assert alloc.guaranteed_profit == pytest.approx(200.0)
+
+    def test_budget_bound_target_consumes_full_budget(self) -> None:
+        # remaining budget 400 binds below placed payout (400/0.25 = 1600 < 2000) →
+        # s = 400, i.e. the entire remaining budget is deployed.
+        alloc = allocate_residual([2000.0], 700.0, [make_quote(decimal_odds=4.0)], 400.0)
+        assert alloc is not None
+        assert alloc.stakes == (400.0,)
+        assert alloc.guaranteed_profit == pytest.approx(500.0)
+
+    def test_increment_round_down_erodes_but_keeps_profit(self) -> None:
+        # optimal s = 250, rounded DOWN to a multiple of 7 → 245; profit erodes 50→35.
+        alloc = allocate_residual(
+            [1000.0], 700.0, [make_quote(decimal_odds=4.0, stake_increment=7.0)], 1000.0
+        )
+        assert alloc is not None
+        assert alloc.stakes == (245.0,)
+        assert alloc.guaranteed_profit == pytest.approx(35.0)
+
+    def test_favorable_higher_odds_smaller_stake_larger_profit(self) -> None:
+        # remaining @ 5.0 (vs 4.0 baseline): s drops 250→200, profit rises 50→100.
+        alloc = allocate_residual([1000.0], 700.0, [make_quote(decimal_odds=5.0)], 1000.0)
+        assert alloc is not None
+        assert alloc.stakes == (200.0,)
+        assert alloc.guaranteed_profit == pytest.approx(100.0)
+
+    def test_min_stake_bump_over_hedges_when_break_even(self) -> None:
+        # optimal s = 250 < min_stake 300, but staking 300 still locks a non-negative
+        # outcome: payout 1200, worst case min(1000, 1200) = 1000, total 700+300 = 1000 →
+        # profit 0 ≥ floor. Over-hedging this leg beats going naked with the fill live.
+        alloc = allocate_residual(
+            [1000.0], 700.0, [make_quote(decimal_odds=4.0, min_stake=300.0)], 1000.0
+        )
+        assert alloc is not None
+        assert alloc.stakes == (300.0,)
+        assert alloc.guaranteed_profit == pytest.approx(0.0)
+
+    def test_min_stake_bump_on_grid_with_increment(self) -> None:
+        # optimal s = 250 < min_stake 251; the on-grid minimum is ceil(251/50)*50 = 300,
+        # NOT 251 — a raw `s = min_stake` would bet off-grid and the book would reject it.
+        alloc = allocate_residual(
+            [1000.0],
+            700.0,
+            [make_quote(decimal_odds=4.0, min_stake=251.0, stake_increment=50.0)],
+            1000.0,
+        )
+        assert alloc is not None
+        assert alloc.stakes == (300.0,)
+        assert alloc.guaranteed_profit == pytest.approx(0.0)
+
+    def test_min_stake_bump_unprofitable_returns_none(self) -> None:
+        # bumping to 400 drives profit negative (1000 − 1100 = −100) → no salvageable
+        # hedge; reject (the worst case is still the placed leg's 1000).
+        alloc = allocate_residual(
+            [1000.0], 700.0, [make_quote(decimal_odds=4.0, min_stake=400.0)], 1000.0
+        )
+        assert alloc is None
+
+    def test_min_stake_bump_exceeds_budget_returns_none(self) -> None:
+        # the on-grid minimum (600) outruns the 500 remaining budget → the budget check
+        # rejects even though the leg is hedge-able in principle.
+        alloc = allocate_residual(
+            [1000.0], 700.0, [make_quote(decimal_odds=4.0, min_stake=600.0)], 500.0
+        )
+        assert alloc is None
+
+    def test_budget_exhausted_returns_none(self) -> None:
+        # remaining budget ≤ 0 → nothing left to hedge with.
+        assert allocate_residual([1000.0], 700.0, [make_quote(decimal_odds=4.0)], 0.0) is None
+        assert allocate_residual([1000.0], 700.0, [make_quote(decimal_odds=4.0)], -5.0) is None
+
+    def test_no_arb_overround_ge_one_returns_none(self) -> None:
+        # two remaining legs @ 1.5 each (inv ≈ 1.333) → profit drives deeply negative.
+        alloc = allocate_residual(
+            [1000.0],
+            700.0,
+            [
+                make_quote(platform="A", outcome="x", decimal_odds=1.5),
+                make_quote(platform="B", outcome="y", decimal_odds=1.5),
+            ],
+            1000.0,
+        )
+        assert alloc is None
+
+    def test_profit_below_floor_returns_none(self) -> None:
+        # baseline profit 50; a 60 floor rejects, a 50 floor keeps (boundary inclusive).
+        q = [make_quote(decimal_odds=4.0)]
+        assert allocate_residual([1000.0], 700.0, q, 1000.0, min_profit_ars=60.0) is None
+        kept = allocate_residual([1000.0], 700.0, q, 1000.0, min_profit_ars=50.0)
+        assert kept is not None and kept.guaranteed_profit == pytest.approx(50.0)
+
+    def test_value_error_on_odds_le_one(self) -> None:
+        with pytest.raises(ValueError, match="> 1.0"):
+            allocate_residual([1000.0], 700.0, [make_quote(decimal_odds=1.0)], 1000.0)
+
+    def test_value_error_on_empty_placed_payouts(self) -> None:
+        with pytest.raises(ValueError, match="placed_payouts"):
+            allocate_residual([], 0.0, [make_quote(decimal_odds=4.0)], 1000.0)
+
+    def test_value_error_on_empty_quotes(self) -> None:
+        with pytest.raises(ValueError, match="quotes"):
+            allocate_residual([1000.0], 700.0, [], 1000.0)
+
+    def test_value_error_on_non_positive_placed_payout(self) -> None:
+        with pytest.raises(ValueError, match="placed payouts"):
+            allocate_residual([-5.0], 700.0, [make_quote(decimal_odds=4.0)], 1000.0)

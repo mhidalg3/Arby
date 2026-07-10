@@ -181,3 +181,40 @@ class PartitionValidation(Base):
     confidence: Mapped[float | None] = mapped_column(Float)
     reasoning: Mapped[str | None] = mapped_column(Text)
     edge_cases: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
+class OddsSnapshot(Base):
+    """Raw odds tick — one row per recorded observation in the ``odds_snapshots``
+    TimescaleDB hypertable.
+
+    Hypertables have no real primary key; SQLAlchemy needs one to operate,
+    so we declare a synthetic composite PK on ``(time, platform, platform_outcome_id)``
+    for ORM purposes only (the DB table has no PK constraint).
+    """
+
+    __tablename__ = "odds_snapshots"
+
+    time: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    platform: Mapped[str] = mapped_column(String, primary_key=True)
+    platform_outcome_id: Mapped[str] = mapped_column(String, primary_key=True, server_default="")
+
+    platform_event_id: Mapped[str] = mapped_column(String)
+    canonical_outcome_id: Mapped[int | None] = mapped_column(BigInteger)
+    raw_market_name: Mapped[str] = mapped_column(String)
+    raw_outcome_name: Mapped[str] = mapped_column(String)
+    decimal_odds: Mapped[float] = mapped_column(Float)
+    max_stake: Mapped[float | None] = mapped_column(Float)
+    # Lag-model columns (additive — all nullable or server-defaulted).
+    platform_market_id: Mapped[str] = mapped_column(String, server_default="")
+    raw_event_name: Mapped[str] = mapped_column(String, server_default="")
+    raw_competition: Mapped[str] = mapped_column(String, server_default="")
+    transport: Mapped[str] = mapped_column(String, server_default="poll")
+    market_code: Mapped[str | None] = mapped_column(String)
+    line: Mapped[float | None] = mapped_column(Float)
+    cell: Mapped[str | None] = mapped_column(String)
+    fixture_key: Mapped[str | None] = mapped_column(String)
+    kickoff_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_change: Mapped[bool] = mapped_column(Boolean, server_default="true")
+    prev_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recorder_session_id: Mapped[str] = mapped_column(String, server_default="")
+    session_fixture_id: Mapped[str | None] = mapped_column(String)

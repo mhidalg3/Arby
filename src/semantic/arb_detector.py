@@ -188,9 +188,7 @@ class _MarketState:
     home_team: str
     away_team: str
     # (cell, platform) → latest CanonicalQuote
-    quotes_by_cell_platform: dict[tuple[str, str], CanonicalQuote] = field(
-        default_factory=dict
-    )
+    quotes_by_cell_platform: dict[tuple[str, str], CanonicalQuote] = field(default_factory=dict)
 
 
 @dataclass
@@ -209,7 +207,9 @@ class ArbDetector:
     # confidence. The static `budget` field below is the fallback for
     # tests + the legacy detector-with-fixed-budget path.
     budget_fn: Callable[[Sequence[OddsQuote]], float] = default_budget_fn
-    budget: float = DEFAULT_BUDGET  # retained for back-compat; ignored when budget_fn is the non-default
+    budget: float = (
+        DEFAULT_BUDGET  # retained for back-compat; ignored when budget_fn is the non-default
+    )
     min_margin_pct: float = DEFAULT_MIN_MARGIN_PCT
     staleness_threshold_sec: float = DEFAULT_STALENESS_SEC
     emit_throttle_sec: float = DEFAULT_EMIT_THROTTLE_SEC
@@ -292,9 +292,7 @@ class ArbDetector:
         # on `decode_responses`. The daemon uses `decode_responses=True`;
         # we coerce defensively here for tests that pass bytes.
         decoded = {
-            (k.decode() if isinstance(k, bytes) else k): (
-                v.decode() if isinstance(v, bytes) else v
-            )
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
             for k, v in fields.items()
         }
         snapshot = stream_fields_to_snapshot(decoded)
@@ -316,9 +314,7 @@ class ArbDetector:
             )
             self._markets[market_key] = state
 
-        state.quotes_by_cell_platform[(quote.outcome.cell, quote.odds_quote.platform)] = (
-            quote
-        )
+        state.quotes_by_cell_platform[(quote.outcome.cell, quote.odds_quote.platform)] = quote
 
         return await self._maybe_emit(market_key, state, quote.odds_quote.timestamp)
 
@@ -350,18 +346,14 @@ class ArbDetector:
 
         # Order legs by sorted cell name for deterministic emission.
         ordered_cells = sorted(expected)
-        legs: tuple[OddsQuote, ...] = tuple(
-            best_per_cell[c].odds_quote for c in ordered_cells
-        )
+        legs: tuple[OddsQuote, ...] = tuple(best_per_cell[c].odds_quote for c in ordered_cells)
         # Stake sizer decides the budget. Returns 0.0 to signal skip
         # (too-low confidence, or below the min-stake floor).
         budget = self.budget_fn(legs)
         if budget <= 0.0:
             return False
         try:
-            opp = detect_arbitrage(
-                legs, budget=budget, min_margin_pct=self.min_margin_pct
-            )
+            opp = detect_arbitrage(legs, budget=budget, min_margin_pct=self.min_margin_pct)
         except ValueError as exc:
             self._log.warning(
                 "detector.detect_arbitrage_error",

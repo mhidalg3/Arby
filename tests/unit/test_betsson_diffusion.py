@@ -101,9 +101,7 @@ def test_subscribe_encoder_reproduces_captured_frames() -> None:
     browser sent (golden fixture from recon 2026-05-29)."""
     frames = [
         base64.b64decode(line)
-        for line in (_FIXTURES / "betsson_diffusion_subscribe_frames.b64")
-        .read_text()
-        .splitlines()
+        for line in (_FIXTURES / "betsson_diffusion_subscribe_frames.b64").read_text().splitlines()
         if line
     ]
     assert encode_subscribe_frame(1, FIXTURE_PHASE_SELECTOR) == frames[0]

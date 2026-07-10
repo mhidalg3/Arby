@@ -112,9 +112,7 @@ class BetanoCapRefresher:
             status, resp = await self.transport.fetch(
                 "POST",
                 f"{_BETANO_BASE}/plain-leg/",
-                json_body=placers.build_betano_plain_leg(
-                    leg.platform_outcome_id, event_id
-                ),
+                json_body=placers.build_betano_plain_leg(leg.platform_outcome_id, event_id),
             )
             if status >= 400:
                 log.warning("cap_refresh.plain_leg_failed", status=status)

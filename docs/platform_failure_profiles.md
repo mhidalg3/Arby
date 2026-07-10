@@ -135,6 +135,11 @@ UI examples seen in viewer screenshots:
   `couponId` (a coupon may exist → never re-POST). The retry is bounded single-shot; a
   second price move on the retry returns the reject (no loop). This is hedge-safe, not a
   `src/risk/` decision: the stake is never resized.
+- Odds-invalid rejects (unfavorable / over-cap / tag-mismatch / second-reject) now read
+  "server repriced before acceptance" with the submitted→validOdds delta in the alert /
+  audit `detail`; the per-leg telemetry event (`executor.leg_placement`) additionally
+  records the server's corrected price as `server_valid_odds` and the price actually POSTed
+  last as `odds_requested`.
 
 **Operator recovery**
 
@@ -559,8 +564,8 @@ Effect:
 - Live proof passed on 2026-06-23: two BetWarrior `LIVE_DELAY_PENDING` coupons resolved
   via poll v2 to `betStatus=OPEN` during the first completed real arb.
 - BetWarrior-first leg ordering. If any platform must bear asynchronous uncertainty, it should be first so no earlier confirmed legs are exposed.
-- Residual hedge recomputation after a confirmed BetWarrior fill: if leg A accepted, reverify remaining legs and recompute stake/odds before hedging.
-- Keep `allowOddsChange* = NO` until residual hedge solver exists. Enabling YES without recomputing can accept a worse filled price and destroy the arb.
+- Residual hedge recomputation after a confirmed BetWarrior fill: **SHIPPED** (2026-07-02). An odds-change reject — or a mid-sequence pre-place drift beyond tolerance — now triggers ONE bounded executor-level recapture per leg: re-fetch fresh odds (the Tier-2 `LiveOddsReverifier` feed) + arb-layer re-price (`detect_arbitrage` full re-price when nothing is live yet; the residual solver `allocate_residual` around already-filled legs so the Dutch book still locks ≥ 0) + guardrail re-check + a single re-POST. No salvageable hedge → today's abort/naked. See W5.
+- Keep `allowOddsChange* = NO`: the recapture path re-fetches from our own feed and re-prices through `src/arbitrage/`, so we never accept a worse filled price blind. Enabling YES would let Kambi fill at any (worse) price without recomputing the hedge.
 - Potential active bearer-capture/keepalive so the bearer exists before an execution candidate appears.
 - More structured `body` logging for pending responses instead of truncated stringified dicts.
 
@@ -593,13 +598,14 @@ betwarrior: SUCCESS without echoed coupon.bets (status ok, no bet)
 
 - Fail-closed; no loose success on `status=SUCCESS` unless `coupon.bets[0]` echoes `stake` and `betOdds`.
 - HTTP error body is logged for diagnosis.
-- Exact odds remain required.
+- Exact odds remain required (`allowOddsChange* = NO`).
+- A Kambi 400 `"Invalid odds specified"` (price moved between our reverify and the POST) is classified by `betwarrior_odds_rejected` and flagged `odds_rejected` on the result. The executor then makes ONE bounded recapture per leg: re-fetch fresh odds, re-price via the arb layer (full `detect_arbitrage` re-price when nothing is live yet; the residual solver `allocate_residual` around already-filled legs so the book still locks ≥ 0), re-run guardrails, and re-POST once. No salvageable hedge (edge gone / budget exhausted / guardrail fail) → today's abort/naked. A `pending_unknown` (submitted) bet is never re-POSTed. Emitted log events: `executor.recaptured`, `executor.recapture_no_arb` (+ `…_unverifiable` / `…_guardrail` / `…_shape_mismatch` on the refuse paths).
 
 **Operator recovery**
 
 - Let next detection/reverify cycle build a fresh candidate.
 - If repeated bearer/auth errors, trigger player-API traffic or re-login.
-- If repeated odds mismatch, the book is moving too fast for current tolerance; do not enable odds changes without residual hedge recomputation.
+- If repeated odds mismatch despite the single recapture (the book moving faster than one re-fetch can catch), the market is too fast to hedge safely — leave `allowOddsChange* = NO` and let it abort/naked rather than accept a worse price blind.
 
 ---
 

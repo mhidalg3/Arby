@@ -86,8 +86,16 @@ class _Recorder:
         self.execs: list[tuple] = []
         self._next = 1
 
-    async def record_opportunity(self, market_id, opp, decision) -> int:  # type: ignore[no-untyped-def]
-        self.opps.append((market_id, opp, decision))
+    async def record_opportunity(
+        self,
+        market_id,  # type: ignore[no-untyped-def]
+        opp,
+        decision,
+        *,
+        adaptive_threshold_pct: float | None = None,
+        garch_variance: float | None = None,
+    ) -> int:
+        self.opps.append((market_id, opp, decision, adaptive_threshold_pct, garch_variance))
         oid = self._next
         self._next += 1
         return oid
@@ -122,7 +130,9 @@ def _orch(
     placers: dict[str, _Placer],
     notifier: _Notifier | None = None,
     recorder: _Recorder | None = None,
+    risk: RiskEvaluator | None = None,
     empty_alert_after: int = 5,
+    adaptive: object | None = None,
 ) -> ArbOrchestrator:
     ex = Executor(
         guardrails=guard,
@@ -132,7 +142,7 @@ def _orch(
     )
     return ArbOrchestrator(
         quote_source=source,
-        risk_evaluator=_risk(),
+        risk_evaluator=risk or _risk(),
         executor=ex,
         guardrails=guard,
         budget_ars=1000.0,
@@ -140,6 +150,7 @@ def _orch(
         notifier=notifier,
         recorder=recorder,  # type: ignore[arg-type]
         empty_alert_after=empty_alert_after,
+        adaptive_threshold=adaptive,  # type: ignore[arg-type]
     )
 
 
@@ -293,3 +304,239 @@ async def test_kill_switch_handoff_records_opportunity_not_execution() -> None:
     await orch.run_once()
     assert len(rec.opps) == 1
     assert rec.execs == []
+
+
+def _risky() -> RiskEvaluator:
+    # Same permissive shape as _risk(), but the warning band starts at 1% so the
+    # standard ~5%-ROI fixture lands inside it (flag set, still APPROVED).
+    return RiskEvaluator(
+        policy=RiskPolicy(
+            min_margin_pct=0.5,
+            min_confidence=0.0,
+            platform_reliability={"betsson": 1.0, "betano": 1.0},
+            high_margin_warning_pct=1.0,
+        )
+    )
+
+
+async def test_high_margin_arb_not_auto_placed_and_handed_off() -> None:
+    """An APPROVED arb inside the high-margin band is alerted + audit-recorded but
+    handed to the operator for manual verification — never auto-placed."""
+    g, note = _guard(), _Notifier()
+    bp, ap = _Placer(), _Placer()
+    rec = _Recorder()
+    orch = _orch(
+        _FakeQuoteSource(_arb_market()),
+        g,
+        {"betsson": bp, "betano": ap},
+        notifier=note,
+        recorder=rec,
+        risk=_risky(),
+    )
+    results = await orch.run_once()
+    assert results == [] and bp.calls == 0 and ap.calls == 0  # nothing auto-placed
+    assert any(m.startswith("🎯 ARB") for m in note.sent)  # still alerted
+    assert any("NOT auto-placed" in m for m in note.sent)  # warning reached Telegram
+    assert len(rec.opps) == 1 and rec.execs == []  # audit row, no execution
+
+
+async def test_high_margin_handoff_takes_precedence_over_kill_switch() -> None:
+    """Both gates tripped → only the high-margin (verify-first) message fires."""
+    g, note = _guard(), _Notifier()
+    g.trip_kill_switch("session cold")
+    orch = _orch(
+        _FakeQuoteSource(_arb_market()),
+        g,
+        {"betsson": _Placer(), "betano": _Placer()},
+        notifier=note,
+        risk=_risky(),
+    )
+    await orch.run_once()
+    assert any("NOT auto-placed" in m for m in note.sent)
+    assert not any("auto-placement suspended" in m for m in note.sent)
+
+
+async def test_orchestrator_orders_bw_first_and_records_permuted_opp() -> None:
+    """The orchestrator permutes legs into placement order (BW-first) at the seam, so
+    the executor places BetWarrior before Betsson AND record_execution receives the
+    SAME permuted opp — positional consistency between placement order and audit
+    (record_execution pairs result.legs[i] with opp.legs[i])."""
+    order: list[str] = []
+
+    class _OrderPlacer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def place(self, leg: Leg) -> PlacementResult:
+            self.calls += 1
+            order.append(leg.platform)
+            return PlacementResult(accepted=True, stake_filled=leg.stake_ars, odds_filled=leg.odds)
+
+    bw, bs = _OrderPlacer(), _OrderPlacer()
+    # Detector order is Betsson-first; the orchestrator permutes to BW-first.
+    market = {
+        "FIX1|1X2": [
+            _quote("betsson-pba", "away", 2.1),
+            _quote("betwarrior-pba", "home", 2.1),
+        ]
+    }
+    rec = _Recorder()
+    orch = _orch(
+        _FakeQuoteSource(market),
+        _guard(),
+        {"betwarrior-pba": bw, "betsson-pba": bs},
+        recorder=rec,
+    )
+    results = await orch.run_once()
+    assert len(results) == 1 and results[0].outcome is ExecutionOutcome.COMPLETED
+    # BetWarrior leg placed FIRST (fragile-auth ordering), Betsson second.
+    assert order == ["betwarrior-pba", "betsson-pba"]
+    # record_opportunity AND record_execution both received the SAME permuted opp —
+    # the seam is before both, so audit intent and execution stay positionally aligned.
+    assert len(rec.opps) == 1
+    assert [q.platform for q in rec.opps[0][1].legs] == ["betwarrior-pba", "betsson-pba"]
+    assert len(rec.execs) == 1
+    recorded_opp = rec.execs[0][1]
+    assert [q.platform for q in recorded_opp.legs] == ["betwarrior-pba", "betsson-pba"]
+
+
+# ---- Phase C: trigger path tests ----
+
+
+class _TriggerSource:
+    """Quote source with both fetch() and trigger_fetch() — tracks calls separately."""
+
+    def __init__(
+        self,
+        full: dict[str, list[OddsQuote]],
+        trigger: dict[str, list[OddsQuote]] | None = None,
+    ) -> None:
+        self._full = full
+        self._trigger = trigger or {}
+        self.fetch_calls = 0
+        self.trigger_calls = 0
+
+    async def fetch(self) -> dict[str, list[OddsQuote]]:
+        self.fetch_calls += 1
+        return self._full
+
+    async def trigger_fetch(self) -> dict[str, list[OddsQuote]]:
+        self.trigger_calls += 1
+        return self._trigger
+
+    @property
+    def market_names(self) -> dict[str, tuple[str, str]]:
+        return {}
+
+
+async def test_process_market_dedup_prevents_reexecution() -> None:
+    """A market executed via _process_market is not re-executed on the next call
+    (the _executed dedup that both full-cycle and trigger paths share)."""
+    g = _guard()
+    bp, ap = _Placer(), _Placer()
+    src = _TriggerSource(_arb_market())
+    orch = _orch(src, g, {"betsson": bp, "betano": ap})  # type: ignore[arg-type]
+    market_id = "FIX1|1X2"
+    quotes = _arb_market()[market_id]
+    # First call: executes the arb
+    res1 = await orch._process_market(market_id, quotes, {})
+    assert res1 is not None
+    assert bp.calls == 1 and ap.calls == 1
+    # Second call: deduped (market already in _executed)
+    res2 = await orch._process_market(market_id, quotes, {})
+    assert res2 is None
+    assert bp.calls == 1 and ap.calls == 1  # no additional placement
+
+
+async def test_trigger_fetch_zero_interval_makes_no_trigger_calls() -> None:
+    """With trigger_interval_sec=0, run_forever never calls trigger_fetch.
+    (Byte-identical to today — verified by the source's trigger_calls counter.)"""
+    g = _guard()
+    bp, ap = _Placer(), _Placer()
+    src = _TriggerSource(_arb_market(), trigger=_arb_market())
+    orch = _orch(src, g, {"betsson": bp, "betano": ap})  # type: ignore[arg-type]
+
+    # Run one iteration of run_forever with trigger disabled, then stop
+    async def _stop_after_one() -> None:
+        await asyncio.sleep(0.1)
+        orch.stop()
+
+    await asyncio.gather(
+        orch.run_forever(poll_interval_sec=0.05, trigger_interval_sec=0.0),
+        _stop_after_one(),
+    )
+    assert src.trigger_calls == 0
+
+
+# ---- Phase E: GARCH adaptive threshold ----
+
+
+class _StubAdaptive:
+    """Minimal AdaptiveThreshold stub: a fixed decide() result + observe counter."""
+
+    def __init__(self, threshold: float, variance: float | None = 42.0) -> None:
+        from src.arbitrage.garch import ThresholdDecision
+
+        self._decision = ThresholdDecision(threshold_pct=threshold, garch_variance=variance)
+        self.observed = 0
+
+    def observe_cycle(self, observations: object) -> None:
+        self.observed += sum(1 for _ in observations)  # type: ignore[arg-type]
+
+    def decide(self, market_id: str):  # type: ignore[no-untyped-def]
+        return self._decision
+
+
+async def test_adaptive_threshold_above_margin_rejects_arb() -> None:
+    """When decide() returns a threshold above the arb's ~5% margin, detect_arbitrage
+    finds no arb → nothing recorded, nothing placed."""
+    g = _guard()
+    bp, ap = _Placer(), _Placer()
+    rec = _Recorder()
+    adaptive = _StubAdaptive(threshold=10.0)  # 10% gate > ~5% arb margin
+    orch = _orch(
+        _FakeQuoteSource(_arb_market()),
+        g,
+        {"betsson": bp, "betano": ap},
+        recorder=rec,
+        adaptive=adaptive,
+    )
+    await orch.run_once()
+    assert rec.opps == [] and bp.calls == 0  # rejected at detection — no record, no place
+
+
+async def test_adaptive_threshold_below_margin_finds_arb_and_records_kwargs() -> None:
+    """When decide() returns a threshold below the arb's margin, the arb is found and
+    the fake recorder captures adaptive_threshold_pct + garch_variance."""
+    g = _guard()
+    bp, ap = _Placer(), _Placer()
+    rec = _Recorder()
+    adaptive = _StubAdaptive(threshold=0.5, variance=123.4)  # 0.5% gate < ~5% margin
+    orch = _orch(
+        _FakeQuoteSource(_arb_market()),
+        g,
+        {"betsson": bp, "betano": ap},
+        recorder=rec,
+        adaptive=adaptive,
+    )
+    await orch.run_once()
+    assert len(rec.opps) == 1
+    _, _, _, thr_pct, gvar = rec.opps[0]
+    assert thr_pct == 0.5
+    assert gvar == 123.4
+    assert bp.calls == 1 and ap.calls == 1  # placed
+
+
+async def test_adaptive_threshold_no_cycle_spreads_attribute_no_crash() -> None:
+    """A quote source without cycle_spreads + adaptive set → the getattr guard skips
+    observe_cycle; detection still runs (the None path)."""
+    g = _guard()
+    bp, ap = _Placer(), _Placer()
+    adaptive = _StubAdaptive(threshold=0.5)
+    # _FakeQuoteSource has no cycle_spreads attribute.
+    orch = _orch(
+        _FakeQuoteSource(_arb_market()), g, {"betsson": bp, "betano": ap}, adaptive=adaptive
+    )
+    await orch.run_once()  # must not raise
+    assert adaptive.observed == 0  # observe_cycle never called (no cycle_spreads)
+    assert bp.calls == 1  # arb still found and placed (static threshold unaffected)

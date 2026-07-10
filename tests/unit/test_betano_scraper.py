@@ -9,6 +9,7 @@ enough to catch parser drift.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import httpx
@@ -42,7 +43,7 @@ _PREMATCH_OK: dict[str, Any] = {
                         {"name": "Arsenal FC", "teamId": 106359},
                     ],
                     "url": "/cuotas-de-partido/paris-saint-germain-arsenal-fc/85324875/",
-                    "startTime": 1780156800000,
+                    "startTime": 4102444800000,
                 },
                 "999": {  # non-FOOT — skip
                     "id": 999,
@@ -179,6 +180,27 @@ async def test_prematch_skips_non_foot_outright_and_esports() -> None:
         snaps = [s async for s in scraper.fetch_live_soccer()]
     # Tennis, outright, and esports events all produced nothing.
     assert {s.platform_event_id for s in snaps} == {"85324875"}
+
+
+async def test_prematch_drops_started_event() -> None:
+    """Prematch mode is fail-closed on in-play: an event whose startTime is
+    already past, or one flagged ``liveNow``, yields nothing even when its
+    1X2 market is otherwise valid."""
+    # Past start time → treated as in-play.
+    past = copy.deepcopy(_PREMATCH_OK)
+    past["data"]["topEventsV2"]["events"]["85324875"]["startTime"] = 1700000000000
+    async with _client(past) as client:
+        scraper = BetanoScraper(client, mode="prematch")
+        snaps = [s async for s in scraper.fetch_live_soccer()]
+    assert snaps == []
+
+    # Future start but flagged live → in-play.
+    live = copy.deepcopy(_PREMATCH_OK)
+    live["data"]["topEventsV2"]["events"]["85324875"]["liveNow"] = True
+    async with _client(live) as client:
+        scraper = BetanoScraper(client, mode="prematch")
+        snaps = [s async for s in scraper.fetch_live_soccer()]
+    assert snaps == []
 
 
 # ---- contract errors ----

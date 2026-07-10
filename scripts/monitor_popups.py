@@ -177,8 +177,10 @@ async def main() -> int:
                     rec = await _sample(platform, page, phrases, started)
                     with log_path.open("a") as fh:
                         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    flag = "🚫 LOCKOUT" if rec.get("blocked") else (
-                        "modal" if rec.get("dialogs") else "clear"
+                    flag = (
+                        "🚫 LOCKOUT"
+                        if rec.get("blocked")
+                        else ("modal" if rec.get("dialogs") else "clear")
                     )
                     err = f" ERR:{rec['error']}" if rec.get("error") else ""
                     print(

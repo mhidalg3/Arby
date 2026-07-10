@@ -60,9 +60,7 @@ class CircuitOpenError(RuntimeError):
     def __init__(self, platform: str, retry_after_sec: float) -> None:
         self.platform = platform
         self.retry_after_sec = retry_after_sec
-        super().__init__(
-            f"{platform}: circuit OPEN, ~{retry_after_sec:.0f}s until retry"
-        )
+        super().__init__(f"{platform}: circuit OPEN, ~{retry_after_sec:.0f}s until retry")
 
 
 # Statuses that indicate we're being rate-limited / blocked (as opposed
@@ -147,9 +145,7 @@ class RateLimitGuard:
             return 0.0
         return max(0.0, self._open_until - self.now_fn())
 
-    async def get(
-        self, send: Callable[[], Awaitable[httpx.Response]]
-    ) -> httpx.Response:
+    async def get(self, send: Callable[[], Awaitable[httpx.Response]]) -> httpx.Response:
         """Run `send()` under the circuit breaker.
 
         - If the circuit is OPEN and still cooling: raise
@@ -195,13 +191,9 @@ class RateLimitGuard:
         self._consecutive_failures = 0
         self._trips = 0
 
-    def _record_failure(
-        self, status: int | None, headers: Mapping[str, str]
-    ) -> None:
+    def _record_failure(self, status: int | None, headers: Mapping[str, str]) -> None:
         self._consecutive_failures += 1
-        immediate = (
-            status is not None and status in self.policy.immediate_open_statuses
-        )
+        immediate = status is not None and status in self.policy.immediate_open_statuses
         threshold_hit = self._consecutive_failures >= self.policy.failure_threshold
         # A probe failing in HALF_OPEN always re-opens.
         half_open_probe_failed = self.state is CircuitState.HALF_OPEN
@@ -216,9 +208,7 @@ class RateLimitGuard:
 
         self._open(status=status, headers=headers, immediate=immediate)
 
-    def _open(
-        self, status: int | None, headers: Mapping[str, str], immediate: bool
-    ) -> None:
+    def _open(self, status: int | None, headers: Mapping[str, str], immediate: bool) -> None:
         self._trips += 1
         # Exponential backoff on repeated trips.
         cooldown = min(

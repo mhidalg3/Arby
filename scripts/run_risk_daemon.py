@@ -98,9 +98,7 @@ def _build_policy() -> RiskPolicy:
             "RISK_HIGH_MARGIN_WARNING_PCT", defaults.high_margin_warning_pct
         ),
         min_distinct_platforms=int(
-            os.environ.get(
-                "RISK_MIN_DISTINCT_PLATFORMS", defaults.min_distinct_platforms
-            )
+            os.environ.get("RISK_MIN_DISTINCT_PLATFORMS", defaults.min_distinct_platforms)
         ),
         min_confidence=_read_float_env("RISK_MIN_CONFIDENCE", defaults.min_confidence),
         # `max_total_stake_ars` was removed when stake sizing moved

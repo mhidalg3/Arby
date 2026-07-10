@@ -113,9 +113,7 @@ class TestOuGoals:
         self, platform: str, raw_market_name: str, expected_line: float
     ) -> None:
         result = resolve_market(platform, raw_market_name)
-        assert result == CanonicalMarket(
-            code=CanonicalMarketCode.OU_GOALS, line=expected_line
-        )
+        assert result == CanonicalMarket(code=CanonicalMarketCode.OU_GOALS, line=expected_line)
 
     @pytest.mark.parametrize(
         ("platform", "raw_market_name"),
@@ -129,9 +127,7 @@ class TestOuGoals:
             ("bplay-pba", "Más de / Menos de 0"),
         ],
     )
-    def test_integer_lines_rejected_push_lines(
-        self, platform: str, raw_market_name: str
-    ) -> None:
+    def test_integer_lines_rejected_push_lines(self, platform: str, raw_market_name: str) -> None:
         """Integer lines are PUSH lines — total goals = N refunds both
         sides. {OVER, UNDER} on a push line isn't a clean partition;
         treating it as one would let the detector emit false arbs."""

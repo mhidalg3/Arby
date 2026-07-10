@@ -154,9 +154,7 @@ class FixtureResolver:
         # existing canonical fixtures via outcome-label match.
         return await self._resolve_non_anchor(snapshot)
 
-    async def _resolve_anchor(
-        self, snapshot: RawOddsSnapshot
-    ) -> CanonicalFixture | None:
+    async def _resolve_anchor(self, snapshot: RawOddsSnapshot) -> CanonicalFixture | None:
         parts = self._split_event_name(snapshot)
         if parts is None:
             return None
@@ -183,9 +181,7 @@ class FixtureResolver:
         # No match — create a new canonical fixture.
         return self._register_new(snapshot, home_n, away_n, is_reserve)
 
-    async def _resolve_non_anchor(
-        self, snapshot: RawOddsSnapshot
-    ) -> CanonicalFixture | None:
+    async def _resolve_non_anchor(self, snapshot: RawOddsSnapshot) -> CanonicalFixture | None:
         """Betsson and any other platform without a parsable home/away in
         raw_event_name. Its slug carries BOTH team names (no reliable order
         or split), so we link by requiring both of a candidate fixture's
@@ -214,9 +210,7 @@ class FixtureResolver:
 
     # ---- internals ----
 
-    def _split_event_name(
-        self, snapshot: RawOddsSnapshot
-    ) -> tuple[str, str] | None:
+    def _split_event_name(self, snapshot: RawOddsSnapshot) -> tuple[str, str] | None:
         sep = _ANCHOR_SEPARATORS.get(snapshot.platform)
         if sep is None:
             return None
@@ -294,12 +288,8 @@ class FixtureResolver:
             return False
         return abs(last - observed_at) <= OBSERVATION_WINDOW_SEC
 
-    def _link(
-        self, snapshot: RawOddsSnapshot, fixture_id: str
-    ) -> CanonicalFixture:
-        self._by_platform_key[(snapshot.platform, snapshot.platform_event_id)] = (
-            fixture_id
-        )
+    def _link(self, snapshot: RawOddsSnapshot, fixture_id: str) -> CanonicalFixture:
+        self._by_platform_key[(snapshot.platform, snapshot.platform_event_id)] = fixture_id
         self._last_seen[fixture_id] = snapshot.timestamp
         return self._fixtures[fixture_id]
 
@@ -314,8 +304,6 @@ class FixtureResolver:
             is_reserve=is_reserve,
         )
         self._fixtures[fixture_id] = fixture
-        self._by_platform_key[(snapshot.platform, snapshot.platform_event_id)] = (
-            fixture_id
-        )
+        self._by_platform_key[(snapshot.platform, snapshot.platform_event_id)] = fixture_id
         self._last_seen[fixture_id] = snapshot.timestamp
         return fixture

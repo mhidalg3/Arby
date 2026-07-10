@@ -164,9 +164,7 @@ class StreamCacheRefresher:
         """Two-phase lookup. Returns one `FreshQuote` per leg in
         input order."""
         # Pre-flight: identify legs without `platform_outcome_id`.
-        unverifiable = {
-            i for i, leg in enumerate(legs) if not leg.platform_outcome_id
-        }
+        unverifiable = {i for i, leg in enumerate(legs) if not leg.platform_outcome_id}
         results: list[FreshQuote | None] = [None] * len(legs)
         for i in unverifiable:
             results[i] = FreshQuote(
@@ -181,8 +179,7 @@ class StreamCacheRefresher:
         verifiable_indices = [i for i in range(len(legs)) if i not in unverifiable]
         if verifiable_indices:
             hash_fields = [
-                f"{legs[i].platform}:{legs[i].platform_outcome_id}"
-                for i in verifiable_indices
+                f"{legs[i].platform}:{legs[i].platform_outcome_id}" for i in verifiable_indices
             ]
             # redis-py's hmget stub returns `Awaitable[list[Any]] | list[Any]`
             # to share types with the sync client; async returns the awaitable.
@@ -211,9 +208,7 @@ class StreamCacheRefresher:
         # Phase 2: XREVRANGE scan fallback for any legs still
         # unresolved. Typically these are warmup-period legs (sink
         # hasn't HSET them yet) or edge cases.
-        unresolved_indices = [
-            i for i in verifiable_indices if results[i] is None
-        ]
+        unresolved_indices = [i for i in verifiable_indices if results[i] is None]
         if unresolved_indices:
             targets: dict[tuple[str, str], int] = {}
             for i in unresolved_indices:
@@ -392,9 +387,7 @@ class QuoteVerifier:
             )
 
         # STALE_DATA: oldest fresh quote exceeds max age.
-        ages = [
-            now - (fq.observed_at or 0.0) for fq in fresh if fq.observed_at is not None
-        ]
+        ages = [now - (fq.observed_at or 0.0) for fq in fresh if fq.observed_at is not None]
         oldest = max(ages) if ages else float("inf")
         if oldest > self.policy.max_freshness_age_sec:
             return VerificationResult(
@@ -413,9 +406,7 @@ class QuoteVerifier:
             )
 
         # All legs have fresh odds. Recompute the overround.
-        fresh_overround = sum(
-            1.0 / fq.decimal_odds for fq in fresh if fq.decimal_odds is not None
-        )
+        fresh_overround = sum(1.0 / fq.decimal_odds for fq in fresh if fq.decimal_odds is not None)
         fresh_margin_pct = (1.0 - fresh_overround) * 100.0
         margin_delta_pct = opp.margin_pct - fresh_margin_pct
         fully_tier_2 = all(fq.tier == 2 for fq in fresh)

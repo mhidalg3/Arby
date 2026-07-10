@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
+
+import pytest
+import structlog
+import structlog.testing
 
 from src.arbitrage.dutch_book import detect_arbitrage
 from src.arbitrage.quotes import OddsQuote
@@ -768,7 +773,7 @@ async def test_reauth_retry_completes_arb() -> None:
     res = await ex.execute_n_leg("opp", list(_arb_three_bw_last()))
     assert res.outcome is ExecutionOutcome.COMPLETED
     assert reauth.calls == 1
-    assert any("re-authenticating BetWarrior" in t for t in n.sent)
+    assert any("re-authenticating betwarrior-pba" in t for t in n.sent)
     assert any("COMPLETE" in t for t in n.sent)
 
 
@@ -864,3 +869,355 @@ async def test_non_auth_reject_does_not_reauth() -> None:
     res = await ex.execute_n_leg("opp", list(_arb_betsson_bw()))
     assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
     assert reauth.calls == 0  # never re-authed on a non-auth reject
+
+
+# ---- odds-change recapture (salvage a reject / pre-place drift) ----
+
+
+class _ScriptedPlacer:
+    """place() follows a scripted list of outcomes (one per call), recording the legs.
+
+    Each script entry is either the string ``"accept"`` or a dict of PlacementResult
+    kwargs (``accepted`` defaults to False). The last entry repeats for further calls.
+    Used to drive the recapture paths: an ``odds_rejected`` reject then an accept, a
+    double-reject, a pending_unknown, etc."""
+
+    def __init__(self, scripts: list[object]) -> None:
+        self.scripts = scripts
+        self.calls = 0
+        self.legs: list[Leg] = []
+
+    async def place(self, leg: Leg) -> PlacementResult:
+        self.legs.append(leg)
+        i = self.calls
+        self.calls += 1
+        s = self.scripts[min(i, len(self.scripts) - 1)]
+        if s == "accept":
+            return PlacementResult(
+                accepted=True, stake_filled=leg.stake_ars, odds_filled=leg.odds, ref=f"r{i}"
+            )
+        assert isinstance(s, dict)
+        return PlacementResult(accepted=False, **s)  # type: ignore[arg-type]
+
+
+def _revalidate_passthrough(seen: list[tuple[list[Leg], list[float]]] | None = None):
+    """Re-price at fresh odds keeping stakes (identity preserved) — the profitability
+    math is exercised in test_stake_allocator / test_arb_executor; here we only drive
+    the executor's recapture dispatch."""
+
+    def revalidate(legs: list[Leg], odds: list[float], caps: list[float | None]) -> list[Leg]:
+        if seen is not None:
+            seen.append((list(legs), list(odds)))
+        return [replace(leg, odds=o) for leg, o in zip(legs, odds, strict=True)]
+
+    return revalidate
+
+
+def _residual_passthrough(seen: list[tuple[int, list[Leg]]] | None = None):
+    """Re-price the remaining suffix at fresh odds keeping stakes (identity preserved)."""
+
+    def residual(
+        placed: list[PlacementResult],
+        remaining: list[Leg],
+        odds: list[float],
+        caps: list[float | None],
+    ) -> list[Leg]:
+        if seen is not None:
+            seen.append((len(placed), list(remaining)))
+        return [replace(leg, odds=o) for leg, o in zip(remaining, odds, strict=True)]
+
+    return residual
+
+
+async def test_leg_a_odds_rejected_recaptures_via_revalidate() -> None:
+    """Leg A odds_rejected (Kambi invalid-odds) → recapture re-prices ALL legs via
+    ``revalidate`` (leg A == full re-price) → re-POST accepted → COMPLETED. Leg A is
+    placed exactly twice (reject + recapture re-place)."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer([{"odds_rejected": True, "detail": "x"}, "accept", "accept"])
+    seen: list[tuple[list[Leg], list[float]]] = []
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_legs()), revalidate=_revalidate_passthrough(seen))
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert sum(1 for leg in placer.legs if leg.outcome == "home") == 2  # leg A placed twice
+    assert any("RE-PRICED" in t for t in n.sent)
+    assert seen and all(len(s[0]) == 2 for s in seen)  # recapture saw all legs
+
+
+async def test_leg_b_odds_rejected_recaptures_via_residual() -> None:
+    """Leg B odds_rejected after leg A filled → ``residual`` called with the one placed
+    fill and the one remaining leg → re-sized B re-POSTed → COMPLETED (no naked)."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer(["accept", {"odds_rejected": True, "detail": "x"}, "accept"])
+    seen: list[tuple[int, list[Leg]]] = []
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=_residual_passthrough(seen))
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert placer.calls == 3  # A accept + B reject + B re-place
+    assert seen and seen[0][0] == 1 and len(seen[0][1]) == 1  # 1 placed, 1 remaining
+    assert any("RE-PRICED" in t for t in n.sent)
+
+
+async def test_leg_b_pre_place_drift_recaptured_via_residual() -> None:
+    """Leg B drifts beyond tolerance at pre-place reverify (leg A already live) →
+    recapture via ``residual`` salvages it → COMPLETED instead of naked."""
+    g, n = _guard(), _FakeNotifier()
+    state = {"n": 0}
+
+    async def reverify(leg: Leg) -> float:
+        state["n"] += 1
+        return leg.odds * 0.9 if state["n"] == 4 else leg.odds  # leg B pre-place drift
+
+    ex = _executor(g, n, _FakeRecovery(), _CountingPlacer(), reverify)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=_residual_passthrough())
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert any("RE-PRICED" in t for t in n.sent)
+
+
+async def test_leg_b_pre_place_drift_residual_none_is_naked() -> None:
+    """Same drift, but the residual solver finds no salvageable hedge → today's NAKED
+    EXPOSURE with the unchanged drift message (recapture refused, not suppressed)."""
+    g, n = _guard(), _FakeNotifier()
+    state = {"n": 0}
+
+    async def reverify(leg: Leg) -> float:
+        state["n"] += 1
+        return leg.odds * 0.9 if state["n"] == 4 else leg.odds
+
+    def residual_none(placed, remaining, odds, caps):  # type: ignore[no-untyped-def]
+        return None
+
+    ex = _executor(g, n, _FakeRecovery(), _CountingPlacer(), reverify)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=residual_none)
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert any("NAKED" in t for t in n.sent)
+
+
+async def test_second_odds_reject_same_leg_aborts() -> None:
+    """Per-leg bound (recaptured keyed by INDEX): leg A rejects twice — the first
+    triggers one recapture, the second is NOT eligible (index already recaptured) →
+    abort, exactly two place calls on leg A."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer(
+        [{"odds_rejected": True, "detail": "x"}, {"odds_rejected": True, "detail": "x"}]
+    )
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_legs()), revalidate=_revalidate_passthrough())
+    assert res.outcome is ExecutionOutcome.ABORTED
+    assert placer.calls == 2  # leg A twice; second reject not eligible
+
+
+async def test_second_odds_reject_same_leg_is_naked() -> None:
+    """Same bound on a later leg: leg B rejects twice after leg A is live → the second
+    is not eligible → NAKED EXPOSURE, leg B placed exactly twice."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer(
+        ["accept", {"odds_rejected": True, "detail": "x"}, {"odds_rejected": True, "detail": "x"}]
+    )
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=_residual_passthrough())
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert placer.calls == 3  # A + B×2
+    assert sum(1 for leg in placer.legs if leg.outcome == "away") == 2
+
+
+async def test_independent_recapture_per_leg_index() -> None:
+    """``recaptured`` is keyed by leg INDEX: legs B and C each odds-reject once and
+    each recapture independently → COMPLETED with two residual calls."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer(
+        [
+            "accept",
+            {"odds_rejected": True, "detail": "x"},
+            "accept",
+            {"odds_rejected": True, "detail": "x"},
+            "accept",
+        ]
+    )
+    seen: list[tuple[int, list[Leg]]] = []
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_three_legs()), residual=_residual_passthrough(seen))
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert len(seen) == 2  # leg B (index 1) and leg C (index 2) each recaptured once
+
+
+async def test_recapture_unverifiable_odds_is_naked() -> None:
+    """Recapture refetch of leg B returns the 0.0 unverifiable sentinel → recapture
+    refuses → NAKED EXPOSURE (leg A live), no re-POST."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer(["accept", {"odds_rejected": True, "detail": "x"}])
+    state = {"n": 0}
+
+    async def reverify(leg: Leg) -> float:
+        state["n"] += 1
+        return 0.0 if state["n"] == 5 else leg.odds  # recapture refetch of leg B fails
+
+    ex = _executor(g, n, _FakeRecovery(), placer, reverify)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=_residual_passthrough())
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert placer.calls == 2  # A accept + B reject; recapture unverifiable, no re-POST
+
+
+async def test_recapture_guardrail_reject_is_naked() -> None:
+    """A re-sized stake that blows past the per-match cap → check_leg denies the
+    recaptured leg → NAKED EXPOSURE, no re-POST."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer(["accept", {"odds_rejected": True, "detail": "x"}])
+
+    def residual_over_cap(placed, remaining, odds, caps):  # type: ignore[no-untyped-def]
+        return [replace(remaining[0], stake_ars=999_999.0, odds=odds[0])]
+
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=residual_over_cap)
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert placer.calls == 2
+
+
+async def test_pending_unknown_never_recaptures_even_if_odds_rejected() -> None:
+    """A submitted-but-unconfirmed bet is NEVER re-POSTed: pending_unknown routes to
+    PENDING_UNKNOWN before the odds-reject recapture gate, even when both flags set."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer([{"pending_unknown": True, "odds_rejected": True, "detail": "x"}])
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=_residual_passthrough())
+    assert res.outcome is ExecutionOutcome.PENDING_UNKNOWN
+    assert placer.calls == 1  # never re-POSTed
+
+
+async def test_non_odds_reject_does_not_recapture() -> None:
+    """A reject without odds_rejected (suspended outcome, stake limit) never recaptures
+    — today's naked runs unchanged."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _CountingPlacer(reject_index=1)  # odds_rejected defaults False
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=_residual_passthrough())
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert placer.calls == 2
+
+
+async def test_recapture_guardrail_cumulative_suffix_reject_is_naked() -> None:
+    """A multi-leg suffix re-price where each leg fits the per-match cap on its own,
+    but the CUMULATIVE suffix (placed + B + C) breaches it, must be rejected — so a
+    later leg can't walk into a cap breach the per-leg check missed (fail-closed)."""
+    g = _guard(max_position_per_match_ars=1000.0)
+    n = _FakeNotifier()
+    legs = [
+        Leg("betsson", "m1", "1X2", "home", 300.0, 3.0),
+        Leg("betano", "m1", "1X2", "draw", 60.0, 3.1, live_max_stake_ars=5000.0),
+        Leg("betwarrior", "m1", "1X2", "away", 60.0, 3.2),
+    ]
+    placer = _ScriptedPlacer(["accept", {"odds_rejected": True, "detail": "x"}])
+    residual_calls = {"n": 0}
+
+    def residual(placed, remaining, odds, caps):  # type: ignore[no-untyped-def]
+        residual_calls["n"] += 1
+        # B and C each fit under the 1000 cap given A's 300 (300+500=800), but
+        # 300+500+500 = 1300 breaches it cumulatively → C must be rejected.
+        return [
+            replace(remaining[0], stake_ars=500.0, odds=odds[0]),
+            replace(remaining[1], stake_ars=500.0, odds=odds[1]),
+        ]
+
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", legs, residual=residual)
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE  # A live; recapture refused
+    assert residual_calls["n"] == 1  # recapture ran, then the suffix failed the guardrail
+
+
+async def test_no_residual_keeps_naked_on_drift() -> None:
+    """Without a residual callback, a mid-sequence drift keeps today's naked behavior
+    (regression guard: the default-None path is unchanged)."""
+    g = _guard()
+    state = {"n": 0}
+
+    async def reverify(leg: Leg) -> float:
+        state["n"] += 1
+        return leg.odds * 0.9 if state["n"] == 4 else leg.odds
+
+    ex = _executor(g, _FakeNotifier(), _FakeRecovery(), _CountingPlacer(), reverify)
+    res = await ex.execute_n_leg("o", list(_legs()))  # no residual=
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+
+
+async def test_revalidate_identity_drift_aborts() -> None:
+    """A malformed revalidate that changes a routing field (platform_outcome_id) is
+    caught by the phase-2 identity guard → ABORTED, nothing placed (fail closed)."""
+    g, n = _guard(), _FakeNotifier()
+
+    def revalidate(legs, odds, caps):  # type: ignore[no-untyped-def]
+        out = [replace(lg, odds=o) for lg, o in zip(legs, odds, strict=True)]
+        return [replace(out[0], platform_outcome_id="WRONG-SEL"), *out[1:]]
+
+    ex = _executor(g, n, _FakeRecovery(), _CountingPlacer())
+    res = await ex.execute_n_leg("o", list(_legs()), revalidate=revalidate)
+    assert res.outcome is ExecutionOutcome.ABORTED
+    assert "book/selection identity" in (res.reason or "")
+
+
+async def test_recapture_residual_identity_drift_is_naked() -> None:
+    """A malformed residual that swaps a leg's outcome is caught by the recapture
+    identity guard → recapture refuses → NAKED EXPOSURE (leg A live), no re-POST."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _ScriptedPlacer(["accept", {"odds_rejected": True, "detail": "x"}])
+
+    def residual_swap_outcome(placed, remaining, odds, caps):  # type: ignore[no-untyped-def]
+        return [replace(remaining[0], outcome="WRONG", odds=odds[0])]
+
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    res = await ex.execute_n_leg("o", list(_legs()), residual=residual_swap_outcome)
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert placer.calls == 2  # A accept + B reject; malformed recapture, no re-POST
+
+
+# ---- per-leg placement telemetry (executor.leg_placement) ----
+
+
+async def test_leg_placement_telemetry_emits_full_odds_ladder_per_attempt() -> None:
+    """One executor.leg_placement event per placement attempt, carrying the full odds
+    ladder (detected/preflight/preplace/odds_requested/odds_filled) + stake/ref, with
+    detail absent on an accepted leg. The stepped reverifier moves odds ~0.5% below
+    detection (within the 1% tolerance) so the ladder stages are distinct."""
+    g, n = _guard(), _FakeNotifier()
+
+    async def stepped_reverify(leg: Leg) -> float:
+        return leg.odds * 0.995
+
+    ex = _executor(g, n, _FakeRecovery(), DryRunPlacer(), reverify=stepped_reverify)
+    legs = _legs()  # betsson 2.0, betwarrior 2.1
+    with structlog.testing.capture_logs() as cap:
+        res = await ex.execute_n_leg("opp1", list(legs))
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    placements = [e for e in cap if e["event"] == "executor.leg_placement"]
+    assert len(placements) == 2  # one per leg
+    a, b = placements
+    # Leg A: detected 2.0 → preflight/preplace 1.99 (within tolerance), plain placer.
+    assert a["leg"] == "A" and a["platform"] == "betsson"
+    assert a["detected_odds"] == 2.0
+    assert a["preflight_odds"] == pytest.approx(1.99, rel=1e-6)
+    assert a["preplace_odds"] == pytest.approx(1.99, rel=1e-6)
+    assert a["odds_requested"] == pytest.approx(1.99, rel=1e-6)  # plain placer → attempted
+    assert a["server_valid_odds"] is None  # no Betsson correction
+    assert a["accepted"] is True
+    assert a["stake_filled"] == 100.0 and a["odds_filled"] == pytest.approx(1.99, rel=1e-6)
+    assert a["ref"] == "dry-run"
+    assert a["detail"] is None  # accepted → no detail
+    # Leg B: detected 2.1, also moved and placed.
+    assert b["leg"] == "B" and b["platform"] == "betwarrior"
+    assert b["detected_odds"] == 2.1
+    assert b["accepted"] is True
+
+
+async def test_leg_placement_telemetry_carries_detail_only_on_reject() -> None:
+    """An accepted leg emits detail=None; a rejected leg emits accepted=False + its
+    detail. The rejected leg's event still fires (the attempt happened)."""
+    g, n = _guard(), _FakeNotifier()
+    placer = _CountingPlacer(reject_index=1)  # leg B rejected
+    ex = _executor(g, n, _FakeRecovery(), placer)
+    with structlog.testing.capture_logs() as cap:
+        res = await ex.execute_n_leg("opp1", list(_legs()))
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    placements = [e for e in cap if e["event"] == "executor.leg_placement"]
+    assert len(placements) == 2
+    assert placements[0]["accepted"] is True and placements[0]["detail"] is None
+    assert placements[1]["accepted"] is False
+    assert placements[1]["detail"] == "rejected by book"

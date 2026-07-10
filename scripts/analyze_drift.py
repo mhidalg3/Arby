@@ -115,9 +115,7 @@ def _summarize(values: Iterable[float], *, signed: bool) -> dict[str, float]:
 
 def _decode(raw: dict[Any, Any]) -> dict[str, str]:
     return {
-        (k.decode() if isinstance(k, bytes) else k): (
-            v.decode() if isinstance(v, bytes) else v
-        )
+        (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
         for k, v in raw.items()
     }
 
@@ -256,8 +254,10 @@ def _render_report(
     print()
 
     print("--- Per-platform |odds drift| (signed mean shows direction) ---")
-    print(f"  {'platform':<18} {'legs':>6} {'|median|':>10} {'|p95|':>10} "
-          f"{'|max|':>10} {'signed mean':>14} {'stdev':>10} {'missing':>9}")
+    print(
+        f"  {'platform':<18} {'legs':>6} {'|median|':>10} {'|p95|':>10} "
+        f"{'|max|':>10} {'signed mean':>14} {'stdev':>10} {'missing':>9}"
+    )
     for platform in sorted(per_platform_drift.keys() | per_platform_missing.keys()):
         drifts = per_platform_drift.get(platform, [])
         signed = _summarize(drifts, signed=True)
@@ -276,8 +276,10 @@ def _render_report(
     print()
 
     print("--- Per-(platform, market) |odds drift| ---")
-    print(f"  {'platform':<18} {'market_id':<26} {'n':>5} "
-          f"{'|median|':>10} {'|p95|':>10} {'|max|':>10}")
+    print(
+        f"  {'platform':<18} {'market_id':<26} {'n':>5} "
+        f"{'|median|':>10} {'|p95|':>10} {'|max|':>10}"
+    )
     for (platform, market_id), drifts in sorted(per_platform_market_drift.items()):
         if not drifts:
             continue
@@ -340,22 +342,14 @@ async def main() -> int:
         else:
             in_play.append((entry_id, raw_fields))
 
-    kickoff_iso = (
-        datetime.fromtimestamp(kickoff_epoch, tz=UTC)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    kickoff_iso = datetime.fromtimestamp(kickoff_epoch, tz=UTC).isoformat().replace("+00:00", "Z")
     print(f"Partition: kickoff = {kickoff_iso} (epoch {kickoff_epoch:.0f})")
     print(
         f"           pre-match = {len(pre_match):,}   "
         f"in-play = {len(in_play):,}   skipped = {skipped:,}"
     )
-    _render_report(
-        pre_match, label=f"PRE-MATCH (< {kickoff_iso})", stream_name=stream_name
-    )
-    _render_report(
-        in_play, label=f"IN-PLAY (≥ {kickoff_iso})", stream_name=stream_name
-    )
+    _render_report(pre_match, label=f"PRE-MATCH (< {kickoff_iso})", stream_name=stream_name)
+    _render_report(in_play, label=f"IN-PLAY (≥ {kickoff_iso})", stream_name=stream_name)
     return 0
 
 

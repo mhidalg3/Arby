@@ -111,9 +111,7 @@ class TestBetssonQuoteRefresher:
 
     async def test_scraper_error_raises(self) -> None:
         scraper = AsyncMock()
-        scraper.fetch_event_quotes = AsyncMock(
-            side_effect=BetssonContractError("simulated")
-        )
+        scraper.fetch_event_quotes = AsyncMock(side_effect=BetssonContractError("simulated"))
         refresher = BetssonQuoteRefresher(scraper=scraper)
         leg = _leg("betsson-pba", "f-evt", "out-1")
         with pytest.raises(BetssonContractError):
@@ -170,9 +168,7 @@ class TestBetWarriorQuoteRefresher:
 
     async def test_scraper_error_raises(self) -> None:
         scraper = AsyncMock()
-        scraper.fetch_event_quotes = AsyncMock(
-            side_effect=BetWarriorContractError("simulated")
-        )
+        scraper.fetch_event_quotes = AsyncMock(side_effect=BetWarriorContractError("simulated"))
         refresher = BetWarriorQuoteRefresher(scraper=scraper)
         leg = _leg("betwarrior-pba", "kambi-1", "kambi-out-1")
         with pytest.raises(BetWarriorContractError):
@@ -256,9 +252,7 @@ class TestMultiPlatformDispatch:
         tier_1 = AsyncMock()
         tier_1.refresh_batch = AsyncMock()
 
-        multi = MultiPlatformRefresher(
-            per_platform={"betsson-pba": tier_2}, tier_1_fallback=tier_1
-        )
+        multi = MultiPlatformRefresher(per_platform={"betsson-pba": tier_2}, tier_1_fallback=tier_1)
         leg = _leg("betsson-pba", "f-evt", "out-1")
         results = await multi.refresh_batch([leg])
         assert len(results) == 1
@@ -283,9 +277,7 @@ class TestMultiPlatformDispatch:
                 )
             ]
         )
-        multi = MultiPlatformRefresher(
-            per_platform={"betsson-pba": tier_2}, tier_1_fallback=tier_1
-        )
+        multi = MultiPlatformRefresher(per_platform={"betsson-pba": tier_2}, tier_1_fallback=tier_1)
         leg = _leg("betsson-pba", "f-evt", "out-1")
         results = await multi.refresh_batch([leg])
         assert len(results) == 1
@@ -319,9 +311,7 @@ class TestMultiPlatformDispatch:
                 )
             ]
         )
-        multi = MultiPlatformRefresher(
-            per_platform={"bplay-pba": tier_2}, tier_1_fallback=tier_1
-        )
+        multi = MultiPlatformRefresher(per_platform={"bplay-pba": tier_2}, tier_1_fallback=tier_1)
         leg = _leg("bplay-pba", "bp-evt", "bp-out")
         results = await multi.refresh_batch([leg])
         assert results[0].tier == 1
@@ -342,9 +332,7 @@ class TestMultiPlatformDispatch:
                 )
             ]
         )
-        multi = MultiPlatformRefresher(
-            per_platform={"betsson-pba": tier_2}, tier_1_fallback=tier_1
-        )
+        multi = MultiPlatformRefresher(per_platform={"betsson-pba": tier_2}, tier_1_fallback=tier_1)
         leg = _leg("betsson-pba", platform_event_id=None, platform_outcome_id=None)
         results = await multi.refresh_batch([leg])
         # Tier-1 was called; Tier-2 was skipped
@@ -386,9 +374,7 @@ class TestMultiPlatformDispatch:
         )
         bw_t2.platform_name = "betwarrior-pba"
         bp_t2 = AsyncMock()
-        bp_t2.refresh = AsyncMock(
-            return_value=FreshQuote("bplay-pba", "c", 3.10, time.time(), 2)
-        )
+        bp_t2.refresh = AsyncMock(return_value=FreshQuote("bplay-pba", "c", 3.10, time.time(), 2))
         bp_t2.platform_name = "bplay-pba"
 
         multi = MultiPlatformRefresher(

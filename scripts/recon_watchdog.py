@@ -51,9 +51,7 @@ RAW_SAMPLE_COUNT: Final[int] = 5_000
 
 
 def _iso_now() -> str:
-    return (
-        datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-    )
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _emit(level: str, msg: str) -> None:
@@ -89,11 +87,7 @@ async def _check_raw_growth(
         _alert("odds:raw empty (sink not writing or stream cleared)")
         return
     entry_id_raw, _fields = entries[0]
-    entry_id = (
-        entry_id_raw.decode()
-        if isinstance(entry_id_raw, bytes)
-        else entry_id_raw
-    )
+    entry_id = entry_id_raw.decode() if isinstance(entry_id_raw, bytes) else entry_id_raw
     ms_part = entry_id.split("-", 1)[0]
     try:
         latest_ts = int(ms_part) / 1000.0
@@ -101,10 +95,7 @@ async def _check_raw_growth(
         return
     age = time.time() - latest_ts
     if age > 60.0:
-        _alert(
-            f"odds:raw most-recent entry is {age:.0f}s old "
-            f"(sink stopped writing)"
-        )
+        _alert(f"odds:raw most-recent entry is {age:.0f}s old (sink stopped writing)")
 
 
 async def _check_per_platform_freshness(
@@ -119,6 +110,7 @@ async def _check_per_platform_freshness(
 
     Returns the per-platform max timestamp dict."""
     import json as _json
+
     per_platform_max: dict[str, float] = defaultdict(float)
     cursor = 0
     while True:
@@ -144,29 +136,18 @@ async def _check_per_platform_freshness(
     # `EXCLUDE_PLATFORMS` (comma-separated) lets the operator silence
     # alerts for platforms intentionally not running (e.g. Bplay
     # disabled during a rate-limit cool-down).
-    excluded = {
-        p.strip()
-        for p in os.environ.get("EXCLUDE_PLATFORMS", "").split(",")
-        if p.strip()
-    }
+    excluded = {p.strip() for p in os.environ.get("EXCLUDE_PLATFORMS", "").split(",") if p.strip()}
     expected_platforms = tuple(
-        p for p in ("betsson-pba", "betwarrior-pba", "bplay-pba")
-        if p not in excluded
+        p for p in ("betsson-pba", "betwarrior-pba", "bplay-pba") if p not in excluded
     )
     for platform in expected_platforms:
         last_ts = per_platform_max.get(platform, 0)
         if last_ts <= 0:
-            _alert(
-                f"{platform}: NO snapshots in odds:latest hash "
-                f"(scraper down or never started?)"
-            )
+            _alert(f"{platform}: NO snapshots in odds:latest hash (scraper down or never started?)")
             continue
         age = now - last_ts
         if age > stall_sec:
-            _alert(
-                f"{platform}: most-recent snapshot is {age:.0f}s old "
-                f"(threshold {stall_sec}s)"
-            )
+            _alert(f"{platform}: most-recent snapshot is {age:.0f}s old (threshold {stall_sec}s)")
     return dict(per_platform_max)
 
 
@@ -236,18 +217,13 @@ async def _check_target_match(
             )
     else:
         if state.get("target_zero_cycles", 0) > 0:
-            _info(
-                f"target match present again ({hits} hits in last "
-                f"{RAW_SAMPLE_COUNT} entries)"
-            )
+            _info(f"target match present again ({hits} hits in last {RAW_SAMPLE_COUNT} entries)")
         state["target_zero_cycles"] = 0
 
 
 async def main() -> int:
     settings = get_settings()
-    interval_sec = int(
-        os.environ.get("CHECK_INTERVAL_SEC", str(DEFAULT_CHECK_INTERVAL_SEC))
-    )
+    interval_sec = int(os.environ.get("CHECK_INTERVAL_SEC", str(DEFAULT_CHECK_INTERVAL_SEC)))
     stall_sec = int(os.environ.get("STALL_SEC", str(DEFAULT_STALL_SEC)))
     target_raw = os.environ.get("WATCHDOG_TARGET_MATCH", "").strip().lower()
     target_substrings = tuple(s.strip() for s in target_raw.split("|") if s.strip())
@@ -265,9 +241,7 @@ async def main() -> int:
             await asyncio.sleep(interval_sec)
             try:
                 # Sample the recent tail once; reuse across checks.
-                entries = await client.xrevrange(
-                    "odds:raw", "+", "-", count=RAW_SAMPLE_COUNT
-                )
+                entries = await client.xrevrange("odds:raw", "+", "-", count=RAW_SAMPLE_COUNT)
             except Exception as exc:
                 _alert(f"redis read failed: {exc}")
                 continue

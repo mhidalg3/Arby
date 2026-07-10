@@ -100,9 +100,7 @@ class TestCrossPlatformDedup:
     async def test_betwarrior_then_bplay_same_teams_links_same_fixture(self) -> None:
         r = FixtureResolver()
         bw = _snap("betwarrior-pba", "k-1", "LDU Quito - Always Ready", timestamp=1000.0)
-        bp = _snap(
-            "bplay-pba", "b-1", "LDU Quito vs Always Ready", timestamp=1003.0
-        )
+        bp = _snap("bplay-pba", "b-1", "LDU Quito vs Always Ready", timestamp=1003.0)
         f1 = await r.resolve(bw)
         f2 = await r.resolve(bp)
         assert f1 is not None
@@ -122,9 +120,7 @@ class TestCrossPlatformDedup:
         cross-platform arb detection on this team."""
         r = FixtureResolver()
         bp = _snap("bplay-pba", "b-1", "Mirassol FC SP vs Always Ready", timestamp=1000.0)
-        bw = _snap(
-            "betwarrior-pba", "k-1", "Mirassol-SP - Always Ready", timestamp=1003.0
-        )
+        bw = _snap("betwarrior-pba", "k-1", "Mirassol-SP - Always Ready", timestamp=1003.0)
         f1 = await r.resolve(bp)
         f2 = await r.resolve(bw)
         assert f1 is not None
@@ -136,11 +132,11 @@ class TestCrossPlatformDedup:
         `Belgrano Reserves` are different teams; the fuzzy match
         must NOT conflate them."""
         r = FixtureResolver()
-        first = _snap(
-            "betwarrior-pba", "k-1", "Belgrano - Quilmes", timestamp=1000.0
-        )
+        first = _snap("betwarrior-pba", "k-1", "Belgrano - Quilmes", timestamp=1000.0)
         reserves = _snap(
-            "bplay-pba", "b-1", "Belgrano Reserves vs Quilmes Reserves",
+            "bplay-pba",
+            "b-1",
+            "Belgrano Reserves vs Quilmes Reserves",
             timestamp=1003.0,
         )
         f1 = await r.resolve(first)
@@ -194,7 +190,9 @@ class TestBetssonAnchoring:
     async def test_betsson_links_to_existing_anchor_by_outcome_team(self) -> None:
         r = FixtureResolver()
         # Anchor first via BetWarrior.
-        await r.resolve(_snap("betwarrior-pba", "k-1", "Gimnasia Jujuy - Belgrano", timestamp=1000.0))
+        await r.resolve(
+            _snap("betwarrior-pba", "k-1", "Gimnasia Jujuy - Belgrano", timestamp=1000.0)
+        )
         # Now Betsson snapshot with outcome label = "Belgrano" (the away team).
         bet = _snap("betsson-pba", "f-bet", "gimnasia jujuy belgrano", "Belgrano", timestamp=1002.0)
         f = await r.resolve(bet)
@@ -207,7 +205,9 @@ class TestBetssonAnchoring:
         the fixture without needing the outcome label — the draw cell completes
         the partition in the same cycle instead of waiting for a non-draw snap."""
         r = FixtureResolver()
-        await r.resolve(_snap("betwarrior-pba", "k-1", "Gimnasia Jujuy - Belgrano", timestamp=1000.0))
+        await r.resolve(
+            _snap("betwarrior-pba", "k-1", "Gimnasia Jujuy - Belgrano", timestamp=1000.0)
+        )
         bet = _snap("betsson-pba", "f-bet", "gimnasia jujuy belgrano", "Empate", timestamp=1002.0)
         f = await r.resolve(bet)
         assert f is not None
@@ -319,8 +319,14 @@ class TestReserveAwareMatching:
         )
         # Betsson leaves the names bare; reserve-ness is in the competition slug.
         bet = await r.resolve(
-            _snap("betsson-pba", "f-1", "huracan estudiantes", "Huracan", timestamp=1002.0,
-                  raw_competition="liga profesional de reserva")
+            _snap(
+                "betsson-pba",
+                "f-1",
+                "huracan estudiantes",
+                "Huracan",
+                timestamp=1002.0,
+                raw_competition="liga profesional de reserva",
+            )
         )
         assert ban is not None and bet is not None
         assert ban.fixture_id == bet.fixture_id  # same reserve match, linked
@@ -341,9 +347,15 @@ class TestReserveAwareMatching:
         """A Betsson reserve event must not attach to a registered SENIOR fixture of
         the same teams — the reserve-flag gate blocks the conflation."""
         r = FixtureResolver()
-        await r.resolve(_snap("betano", "k-1", "Huracan vs Estudiantes", timestamp=1000.0))  # senior
+        await r.resolve(
+            _snap("betano", "k-1", "Huracan vs Estudiantes", timestamp=1000.0)
+        )  # senior
         reserve_event = _snap(
-            "betsson-pba", "f-1", "huracan estudiantes", "Huracan", timestamp=1002.0,
+            "betsson-pba",
+            "f-1",
+            "huracan estudiantes",
+            "Huracan",
+            timestamp=1002.0,
             raw_competition="liga profesional de reserva",
         )
         assert await r.resolve(reserve_event) is None  # no SENIOR match for a reserve event

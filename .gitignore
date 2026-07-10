@@ -53,3 +53,4 @@ notebooks/
 # Recon artifacts (large, local, regenerable)
 recon/artifacts/
 recon/profile/
+nohup.out

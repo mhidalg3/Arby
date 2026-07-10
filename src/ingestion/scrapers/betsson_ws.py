@@ -128,6 +128,7 @@ def market_value_to_snapshots(
                 decimal_odds=price,
                 max_stake=None,
                 timestamp=observed_at,
+                transport="push",
             )
         )
     return out
@@ -200,9 +201,7 @@ class BetssonWsScraper(BaseScraper):
         if self._http_client is None:
             self._log.warning("ws.no_discovery_source")
             return []
-        scraper = BetssonScraper(
-            self._http_client, soccer_slug_prefixes=self._soccer_slug_prefixes
-        )
+        scraper = BetssonScraper(self._http_client, soccer_slug_prefixes=self._soccer_slug_prefixes)
         try:
             fixtures = await scraper._discover_soccer_fixtures()
         except BetssonContractError as exc:
@@ -224,9 +223,7 @@ class BetssonWsScraper(BaseScraper):
             async with connect(
                 _connect_url(), open_timeout=_CONNECT_TIMEOUT_SEC, max_size=_MAX_FRAME_BYTES
             ) as ws:
-                for conv, start in enumerate(
-                    range(0, len(selectors), _SUBSCRIBE_BATCH), start=1
-                ):
+                for conv, start in enumerate(range(0, len(selectors), _SUBSCRIBE_BATCH), start=1):
                     batch = selectors[start : start + _SUBSCRIBE_BATCH]
                     await ws.send(encode_subscribe_frame(conv, *batch))
                 deadline = time.monotonic() + self._stream_duration_sec

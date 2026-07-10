@@ -17,18 +17,24 @@ the kill switch trips. The kill switch gates only *auto-placement*: while it's
 tripped (a cold session, a freeze, a daily-loss stop) the loop keeps detecting and,
 on each found arb, alerts the operator to place it MANUALLY rather than silently
 doing nothing. This is the "notify + manual assist, never stop watching" model.
+The same is true of an APPROVED arb in the high-margin band
+(`RiskDecision.high_margin_warning`): it is alerted and audit-recorded but never
+auto-placed — the operator verifies the quotes are genuine before placing.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Mapping
 from typing import Protocol
 
 import structlog
 
 from src.arbitrage.dutch_book import ArbitrageOpportunity, detect_arbitrage
+from src.arbitrage.garch import AdaptiveThreshold
 from src.arbitrage.quotes import OddsQuote
-from src.execution.arb_executor import execute_opportunity
+from src.execution.arb_executor import execute_opportunity, order_opportunity_for_execution
 from src.execution.audit import AuditRecorder, NullRecorder
 from src.execution.executor import ExecutionResult, Executor
 from src.execution.guardrails import Guardrails
@@ -79,8 +85,10 @@ class ArbOrchestrator:
         dynamic_stake_cap_ars: float | None = None,
         notifier: Notifier | None = None,
         recorder: AuditRecorder | None = None,
+        staleness_rank: Mapping[str, Mapping[str, float]] | None = None,
         empty_alert_after: int = 5,
         platform_stale_after_sec: float = 180.0,
+        adaptive_threshold: AdaptiveThreshold | None = None,
     ) -> None:
         self._quotes = quote_source
         self._risk = risk_evaluator
@@ -105,6 +113,9 @@ class ArbOrchestrator:
         self._executed: set[str] = set()  # market_ids already acted on (dedup)
         self._last_error: str | None = None  # de-dup repeated loop-error alerts
         self._stop = False  # operator stop; the kill switch never stops detection
+        self._staleness_rank = staleness_rank
+        # GARCH adaptive margin threshold; None ⇒ byte-identical static behavior.
+        self._adaptive = adaptive_threshold
         self._log = log.bind(component="orchestrator")
 
     def stop(self) -> None:
@@ -113,61 +124,121 @@ class ArbOrchestrator:
 
     async def run_once(self) -> list[ExecutionResult]:
         """One detection pass over every fresh market. Approved arbs are alerted
-        (and auto-placed when the kill switch is clear; handed off for manual
-        placement when it's tripped). Detection runs regardless of the kill switch.
-        Returns the execution results auto-placed this pass."""
+        (and auto-placed when the kill switch is clear and the margin is below the
+        high-margin band; handed off for manual placement/verification otherwise).
+        Detection runs regardless of the kill switch. Returns the execution results
+        auto-placed this pass."""
         results: list[ExecutionResult] = []
         by_market = await self._quotes.fetch()
+        # GARCH adaptive threshold: evolve σ²_t once per FULL cycle (never on the
+        # trigger path — the recursion needs evenly spaced sampling instants). The
+        # values sampled here may have been refreshed by trigger bursts via the union
+        # cache; the cadence contract governs WHEN we sample, not the provenance.
+        if self._adaptive is not None:
+            spreads_fn = getattr(self._quotes, "cycle_spreads", None)
+            if spreads_fn is not None:
+                self._adaptive.observe_cycle(spreads_fn())
         # Team names for human-readable alerts (duck-typed like `stale_platforms`;
         # the source rebuilds this on every fetch, so it is never stale across cycles).
         market_names: dict[str, tuple[str, str]] = getattr(self._quotes, "market_names", {})
         await self._track_ingestion(len(by_market))
         await self._track_platform_freshness()
         for market_id, quotes in by_market.items():
-            if market_id in self._executed or len(quotes) < 2:
-                continue
-            try:
-                opp = detect_arbitrage(quotes, self._budget, self._min_margin_pct)
-            except ValueError as exc:  # malformed quotes — skip this market
-                self._log.warning("orchestrator.detect_error", market_id=market_id, error=str(exc))
-                continue
-            if opp is None:
-                continue
-            decision = self._risk.evaluate(opp)
-            if decision.verdict is not Verdict.APPROVED:
-                self._log.info("orchestrator.rejected", market_id=market_id, reason=decision.reason)
-                continue
-            # Approved. Act once per market (dedup) — alert the operator either way.
-            self._executed.add(market_id)
-            self._log.info(
-                "orchestrator.arb_found", market_id=market_id, roi_pct=opp.realized_roi_pct
-            )
-            home, away = market_names.get(market_id, ("", ""))
-            await self._notifier.send(format_arb_alert(market_id, opp, home, away))
-            opp_db_id = await self._recorder.record_opportunity(market_id, opp, decision)
-            if self._guardrails.kill_switch_tripped:
-                # Auto-placement suspended (cold session / freeze / daily loss) →
-                # hand off to the operator; keep detecting the rest.
-                self._log.warning("orchestrator.manual_handoff", market_id=market_id)
-                await self._notifier.send(
-                    f"✋ {market_id}: auto-placement suspended "
-                    f"({self._guardrails.kill_switch_reason}) — place this one MANUALLY."
-                )
-                continue
-            self._log.info("orchestrator.executing", market_id=market_id)
-            res = await execute_opportunity(
-                self._executor,
-                opp,
-                opp_id=market_id,
-                dynamic_stake_cap_ars=self._dynamic_cap,
-                budget=self._budget,
-                min_margin_pct=self._min_margin_pct,
-            )
-            self._log.info("orchestrator.executed", market_id=market_id, outcome=res.outcome)
-            if opp_db_id is not None:
-                await self._recorder.record_execution(opp_db_id, opp, res)
-            results.append(res)
+            res = await self._process_market(market_id, quotes, market_names)
+            if res is not None:
+                results.append(res)
         return results
+
+    async def _process_market(
+        self,
+        market_id: str,
+        quotes: list[OddsQuote],
+        market_names: dict[str, tuple[str, str]],
+    ) -> ExecutionResult | None:
+        """Detect → risk → order → alert → record → execute for ONE market.
+
+        Shared by ``run_once`` (full cycle) and the trigger loop in ``run_forever``
+        (burst cycle). The ``_executed`` dedup, leg ordering, and all placement
+        verification apply identically in both paths — a trigger-driven arb gets
+        NO shortcut. Returns the execution result when auto-placed, None otherwise
+        (rejected / high-margin / kill-switch / already-executed)."""
+        if market_id in self._executed or len(quotes) < 2:
+            return None
+        # Per-market adaptive threshold (GARCH σ²_t ratio). None ⇒ static base —
+        # the SAME threshold admits the arb at detect AND reverify time (below).
+        if self._adaptive is not None:
+            tdec = self._adaptive.decide(market_id)
+            min_margin, garch_var = tdec.threshold_pct, tdec.garch_variance
+        else:
+            min_margin, garch_var = self._min_margin_pct, None
+        try:
+            opp = detect_arbitrage(quotes, self._budget, min_margin)
+        except ValueError as exc:  # malformed quotes — skip this market
+            self._log.warning("orchestrator.detect_error", market_id=market_id, error=str(exc))
+            return None
+        if opp is None:
+            return None
+        decision = self._risk.evaluate(opp)
+        if decision.verdict is not Verdict.APPROVED:
+            self._log.info("orchestrator.rejected", market_id=market_id, reason=decision.reason)
+            return None
+        # Approved. Act once per market (dedup) — alert the operator either way.
+        self._executed.add(market_id)
+        # Permute legs into placement order ONCE, before any consumer: the alert,
+        # record_opportunity, execute_opportunity, and record_execution all zip
+        # positionally against opp.legs/opp.stakes, so a single permuted opp keeps
+        # them mutually consistent (leg_placement_order_decision.md).
+        opp = order_opportunity_for_execution(opp, staleness_rank=self._staleness_rank)
+        self._log.info(
+            "orchestrator.arb_found",
+            market_id=market_id,
+            roi_pct=opp.realized_roi_pct,
+            placement_order=[q.platform for q in opp.legs],
+            threshold_pct=min_margin,
+            garch_variance=garch_var,
+        )
+        home, away = market_names.get(market_id, ("", ""))
+        await self._notifier.send(format_arb_alert(market_id, opp, home, away))
+        opp_db_id = await self._recorder.record_opportunity(
+            market_id,
+            opp,
+            decision,
+            adaptive_threshold_pct=min_margin if self._adaptive is not None else None,
+            garch_variance=garch_var,
+        )
+        if decision.high_margin_warning:
+            self._log.warning(
+                "orchestrator.high_margin_handoff",
+                market_id=market_id,
+                roi_pct=opp.realized_roi_pct,
+            )
+            await self._notifier.send(
+                f"⚠️ {market_id}: ROI {opp.realized_roi_pct:.2f}% is in the high-margin band "
+                f"(≥{self._risk.policy.high_margin_warning_pct:.0f}%) — NOT auto-placed. "
+                "Verify the quotes are genuine (stale odds? in-play? mismatched partition?) "
+                "and place MANUALLY only if the arb is real."
+            )
+            return None
+        if self._guardrails.kill_switch_tripped:
+            self._log.warning("orchestrator.manual_handoff", market_id=market_id)
+            await self._notifier.send(
+                f"✋ {market_id}: auto-placement suspended "
+                f"({self._guardrails.kill_switch_reason}) — place this one MANUALLY."
+            )
+            return None
+        self._log.info("orchestrator.executing", market_id=market_id)
+        res = await execute_opportunity(
+            self._executor,
+            opp,
+            opp_id=market_id,
+            dynamic_stake_cap_ars=self._dynamic_cap,
+            budget=self._budget,
+            min_margin_pct=min_margin,
+        )
+        self._log.info("orchestrator.executed", market_id=market_id, outcome=res.outcome)
+        if opp_db_id is not None:
+            await self._recorder.record_execution(opp_db_id, opp, res)
+        return res
 
     async def _track_ingestion(self, n_markets: int) -> None:
         """Alert (once) if detection goes dry for `_empty_alert_after` cycles, and
@@ -207,20 +278,55 @@ class ArbOrchestrator:
                 self._stale_alerted.discard(platform)
                 await self._notifier.send(f"✅ {platform} ingestion recovered.")
 
-    async def run_forever(self, poll_interval_sec: float = 5.0) -> None:
+    async def run_forever(
+        self,
+        poll_interval_sec: float = 5.0,
+        trigger_interval_sec: float = 0.0,
+    ) -> None:
         """Poll until the operator calls :meth:`stop` (or cancels). Per-cycle errors
         are alerted (de-duped) and the loop continues — detection NEVER halts on a
-        fault or a tripped kill switch."""
-        self._log.info("orchestrator.start", budget_ars=self._budget, poll=poll_interval_sec)
+        fault or a tripped kill switch.
+
+        When ``trigger_interval_sec > 0`` and the source supports ``trigger_fetch``,
+        trigger mini-cycles run between full cycles. ``trigger_interval_sec=0``
+        (default) disables triggering; behavior is byte-identical to today."""
+        self._log.info(
+            "orchestrator.start",
+            budget_ars=self._budget,
+            poll=poll_interval_sec,
+            trigger=trigger_interval_sec,
+        )
         while not self._stop:
             try:
                 await self.run_once()
-                self._last_error = None  # a clean cycle re-arms the error alert
-            except Exception as exc:  # noqa: BLE001 — keep polling through transient faults
+                self._last_error = None
+            except Exception as exc:  # noqa: BLE001
                 msg = str(exc)
                 self._log.error("orchestrator.cycle_error", error=msg)
-                if msg != self._last_error:  # don't spam the same fault every poll
+                if msg != self._last_error:
                     await self._notifier.send(f"⚠️ Loop error (detection continues): {msg}")
                     self._last_error = msg
-            await asyncio.sleep(poll_interval_sec)
+            if trigger_interval_sec > 0 and hasattr(self._quotes, "trigger_fetch"):
+                # Wall-clock deadline so trigger_fetch/_process_market WORK time counts
+                # toward the full-poll cadence (no drift — the next full cycle fires on
+                # schedule regardless of how long the mini-cycles take).
+                deadline = time.monotonic() + poll_interval_sec
+                while not self._stop:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(trigger_interval_sec, remaining))
+                    if self._stop:
+                        break
+                    try:
+                        by_market = await self._quotes.trigger_fetch()
+                        if by_market:
+                            names = getattr(self._quotes, "market_names", {})
+                            self._log.info("orchestrator.trigger_cycle", moved=len(by_market))
+                            for mid, quotes in by_market.items():
+                                await self._process_market(mid, quotes, names)
+                    except Exception as exc:  # noqa: BLE001
+                        self._log.warning("orchestrator.trigger_error", error=str(exc))
+            else:
+                await asyncio.sleep(poll_interval_sec)
         self._log.warning("orchestrator.stopped", reason="operator stop")

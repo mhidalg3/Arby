@@ -64,9 +64,7 @@ class Canonicalizer:
 
     fixture_resolver: FixtureResolver
 
-    async def canonicalize(
-        self, snapshot: RawOddsSnapshot
-    ) -> CanonicalQuote | None:
+    async def canonicalize(self, snapshot: RawOddsSnapshot) -> CanonicalQuote | None:
         """Resolve a snapshot to a canonical quote, or None to drop."""
         market = resolve_market(snapshot.platform, snapshot.raw_market_name)
         if market is None:

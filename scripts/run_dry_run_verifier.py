@@ -176,14 +176,10 @@ async def main() -> int:
             # http client. The dispatcher routes legs by
             # `platform_name`; legs with unrecognized platforms or
             # missing IDs degrade to Tier-1.
-            tier_1 = StreamCacheRefresher(
-                redis_client=redis_client, scan_count=scan_count
-            )
+            tier_1 = StreamCacheRefresher(redis_client=redis_client, scan_count=scan_count)
             per_platform_refreshers: dict[str, QuoteRefresher] = {
                 "betsson-pba": BetssonQuoteRefresher(
-                    scraper=BetssonScraper(
-                        http_client=betsson_http, subdomain="pba"
-                    )
+                    scraper=BetssonScraper(http_client=betsson_http, subdomain="pba")
                 ),
                 "betwarrior-pba": BetWarriorQuoteRefresher(
                     scraper=BetWarriorPbaDepthScraper(http_client=betwarrior_http)
@@ -208,9 +204,7 @@ async def main() -> int:
                 verifier=verifier,
                 start_id=start_id,
             )
-            daemon_task = asyncio.create_task(
-                daemon.run(stop_event), name="verifier_daemon"
-            )
+            daemon_task = asyncio.create_task(daemon.run(stop_event), name="verifier_daemon")
             auto_stop_task = asyncio.create_task(
                 _maybe_auto_stop_after(stop_event, run_seconds), name="auto_stop"
             )

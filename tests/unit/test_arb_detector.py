@@ -105,21 +105,51 @@ def _arb_snapshots(t: float = 1000.0) -> list[RawOddsSnapshot]:
     return [
         # BetWarrior anchor (creates the canonical fixture)
         _snap(
-            "betwarrior-pba", "k-1", "Boca - River", "Resultado Final", "1", 2.4, timestamp=t,
+            "betwarrior-pba",
+            "k-1",
+            "Boca - River",
+            "Resultado Final",
+            "1",
+            2.4,
+            timestamp=t,
         ),
         _snap(
-            "betwarrior-pba", "k-1", "Boca - River", "Resultado Final", "X", 3.9, timestamp=t,
+            "betwarrior-pba",
+            "k-1",
+            "Boca - River",
+            "Resultado Final",
+            "X",
+            3.9,
+            timestamp=t,
         ),
         _snap(
-            "betwarrior-pba", "k-1", "Boca - River", "Resultado Final", "2", 4.0, timestamp=t,
+            "betwarrior-pba",
+            "k-1",
+            "Boca - River",
+            "Resultado Final",
+            "2",
+            4.0,
+            timestamp=t,
         ),
         # Bplay (also anchor — same teams → links to existing fixture)
         _snap(
-            "bplay-pba", "b-1", "Boca vs River", "1-X-2", "Empate", 4.0, timestamp=t,
+            "bplay-pba",
+            "b-1",
+            "Boca vs River",
+            "1-X-2",
+            "Empate",
+            4.0,
+            timestamp=t,
         ),
         # Betsson (uses outcome label "Boca" to anchor against canonical fixture)
         _snap(
-            "betsson-pba", "f-1", "boca river", "Ganador del partido", "Boca", 2.5, timestamp=t,
+            "betsson-pba",
+            "f-1",
+            "boca river",
+            "Ganador del partido",
+            "Boca",
+            2.5,
+            timestamp=t,
         ),
     ]
 
@@ -194,9 +224,7 @@ class TestDetection:
         only_betsson = [
             _snap("betsson-pba", "f-1", "boca river", "Ganador del partido", "Boca", 2.5),
             _snap("betsson-pba", "f-1", "boca river", "Ganador del partido", "Empate", 3.5),
-            _snap(
-                "betsson-pba", "f-1", "boca river", "Ganador del partido", "River", 3.0
-            ),
+            _snap("betsson-pba", "f-1", "boca river", "Ganador del partido", "River", 3.0),
         ]
         xadd_mock = await _drain(detector, only_betsson)
         assert xadd_mock.call_count == 0
@@ -290,9 +318,7 @@ class TestThrottle:
         # total ≤ first-batch chain length, ≤ 3.
         assert 1 <= xadd_mock.call_count <= 3
         # Peak margin shown in the last emission.
-        assert float(xadd_mock.call_args[0][1]["margin_pct"]) == pytest.approx(
-            10.0, abs=0.01
-        )
+        assert float(xadd_mock.call_args[0][1]["margin_pct"]) == pytest.approx(10.0, abs=0.01)
 
     async def test_emission_unblocks_after_throttle(self) -> None:
         detector = ArbDetector(
@@ -355,9 +381,7 @@ class TestMalformed:
         detector.redis_client.xadd = AsyncMock(return_value="0-0")
         # Entry missing required fields.
         malformed_page = [("odds:raw", [("1-0", {"only": "this_field"})])]
-        detector.redis_client.xread = AsyncMock(
-            side_effect=[malformed_page, *([[]] * 5)]
-        )
+        detector.redis_client.xread = AsyncMock(side_effect=[malformed_page, *([[]] * 5)])
         stop = asyncio.Event()
         task = asyncio.create_task(detector.run(stop))
         await asyncio.sleep(0.05)

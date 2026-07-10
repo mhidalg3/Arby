@@ -121,9 +121,7 @@ def _resolve_h2h_3way(
     return None
 
 
-def _resolve_btts(
-    snapshot: RawOddsSnapshot, market: CanonicalMarket
-) -> CanonicalOutcome | None:
+def _resolve_btts(snapshot: RawOddsSnapshot, market: CanonicalMarket) -> CanonicalOutcome | None:
     # NFKD-fold + lowercase + alphanumeric-only handles `"Sí"`, `"Si"`,
     # `"sí"`, `"No"`, `"no"` uniformly. Leading/trailing whitespace
     # gone via the pipeline.

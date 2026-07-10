@@ -126,7 +126,11 @@ class BetssonLegPlacer:
             self._log.warning("leg_placer.transport_error", error=str(exc))
             return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
         if status >= 400:
-            return PlacementResult(accepted=False, detail=f"HTTP {status}: {str(resp)[:200]}")
+            return PlacementResult(
+                accepted=False,
+                detail=f"HTTP {status}: {str(resp)[:200]}",
+                auth_failed=status == 401,
+            )
         result = placers.parse_betsson(resp)
         if result.accepted:
             if result.stake_filled == 0.0:
@@ -155,7 +159,15 @@ class BetssonLegPlacer:
                 submitted_selection=leg.platform_outcome_id,
                 correction_tag=correction.selection_tag,
             )
-            return result
+            return replace(
+                result,
+                server_valid_odds=correction.valid_odds,
+                detail=(
+                    f"betsson: server repriced before acceptance (E_BETTING_ODDS_INVALID) "
+                    f"for a different selection tag {correction.selection_tag!r} — market "
+                    f"changed underneath us; not re-submitted"
+                ),
+            )
         uplift_ceiling = leg.odds * (1.0 + _BETSSON_RESUBMIT_MAX_UPLIFT_PCT / 100.0)
         if not (leg.odds < correction.valid_odds <= uplift_ceiling):
             self._log.info(
@@ -164,7 +176,15 @@ class BetssonLegPlacer:
                 valid_odds=correction.valid_odds,
                 selection_tag=correction.selection_tag,
             )
-            return result
+            return replace(
+                result,
+                server_valid_odds=correction.valid_odds,
+                detail=(
+                    f"betsson: server repriced before acceptance (E_BETTING_ODDS_INVALID): "
+                    f"submitted {leg.odds} → validOdds {correction.valid_odds} — "
+                    f"unfavorable/over-cap, not re-submitted (expected market drift)"
+                ),
+            )
         self._log.info(
             "leg_placer.betsson_odds_resubmit",
             submitted=leg.odds,
@@ -180,13 +200,41 @@ class BetssonLegPlacer:
             )
         except TransportError as exc:
             self._log.warning("leg_placer.transport_error", error=str(exc))
-            return PlacementResult(accepted=False, detail=f"transport: {exc!s}")
+            return PlacementResult(
+                accepted=False,
+                detail=f"transport: {exc!s}",
+                odds_requested=correction.valid_odds,
+                server_valid_odds=correction.valid_odds,
+            )
         if status >= 400:
-            return PlacementResult(accepted=False, detail=f"HTTP {status}: {str(resp)[:200]}")
+            return PlacementResult(
+                accepted=False,
+                detail=f"HTTP {status}: {str(resp)[:200]}",
+                auth_failed=status == 401,
+                odds_requested=correction.valid_odds,
+                server_valid_odds=correction.valid_odds,
+            )
         retry = placers.parse_betsson(resp)
-        if retry.accepted and retry.stake_filled == 0.0:
-            return replace(retry, stake_filled=leg.stake_ars, odds_filled=correction.valid_odds)
-        return retry
+        if retry.accepted:
+            # The re-submit POSTed correction.valid_odds_str, not leg.odds — record
+            # both the price actually POSTed and the server-truth it came from.
+            retry = replace(
+                retry,
+                odds_requested=correction.valid_odds,
+                server_valid_odds=correction.valid_odds,
+            )
+            if retry.stake_filled == 0.0:
+                return replace(retry, stake_filled=leg.stake_ars, odds_filled=correction.valid_odds)
+            return retry
+        return replace(
+            retry,
+            odds_requested=correction.valid_odds,
+            server_valid_odds=correction.valid_odds,
+            detail=(
+                f"betsson: re-submit at server validOdds {correction.valid_odds} "
+                f"(E_BETTING_ODDS_INVALID correction) rejected: {retry.detail}"
+            ),
+        )
 
 
 class BetWarriorTransport(Protocol):
@@ -264,6 +312,7 @@ class BetWarriorLegPlacer:
                 accepted=False,
                 detail=f"HTTP {status}: {str(resp)[:200]}",
                 auth_failed=status == 401,
+                odds_rejected=status == 400 and placers.betwarrior_odds_rejected(resp),
             )
         # Log the body on ANY non-SUCCESS HTTP-200 response — previously only HTTP ≥ 400 was
         # logged, so a LIVE_DELAY_PENDING (the transient hold the poll below resolves) went
@@ -351,7 +400,7 @@ class BetWarriorLegPlacer:
                     bet_status=placers.BETWARRIOR_BET_OPEN,
                     coupon_ref=ref,
                 )
-                return placers.betwarrior_fill(bet, ref)
+                return placers.betwarrior_fill(bet, ref, raw=bet)
             if match is placers.BetHistoryMatch.REJECTED:
                 # A definitive reject literal — the bet is NOT placed. Clean reject.
                 self._log.warning(

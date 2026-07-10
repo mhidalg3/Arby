@@ -4,19 +4,25 @@ Date: 2026-06-27
 
 ## Status
 
-Current execution order is deterministic, but not risk-aware:
+Current execution order IS risk-aware, via `arb_executor.order_opportunity_for_execution`
+(applied at the orchestrator seam — `orchestrator.run_once`, before alert / record_opportunity /
+record_execution / execute_opportunity, so all four zip positionally against the same permuted
+`opp.legs`/`opp.stakes`). Rules live (leg_placement_order_decision.md §"Initial hand-coded
+approximation" rules 1, 2, 3, 5):
 
 1. `semantic/arb_detector.py` picks the best quote per outcome cell.
 2. It emits legs by sorted cell/outcome name.
-3. `arb_executor.py` preserves that order.
-4. `Executor` places sequentially.
+3. `order_opportunity_for_execution` permutes into placement order: (1) fragile-auth platform
+   first (today `betwarrior-pba`), (2) single-leg platform before a same-platform pair,
+   (3) smaller stake first, (5) detector order as the stable tie-break.
+4. `arb_executor.execute_opportunity` / `Executor` place sequentially in that order.
 
-So a Betsson-first or BetWarrior-first run is currently an artifact of which platform won the earliest sorted outcome cell, not a deliberate safety policy.
-
-**Current-vs-proposed boundary:** every ordering heuristic below is analysis-only. The live
-bot does **not** currently do BetWarrior-first, Betsson-first, single-leg-first, stake-first,
-or residual-risk ordering. It still executes the detector's outcome-cell order until a
-future implementation changes that policy.
+**Current-vs-proposed boundary:** rules 1/2/3/5 are LIVE. Rule 4 (worst-case-residual
+permutation scorer — §"Proposed future decision algorithm") is deliberately NOT implemented:
+the doc itself defers it until failure probabilities are calibrated ("Validation remaining").
+The fragile-auth set is `{"betwarrior-pba"}`; if `auth_precheck` is later wired into
+`run_hot_loop` (the named gap below), BW's pre-place risk drops and that set should be
+re-evaluated — the constant in `arb_executor._FRAGILE_AUTH_PLATFORMS` is the single knob.
 
 ## Current abort / exposure model
 

@@ -66,11 +66,7 @@ def _peek_schema(body: Any, depth: int = 0) -> str:
         return f"dict[{len(keys)} keys]: {keys[:10]}"
     if isinstance(body, list):
         sample_type = type(body[0]).__name__ if body else "empty"
-        sample_keys = (
-            list(body[0].keys())[:10]
-            if body and isinstance(body[0], dict)
-            else None
-        )
+        sample_keys = list(body[0].keys())[:10] if body and isinstance(body[0], dict) else None
         if sample_keys is not None:
             return f"list[{len(body)}] of dict: {sample_keys}"
         return f"list[{len(body)}] of {sample_type}"
@@ -82,9 +78,19 @@ def _looks_odds_shaped(body: Any) -> bool:
     if not isinstance(body, dict):
         return False
     interesting = {
-        "events", "markets", "selections", "outcomes", "fixtures",
-        "matches", "competitions", "leagues", "odds", "prices",
-        "betoffers", "betOffers", "data",
+        "events",
+        "markets",
+        "selections",
+        "outcomes",
+        "fixtures",
+        "matches",
+        "competitions",
+        "leagues",
+        "odds",
+        "prices",
+        "betoffers",
+        "betOffers",
+        "data",
     }
     return bool(set(body.keys()) & interesting)
 
@@ -107,9 +113,7 @@ def analyze(har_path: Path, *, dump: bool, min_bytes: int, api_prefix: str) -> i
         if rtype not in {"xhr", "fetch"}:
             # HAR doesn't carry resource type natively; check for
             # JSON content-type as fallback.
-            ctype = (
-                e["response"].get("content", {}).get("mimeType", "").lower()
-            )
+            ctype = e["response"].get("content", {}).get("mimeType", "").lower()
             if "json" not in ctype:
                 continue
         u = urlparse(req["url"])
@@ -174,19 +178,21 @@ def analyze(har_path: Path, *, dump: bool, min_bytes: int, api_prefix: str) -> i
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("har", type=Path, help="Path to network.har produced by recon.py")
     parser.add_argument(
-        "har", type=Path, help="Path to network.har produced by recon.py"
-    )
-    parser.add_argument(
-        "--dump", action="store_true",
+        "--dump",
+        action="store_true",
         help="Write each qualifying JSON response to <slug>.json next to the HAR.",
     )
     parser.add_argument(
-        "--min-bytes", type=int, default=1_000,
+        "--min-bytes",
+        type=int,
+        default=1_000,
         help="Skip JSON responses smaller than this (default 1,000).",
     )
     parser.add_argument(
-        "--api-prefix", default="/api/",
+        "--api-prefix",
+        default="/api/",
         help="Substring used to surface API-looking paths (default '/api/').",
     )
     args = parser.parse_args()

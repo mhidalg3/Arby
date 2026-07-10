@@ -45,6 +45,16 @@ class RawOddsSnapshot:
     # leaves the team names bare. Default "" — platforms that mark reserves in the
     # team name itself (Betano "… ii", Bplay "… Reserves") need not populate it.
     raw_competition: str = ""
+    # Platform-stated kickoff (unix epoch seconds) when the payload carries one;
+    # None otherwise. Enables a cross-run-stable analytics fixture key. Betano sets
+    # this from `startTime` (ms); BetWarrior from the Kambi `event.start` field.
+    # Betsson/Bplay: None unless a kickoff field surfaces in their payloads —
+    # never guess.
+    kickoff_utc: float | None = None
+    # Observation transport: "poll" (timestamp = poll time, interval-censored) or
+    # "push" (timestamp = message-decode time, ≈ server update time minus transport
+    # latency). The lag analysis carries censoring bounds for "poll" platforms.
+    transport: str = "poll"
 
 
 class BaseScraper(ABC):

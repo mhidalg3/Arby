@@ -178,9 +178,7 @@ class TestBTTSResolution:
             ("betsson-pba", "Yes", CELL_YES),
         ],
     )
-    def test_btts_outcome_resolves(
-        self, platform: str, label: str, expected_cell: str
-    ) -> None:
+    def test_btts_outcome_resolves(self, platform: str, label: str, expected_cell: str) -> None:
         snap = _snap(platform, label)
         result = resolve_outcome(snap, _BTTS, _fixture())
         assert result is not None
@@ -228,9 +226,7 @@ class TestOUResolution:
             ("betsson-pba", "Under", CELL_UNDER),
         ],
     )
-    def test_ou_outcome_resolves(
-        self, platform: str, label: str, expected_cell: str
-    ) -> None:
+    def test_ou_outcome_resolves(self, platform: str, label: str, expected_cell: str) -> None:
         snap = _snap(platform, label)
         result = resolve_outcome(snap, _OU_2_5, _fixture())
         assert result is not None

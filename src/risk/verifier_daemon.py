@@ -78,12 +78,10 @@ def verification_to_stream_fields(
         "away_team": away_team,
         "detection_margin_pct": f"{result.detection_margin_pct:.6f}",
         "fresh_margin_pct": (
-            "" if result.fresh_margin_pct is None
-            else f"{result.fresh_margin_pct:.6f}"
+            "" if result.fresh_margin_pct is None else f"{result.fresh_margin_pct:.6f}"
         ),
         "margin_delta_pct": (
-            "" if result.margin_delta_pct is None
-            else f"{result.margin_delta_pct:.6f}"
+            "" if result.margin_delta_pct is None else f"{result.margin_delta_pct:.6f}"
         ),
         "time_since_detection_sec": f"{result.time_since_detection_sec:.3f}",
         "fully_tier_2": "1" if result.fully_tier_2 else "0",
@@ -155,11 +153,7 @@ class VerifierDaemon:
                 continue
             for _stream_name, items in entries:
                 for entry_id, fields in items:
-                    last_id = (
-                        entry_id
-                        if isinstance(entry_id, str)
-                        else entry_id.decode()
-                    )
+                    last_id = entry_id if isinstance(entry_id, str) else entry_id.decode()
                     seen += 1
                     verdict = await self._process_entry(fields)
                     if verdict is not None:
@@ -177,13 +171,9 @@ class VerifierDaemon:
             by_verdict=by_verdict,
         )
 
-    async def _process_entry(
-        self, fields: dict[str, Any]
-    ) -> VerificationVerdict | None:
+    async def _process_entry(self, fields: dict[str, Any]) -> VerificationVerdict | None:
         decoded = {
-            (k.decode() if isinstance(k, bytes) else k): (
-                v.decode() if isinstance(v, bytes) else v
-            )
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
             for k, v in fields.items()
         }
         opp = opportunity_from_stream_fields(decoded)

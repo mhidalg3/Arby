@@ -86,19 +86,35 @@ class TestRoundTrip:
         assert opportunity_from_stream_fields({}) is None
         assert opportunity_from_stream_fields({"market_id": "x"}) is None
         # Bad JSON in legs_json
-        assert opportunity_from_stream_fields(
-            {"market_id": "x", "legs_json": "not json",
-             "total_stake": "0", "guaranteed_profit": "0",
-             "margin_pct": "0", "realized_roi_pct": "0",
-             "capital_utilization": "0"}
-        ) is None
+        assert (
+            opportunity_from_stream_fields(
+                {
+                    "market_id": "x",
+                    "legs_json": "not json",
+                    "total_stake": "0",
+                    "guaranteed_profit": "0",
+                    "margin_pct": "0",
+                    "realized_roi_pct": "0",
+                    "capital_utilization": "0",
+                }
+            )
+            is None
+        )
         # Empty legs
-        assert opportunity_from_stream_fields(
-            {"market_id": "x", "legs_json": "[]",
-             "total_stake": "0", "guaranteed_profit": "0",
-             "margin_pct": "0", "realized_roi_pct": "0",
-             "capital_utilization": "0"}
-        ) is None
+        assert (
+            opportunity_from_stream_fields(
+                {
+                    "market_id": "x",
+                    "legs_json": "[]",
+                    "total_stake": "0",
+                    "guaranteed_profit": "0",
+                    "margin_pct": "0",
+                    "realized_roi_pct": "0",
+                    "capital_utilization": "0",
+                }
+            )
+            is None
+        )
 
 
 # ---- Decision serialization ----

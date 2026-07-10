@@ -30,8 +30,14 @@ class _FakeRefresher:
 
 def _leg(platform: str = "betano") -> Leg:
     return Leg(
-        platform=platform, match_id="m", market="1X2", outcome="home", stake_ars=50.0,
-        odds=2.0, platform_outcome_id="o1", platform_event_ref="e1",
+        platform=platform,
+        match_id="m",
+        market="1X2",
+        outcome="home",
+        stake_ars=50.0,
+        odds=2.0,
+        platform_outcome_id="o1",
+        platform_event_ref="e1",
     )
 
 
@@ -52,7 +58,6 @@ async def test_refresh_error_fails_closed() -> None:
 async def test_market_unavailable_fails_closed() -> None:
     rv = LiveOddsReverifier({"betano": _FakeRefresher(None)})  # type: ignore[dict-item]
     assert await rv(_leg()) == 0.0  # decimal_odds=None → unverified → abort
-
 
 
 # ---- BetanoCapRefresher: live per-bet cap probe (fail-soft → None) ----

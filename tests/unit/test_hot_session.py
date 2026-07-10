@@ -42,6 +42,11 @@ class _FakeTransport:
         self.reality_close_failures_before_success: int | None = None
         self.reality_clear_after_failed_attempt = False
         self.reality_close_delay_s = 0.0
+        # Simulate the SPA settling after Cerrar: a successful close sets
+        # context_ok_pending, and establish_betsson_context() returns False while it is
+        # > 0 (decrementing per call), then falls back to context_ok.
+        self.establish_fail_after_close = 0
+        self.context_ok_pending = 0
         # BetWarrior promotions behavior: when True, the next
         # attempt_betwarrior_promotions_home() call clears `blocked` and returns True.
         self.promotions_home_ok = False
@@ -50,6 +55,16 @@ class _FakeTransport:
         # call clears `blocked` (session recovered) and returns True.
         self.relogin_ok = False
         self.relogin_calls = 0
+        # Betsson relogin behavior: when True, the next attempt_betsson_relogin() call
+        # clears `blocked` (session recovered) and returns True.
+        self.betsson_relogin_ok = False
+        self.betsson_relogin_calls = 0
+        # Betsson unreadable-header outcome: when the knob is True, each
+        # attempt_betsson_relogin() sets the one-shot betsson_relogin_unreadable flag
+        # (gave up without touching the session — manager must NOT consume the
+        # episode's reauth attempt).
+        self.betsson_relogin_unreadable = False
+        self.betsson_relogin_unreadable_result = False
         # Keepalive behavior: count calls so tests can assert the loop fired.
         self.keepalive_calls = 0
         # Session-persist behavior: count save_session calls (heartbeat + shutdown).
@@ -67,6 +82,9 @@ class _FakeTransport:
 
     async def establish_betsson_context(self) -> bool:
         self.establish_calls += 1
+        if self.context_ok_pending > 0:
+            self.context_ok_pending -= 1
+            return False
         return self.context_ok
 
     async def check_betano_ready(self) -> bool:
@@ -103,9 +121,11 @@ class _FakeTransport:
             and self.reality_close_calls > self.reality_close_failures_before_success
         ):
             self.blocked = None
+            self.context_ok_pending = self.establish_fail_after_close
             return True
         if self.reality_close_ok:
             self.blocked = None
+            self.context_ok_pending = self.establish_fail_after_close
             return True
         if self.reality_clear_after_failed_attempt:
             self.blocked = None
@@ -121,6 +141,16 @@ class _FakeTransport:
     async def attempt_betwarrior_relogin(self) -> bool:
         self.relogin_calls += 1
         if self.relogin_ok:
+            self.blocked = None  # session recovered → re-probe clears the block
+            return True
+        return False
+
+    async def attempt_betsson_relogin(self) -> bool:
+        self.betsson_relogin_calls += 1
+        # Mirror the real transport's one-shot flag contract: reset per call, set only
+        # when this attempt gives up on an unreadable header.
+        self.betsson_relogin_unreadable = self.betsson_relogin_unreadable_result
+        if self.betsson_relogin_ok:
             self.blocked = None  # session recovered → re-probe clears the block
             return True
         return False
@@ -655,6 +685,87 @@ async def test_betsson_reality_check_suspends_then_auto_closes() -> None:
         assert suspended_at < ready_at
 
 
+async def test_reality_check_resume_does_not_need_periodic_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close → re-probe → resume must flow from the recovery task itself: with the
+    periodic heartbeat effectively disabled (3600s), a reality-check episode still
+    suspends first and then resumes. Regression pin for _apply_recovered — the
+    existing RC tests run heartbeat_sec=0.01 and would mask its removal. The resume
+    path sleeps a settle window before EVERY probe (incl. the first — see the
+    2026-07-05 relogin regression), so the delay is patched tiny here."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_RESUME_REPROBE_DELAY_S", 0.01)
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_ok = True
+    bsn.blocked = SessionBlock(phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check")
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=3600.0,  # periodic loop cannot contribute within the test
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        await asyncio.sleep(0.05)
+        assert bsn.reality_close_calls >= 1
+        assert not g.kill_switch_tripped
+        suspended_at = next(
+            i for i, s in enumerate(note.sent) if "NOT READY" in s and "REALITY CHECK" in s
+        )
+        ready_at = next(i for i, s in enumerate(note.sent) if "ready again" in s)
+        assert suspended_at < ready_at
+
+
+async def test_reality_check_delayed_readiness_resumes_via_reprobe_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SPA can need a few seconds to be placeable again right after Cerrar. The
+    post-close re-probe must retry (not give up after one False) and resume once the
+    context lands — without the periodic heartbeat, which is disabled here."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_RESUME_REPROBE_DELAY_S", 0.01)
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_ok = True
+    bsn.establish_fail_after_close = 1  # immediate post-close probe fails; retry #1 lands
+    bsn.blocked = SessionBlock(phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check")
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=3600.0,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        await asyncio.sleep(0.1)
+        assert not g.kill_switch_tripped
+        assert any("ready again" in s for s in note.sent)
+        # startup probe + failed immediate re-probe + succeeding retry #1.
+        assert bsn.establish_calls >= 3
+
+
+async def test_reality_check_reprobe_budget_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the context never lands after the close, the re-probe loop must give up after a
+    bounded number of attempts and defer to the (here disabled) heartbeat — never spin."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_RESUME_REPROBE_DELAY_S", 0.01)
+    bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
+    bsn.reality_close_ok = True
+    bsn.establish_fail_after_close = 99  # context never lands within the retry budget
+    bsn.blocked = SessionBlock(phrase="¿sabés qué hora es?", is_overlay=True, kind="reality_check")
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=3600.0,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        await asyncio.sleep(0.1)
+        assert g.kill_switch_tripped  # resume deferred to the (disabled) heartbeat
+        # startup probe + immediate re-probe + exactly the retry budget — no more.
+        assert bsn.establish_calls == 1 + 1 + hot_session_mod._REALITY_CHECK_RESUME_REPROBES
+
+
 async def test_reality_check_close_failure_retries_then_falls_back_to_suspend_alert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -709,8 +820,13 @@ async def test_reality_check_close_retries_transient_miss(
         assert suspended_at < ready_at
 
 
-async def test_reality_check_new_episode_gets_fresh_close_budget() -> None:
-    """After one reality-check popup clears, a later popup must get a fresh close task."""
+async def test_reality_check_new_episode_gets_fresh_close_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After one reality-check popup clears, a later popup must get a fresh close task.
+    The resume settle sleep is patched tiny so the first episode's recovery task
+    FINISHES within the test window (a lingering task blocks the next episode's)."""
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_RESUME_REPROBE_DELAY_S", 0.01)
     bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
     bsn.reality_close_ok = True
     m = HotSessionManager(
@@ -824,6 +940,7 @@ async def test_reality_check_clear_during_retry_delay_skips_next_click(
 ) -> None:
     """If the popup clears during retry backoff, the next cycle re-probes before clicking."""
     monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_CLOSE_RETRY_DELAY_S", 0.05)
+    monkeypatch.setattr(hot_session_mod, "_REALITY_CHECK_RESUME_REPROBE_DELAY_S", 0.01)
     bano, bsn, g, note = _FakeTransport(), _FakeTransport(), _guard(), _RecordingNotifier()
     bsn.reality_close_ok = False
     m = HotSessionManager(
@@ -848,7 +965,12 @@ async def test_reality_check_clear_during_retry_delay_skips_next_click(
             await asyncio.sleep(0.001)
 
         bsn.blocked = None
-        await asyncio.sleep(0.06)
+        # Resume flows through _apply_recovered (settle sleep → probe → health); wait on
+        # the observable outcome instead of a brittle fixed sleep.
+        deadline = time.monotonic() + 1.0
+        while g.kill_switch_tripped:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.005)
         assert bsn.reality_close_calls == 1
         assert bsn.blocked is None
         assert not g.kill_switch_tripped
@@ -996,3 +1118,119 @@ async def test_betwarrior_session_expired_relogin_failure_stays_suspended() -> N
         assert g.kill_switch_tripped
         alert = next(s for s in note.sent if "betwarrior" in s and "SESSION EXPIRED" in s)
         assert "re-login" in alert
+
+
+async def test_betsson_session_expired_suspends_then_auto_relogs() -> None:
+    """A session_expired overlay on Betsson (header logged out / expired popup) suspends
+    first, then the background relogin recovers — dispatching attempt_betsson_relogin
+    (NOT BetWarrior's), and readiness resets."""
+    bano, bsn, bw, g, note = (
+        _FakeTransport(),
+        _FakeTransport(),
+        _FakeTransport(),
+        _guard(),
+        _RecordingNotifier(),
+    )
+    bsn.betsson_relogin_ok = True
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        betwarrior=bw,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="header logged out (no balance/retirar-depósito; login trigger visible)",
+            is_overlay=True,
+            kind="session_expired",
+        )
+        await asyncio.sleep(0.05)
+        assert bsn.betsson_relogin_calls >= 1
+        assert bw.relogin_calls == 0  # right method dispatched — BW untouched
+        assert not g.kill_switch_tripped
+        suspended_at = next(
+            i for i, s in enumerate(note.sent) if "NOT READY" in s and "SESSION EXPIRED" in s
+        )
+        ready_at = next(i for i, s in enumerate(note.sent) if "ready again" in s)
+        assert suspended_at < ready_at
+
+
+async def test_betsson_session_expired_relogin_failure_stays_suspended() -> None:
+    """A failed Betsson relogin degrades to today's behavior: one attempt per episode,
+    stays suspended, the session-expired alert remains (operator finishes login manually)."""
+    bano, bsn, bw, g, note = (
+        _FakeTransport(),
+        _FakeTransport(),
+        _FakeTransport(),
+        _guard(),
+        _RecordingNotifier(),
+    )
+    bsn.betsson_relogin_ok = False
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        betwarrior=bw,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="header logged out (no balance/retirar-depósito; login trigger visible)",
+            is_overlay=True,
+            kind="session_expired",
+        )
+        await asyncio.sleep(0.05)
+        assert bsn.betsson_relogin_calls == 1  # one attempt per episode
+        assert bw.relogin_calls == 0
+        assert g.kill_switch_tripped
+        alert = next(s for s in note.sent if "betsson" in s and "SESSION EXPIRED" in s)
+        assert "re-login" in alert
+
+
+async def test_betsson_unreadable_relogin_defers_and_retries_next_heartbeat() -> None:
+    """An UNREADABLE Betsson relogin (gave up without touching the session — one-shot
+    betsson_relogin_unreadable flag) must NOT consume the episode's single reauth
+    attempt: the manager discards the attempted-guard (session_reauth_deferred) so the
+    next heartbeat retries, and once the header settles the relogin recovers. Without
+    the discard, a genuinely dead session stranded behind the guard until manual login
+    (reviewer finding, 2026-07-05)."""
+    bano, bsn, bw, g, note = (
+        _FakeTransport(),
+        _FakeTransport(),
+        _FakeTransport(),
+        _guard(),
+        _RecordingNotifier(),
+    )
+    bsn.betsson_relogin_ok = False
+    bsn.betsson_relogin_unreadable_result = True  # every attempt gives up unreadable
+    m = HotSessionManager(
+        betano=bano,  # type: ignore[arg-type]
+        betsson=bsn,  # type: ignore[arg-type]
+        betwarrior=bw,  # type: ignore[arg-type]
+        guardrails=g,
+        heartbeat_sec=0.01,
+        notifier=note,  # type: ignore[arg-type]
+    )
+    async with m:
+        bsn.blocked = SessionBlock(
+            phrase="header logged out (no balance/retirar-depósito; login trigger visible)",
+            is_overlay=True,
+            kind="session_expired",
+        )
+        # Unreadable attempts must be RETRIED across heartbeats (guard discarded each
+        # time), unlike a plain failure's one-attempt-per-episode.
+        deadline = time.monotonic() + 1.0
+        while bsn.betsson_relogin_calls < 2:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.005)
+        # Header settles: the next retry performs the real relogin and recovers.
+        bsn.betsson_relogin_unreadable_result = False
+        bsn.betsson_relogin_ok = True
+        deadline = time.monotonic() + 1.0
+        while g.kill_switch_tripped:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.005)
+        assert bsn.blocked is None  # relogin actually ran and recovered the session

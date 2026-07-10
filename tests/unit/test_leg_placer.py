@@ -212,6 +212,9 @@ async def test_betsson_fails_closed_when_context_not_resolved() -> None:
     t = FakeTransport(ctx_headers=None)
     res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-x", 50.0, 2.62))
     assert not res.accepted and "context not resolved" in res.detail
+    assert (
+        res.auth_failed is False
+    )  # missing ctx is SPA context-loss, NOT a logout (manager owns it)
     assert not t.calls  # never POSTed
 
 
@@ -231,6 +234,10 @@ async def test_betsson_favorable_odds_resubmit_accepts_at_valid_odds() -> None:
         t.calls[1]["json"]["bets"][0]["betSelections"][0]["marketSelectionId"]
         == "s-m-f-EVT-MW3W-away"
     )
+    # The re-submit POSTed validOdds (4.45), not leg.odds — both the requested price
+    # and the server-truth it came from are recorded on the fill.
+    assert res.odds_requested == 4.45
+    assert res.server_valid_odds == 4.45
 
 
 async def test_betsson_unfavorable_odds_no_resubmit() -> None:
@@ -240,6 +247,11 @@ async def test_betsson_unfavorable_odds_no_resubmit() -> None:
     assert not res.accepted
     assert len(t.calls) == 1
     assert "E_BETTING_ODDS_INVALID" in res.detail
+    assert "server repriced before acceptance" in res.detail
+    # The kept-reject path records the server's validOdds but NOT a POSTed price
+    # (odds_requested stays at its 0.0 default — leg.odds was POSTed, not validOdds).
+    assert res.server_valid_odds == 4.25
+    assert res.odds_requested == 0.0
 
 
 async def test_betsson_favorable_beyond_cap_no_resubmit() -> None:
@@ -260,6 +272,10 @@ async def test_betsson_resubmit_is_bounded_single_retry() -> None:
     assert not res.accepted
     assert len(t.calls) == 2  # no third POST
     assert "E_BETTING_ODDS_INVALID" in res.detail  # the second error
+    assert "re-submit at server validOdds" in res.detail
+    # The re-submit POSTed the FIRST correction's validOdds (4.45), not leg.odds.
+    assert res.odds_requested == 4.45
+    assert res.server_valid_odds == 4.45
 
 
 async def test_betsson_non_odds_error_no_resubmit() -> None:
@@ -294,6 +310,9 @@ async def test_betsson_favorable_selection_tag_mismatch_no_resubmit() -> None:
     res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-m-f-EVT-MW3W-away", 500.0, 4.35))
     assert not res.accepted
     assert len(t.calls) == 1
+    assert "server repriced before acceptance" in res.detail
+    assert "E_BETTING_ODDS_INVALID" in res.detail
+    assert res.server_valid_odds == 4.45  # the correction's price, even on the kept reject
 
 
 async def test_betwarrior_placer_builds_request_and_parses_success() -> None:
@@ -332,15 +351,28 @@ async def test_betwarrior_401_sets_auth_failed() -> None:
     t = FakeTransport(status=401, body={"reason": "Unauthorized"})
     res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
     assert not res.accepted and res.auth_failed is True
+    assert res.odds_rejected is False  # auth path, never an odds recapture
     assert "HTTP 401" in res.detail
 
 
-async def test_betwarrior_non_401_error_is_not_auth_failed() -> None:
-    # A non-auth HTTP ≥400 (odds invalid, suspended outcome, validation) stays
-    # auth_failed=False — today's abort/naked, never a re-auth.
+async def test_betwarrior_invalid_odds_400_sets_odds_rejected() -> None:
+    # A Kambi 400 "Invalid odds specified" (allowOddsChange=NO, price moved after our
+    # reverify) is flagged odds_rejected so the executor's single recapture can salvage
+    # it. It is NOT auth_failed (that path is reserved for 401s) — never a re-auth.
     t = FakeTransport(status=400, body={"reason": "Invalid odds specified"})
     res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
     assert not res.accepted and res.auth_failed is False
+    assert res.odds_rejected is True
+
+
+async def test_betwarrior_non_odds_400_is_not_odds_rejected() -> None:
+    # A 400 that is NOT the exact-odds-mismatch literal (stake limit, suspended
+    # outcome, validation) must stay odds_rejected=False — no recapture, today's
+    # abort/naked. Fail-closed: only the named mismatch triggers a re-POST.
+    t = FakeTransport(status=400, body={"reason": "Insufficient funds"})
+    res = await BetWarriorLegPlacer(t).place(_leg("betwarrior-pba", "42", 500.0, 1.41))
+    assert not res.accepted and res.auth_failed is False
+    assert res.odds_rejected is False
 
 
 async def test_betwarrior_live_delay_poll_resolves_to_open() -> None:
@@ -366,6 +398,9 @@ async def test_betwarrior_live_delay_poll_resolves_to_open() -> None:
         _leg("betwarrior-pba", "42", 500.0, 1.41)
     )
     assert res.accepted and res.ref == "777" and res.odds_filled == 1.41
+    # The poll-accept path persists the matched bet echo (bounded), not the full
+    # historyCoupons body — the receipt for audit.
+    assert res.raw_response == {"betStatus": "OPEN", "betOdds": 1410, "stake": 500000}
     assert not res.pending_unknown
     # Placed via POST, then GET-polled the coupon/history.json endpoint.
     assert t.calls[0]["method"] == "POST" and t.calls[0]["url"].endswith("/coupon.json")
@@ -564,3 +599,22 @@ async def test_transport_error_returns_not_accepted_not_raise() -> None:
 
     res = await BetssonLegPlacer(BoomTransport()).place(_leg("betsson-pba", "s-x", 10.0, 2.0))
     assert not res.accepted and "transport" in res.detail
+
+
+async def test_betsson_401_sets_auth_failed() -> None:
+    # A placement HTTP 401 (server-side session death) is flagged auth_failed so the
+    # executor's bounded re-auth + retry can rescue it — the mirror of the BW placer.
+    t = FakeTransport(status=401, body={"reason": "Unauthorized"})
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-x", 50.0, 2.62))
+    assert not res.accepted and res.auth_failed is True
+    assert "HTTP 401" in res.detail
+
+
+async def test_betsson_non_auth_400_is_not_auth_failed() -> None:
+    # A non-401 >=400 (stake limit, suspended outcome, validation) is NOT auth_failed —
+    # the reactive re-auth path is reserved for 401s only. The detail still surfaces the
+    # status/body so a different dead-session signal can be tuned in later.
+    t = FakeTransport(status=400, body={"reason": "Insufficient funds"})
+    res = await BetssonLegPlacer(t).place(_leg("betsson-pba", "s-x", 50.0, 2.62))
+    assert not res.accepted and res.auth_failed is False
+    assert "HTTP 400" in res.detail

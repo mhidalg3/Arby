@@ -76,46 +76,95 @@ class TestCrossPlatformCanonicalization:
             timestamp=1000.0,
         )
         bw_draw = _snap(
-            "betwarrior-pba", "k-1027027525", "Boca Juniors - River Plate",
-            "Resultado Final", "X", decimal_odds=3.40, timestamp=1000.0,
+            "betwarrior-pba",
+            "k-1027027525",
+            "Boca Juniors - River Plate",
+            "Resultado Final",
+            "X",
+            decimal_odds=3.40,
+            timestamp=1000.0,
         )
         bw_away = _snap(
-            "betwarrior-pba", "k-1027027525", "Boca Juniors - River Plate",
-            "Resultado Final", "2", decimal_odds=3.20, timestamp=1000.0,
+            "betwarrior-pba",
+            "k-1027027525",
+            "Boca Juniors - River Plate",
+            "Resultado Final",
+            "2",
+            decimal_odds=3.20,
+            timestamp=1000.0,
         )
 
         # Bplay — team-name outcomes
         bp_home = _snap(
-            "bplay-pba", "b-11428880", "Boca Juniors vs River Plate",
-            "1-X-2", "Boca Juniors", decimal_odds=2.15, timestamp=1001.0,
+            "bplay-pba",
+            "b-11428880",
+            "Boca Juniors vs River Plate",
+            "1-X-2",
+            "Boca Juniors",
+            decimal_odds=2.15,
+            timestamp=1001.0,
         )
         bp_draw = _snap(
-            "bplay-pba", "b-11428880", "Boca Juniors vs River Plate",
-            "1-X-2", "Empate", decimal_odds=3.30, timestamp=1001.0,
+            "bplay-pba",
+            "b-11428880",
+            "Boca Juniors vs River Plate",
+            "1-X-2",
+            "Empate",
+            decimal_odds=3.30,
+            timestamp=1001.0,
         )
         bp_away = _snap(
-            "bplay-pba", "b-11428880", "Boca Juniors vs River Plate",
-            "1-X-2", "River Plate", decimal_odds=3.25, timestamp=1001.0,
+            "bplay-pba",
+            "b-11428880",
+            "Boca Juniors vs River Plate",
+            "1-X-2",
+            "River Plate",
+            decimal_odds=3.25,
+            timestamp=1001.0,
         )
 
         # Betsson — flat event name, team-name outcomes
         bet_home = _snap(
-            "betsson-pba", "f-abc", "boca juniors river plate",
-            "Ganador del partido", "Boca Juniors", decimal_odds=2.05, timestamp=1002.0,
+            "betsson-pba",
+            "f-abc",
+            "boca juniors river plate",
+            "Ganador del partido",
+            "Boca Juniors",
+            decimal_odds=2.05,
+            timestamp=1002.0,
         )
         bet_draw = _snap(
-            "betsson-pba", "f-abc", "boca juniors river plate",
-            "Ganador del partido", "Empate", decimal_odds=3.50, timestamp=1002.0,
+            "betsson-pba",
+            "f-abc",
+            "boca juniors river plate",
+            "Ganador del partido",
+            "Empate",
+            decimal_odds=3.50,
+            timestamp=1002.0,
         )
         bet_away = _snap(
-            "betsson-pba", "f-abc", "boca juniors river plate",
-            "Ganador del partido", "River Plate", decimal_odds=3.10, timestamp=1002.0,
+            "betsson-pba",
+            "f-abc",
+            "boca juniors river plate",
+            "Ganador del partido",
+            "River Plate",
+            decimal_odds=3.10,
+            timestamp=1002.0,
         )
 
         # Process in realistic order
         quotes = []
-        for snap in (bw_home, bw_draw, bw_away, bp_home, bp_draw, bp_away,
-                     bet_home, bet_draw, bet_away):
+        for snap in (
+            bw_home,
+            bw_draw,
+            bw_away,
+            bp_home,
+            bp_draw,
+            bp_away,
+            bet_home,
+            bet_draw,
+            bet_away,
+        ):
             q = await c.canonicalize(snap)
             assert q is not None, f"failed to canonicalize: {snap}"
             quotes.append(q)
@@ -130,6 +179,7 @@ class TestCrossPlatformCanonicalization:
 
         # 3 distinct outcome cells, 3 snapshots per cell
         from collections import Counter
+
         cells = Counter(q.outcome.cell for q in quotes)
         assert cells == {CELL_HOME: 3, CELL_DRAW: 3, CELL_AWAY: 3}
 
@@ -147,7 +197,12 @@ class TestCrossPlatformCanonicalization:
     async def test_market_id_format_includes_code(self) -> None:
         c = Canonicalizer(fixture_resolver=FixtureResolver())
         snap = _snap(
-            "betwarrior-pba", "k-1", "A - B", "Resultado Final", "1", timestamp=1000.0,
+            "betwarrior-pba",
+            "k-1",
+            "A - B",
+            "Resultado Final",
+            "1",
+            timestamp=1000.0,
         )
         q = await c.canonicalize(snap)
         assert q is not None
@@ -168,26 +223,55 @@ class TestCrossPlatformCanonicalization:
         c = Canonicalizer(fixture_resolver=FixtureResolver())
         # Anchor each platform's event_id to the fixture via 1X2.
         await c.canonicalize(
-            _snap("betwarrior-pba", "k-1", "Boca - River", "Resultado Final", "1", 2.0,
-                  timestamp=1000.0)
+            _snap(
+                "betwarrior-pba",
+                "k-1",
+                "Boca - River",
+                "Resultado Final",
+                "1",
+                2.0,
+                timestamp=1000.0,
+            )
         )
         await c.canonicalize(
-            _snap("betsson-pba", "f-1", "boca river",
-                  "Ganador del partido", "Boca", 2.0, timestamp=1000.0)
+            _snap(
+                "betsson-pba",
+                "f-1",
+                "boca river",
+                "Ganador del partido",
+                "Boca",
+                2.0,
+                timestamp=1000.0,
+            )
         )
         await c.canonicalize(
-            _snap("bplay-pba", "b-1", "Boca vs River", "1-X-2", "Boca", 2.0,
-                  timestamp=1000.0)
+            _snap("bplay-pba", "b-1", "Boca vs River", "1-X-2", "Boca", 2.0, timestamp=1000.0)
         )
         # Now BTTS hits cache fast path on both platforms.
-        bet_yes = _snap("betsson-pba", "f-1", "boca river",
-                        "Ambos equipos anotan", "Si", 1.85, timestamp=1001.0)
-        bet_no = _snap("betsson-pba", "f-1", "boca river",
-                       "Ambos equipos anotan", "No", 1.95, timestamp=1001.0)
-        bp_yes = _snap("bplay-pba", "b-1", "Boca vs River",
-                       "Ambos equipos anotan", "Si", 1.90, timestamp=1001.0)
-        bp_no = _snap("bplay-pba", "b-1", "Boca vs River",
-                      "Ambos equipos anotan", "No", 1.90, timestamp=1001.0)
+        bet_yes = _snap(
+            "betsson-pba", "f-1", "boca river", "Ambos equipos anotan", "Si", 1.85, timestamp=1001.0
+        )
+        bet_no = _snap(
+            "betsson-pba", "f-1", "boca river", "Ambos equipos anotan", "No", 1.95, timestamp=1001.0
+        )
+        bp_yes = _snap(
+            "bplay-pba",
+            "b-1",
+            "Boca vs River",
+            "Ambos equipos anotan",
+            "Si",
+            1.90,
+            timestamp=1001.0,
+        )
+        bp_no = _snap(
+            "bplay-pba",
+            "b-1",
+            "Boca vs River",
+            "Ambos equipos anotan",
+            "No",
+            1.90,
+            timestamp=1001.0,
+        )
         quotes = []
         for snap in (bet_yes, bet_no, bp_yes, bp_no):
             q = await c.canonicalize(snap)
@@ -207,24 +291,58 @@ class TestCrossPlatformCanonicalization:
         c = Canonicalizer(fixture_resolver=FixtureResolver())
         # Anchor each platform via 1X2 first (realistic order).
         await c.canonicalize(
-            _snap("betwarrior-pba", "k-1", "Boca - River", "Resultado Final", "1", 2.0,
-                  timestamp=1000.0)
+            _snap(
+                "betwarrior-pba",
+                "k-1",
+                "Boca - River",
+                "Resultado Final",
+                "1",
+                2.0,
+                timestamp=1000.0,
+            )
         )
         await c.canonicalize(
-            _snap("betsson-pba", "f-1", "boca river",
-                  "Ganador del partido", "Boca", 2.0, timestamp=1000.0)
+            _snap(
+                "betsson-pba",
+                "f-1",
+                "boca river",
+                "Ganador del partido",
+                "Boca",
+                2.0,
+                timestamp=1000.0,
+            )
         )
         await c.canonicalize(
-            _snap("bplay-pba", "b-1", "Boca vs River", "1-X-2", "Boca", 2.0,
-                  timestamp=1000.0)
+            _snap("bplay-pba", "b-1", "Boca vs River", "1-X-2", "Boca", 2.0, timestamp=1000.0)
         )
 
-        bet_over_25 = _snap("betsson-pba", "f-1", "boca river",
-                            "Total de goles 2.5", "más de 2.5", 1.95, timestamp=1001.0)
-        bp_over_25 = _snap("bplay-pba", "b-1", "Boca vs River",
-                           "Más de / Menos de 2.5", "Más", 1.90, timestamp=1001.0)
-        bet_over_35 = _snap("betsson-pba", "f-1", "boca river",
-                            "Total de goles 3.5", "más de 3.5", 2.50, timestamp=1001.0)
+        bet_over_25 = _snap(
+            "betsson-pba",
+            "f-1",
+            "boca river",
+            "Total de goles 2.5",
+            "más de 2.5",
+            1.95,
+            timestamp=1001.0,
+        )
+        bp_over_25 = _snap(
+            "bplay-pba",
+            "b-1",
+            "Boca vs River",
+            "Más de / Menos de 2.5",
+            "Más",
+            1.90,
+            timestamp=1001.0,
+        )
+        bet_over_35 = _snap(
+            "betsson-pba",
+            "f-1",
+            "boca river",
+            "Total de goles 3.5",
+            "más de 3.5",
+            2.50,
+            timestamp=1001.0,
+        )
 
         q25_bet = await c.canonicalize(bet_over_25)
         q25_bp = await c.canonicalize(bp_over_25)
@@ -242,15 +360,36 @@ class TestCrossPlatformCanonicalization:
         quotes — they don't form a clean partition."""
         c = Canonicalizer(fixture_resolver=FixtureResolver())
         await c.canonicalize(
-            _snap("betwarrior-pba", "k-1", "Boca - River", "Resultado Final", "1", 2.0,
-                  timestamp=1000.0)
+            _snap(
+                "betwarrior-pba",
+                "k-1",
+                "Boca - River",
+                "Resultado Final",
+                "1",
+                2.0,
+                timestamp=1000.0,
+            )
         )
         await c.canonicalize(
-            _snap("betsson-pba", "f-1", "boca river",
-                  "Ganador del partido", "Boca", 2.0, timestamp=1000.0)
+            _snap(
+                "betsson-pba",
+                "f-1",
+                "boca river",
+                "Ganador del partido",
+                "Boca",
+                2.0,
+                timestamp=1000.0,
+            )
         )
-        push_snap = _snap("betsson-pba", "f-1", "boca river",
-                          "Total de goles 2", "más de 2", 2.00, timestamp=1001.0)
+        push_snap = _snap(
+            "betsson-pba",
+            "f-1",
+            "boca river",
+            "Total de goles 2",
+            "más de 2",
+            2.00,
+            timestamp=1001.0,
+        )
         result = await c.canonicalize(push_snap)
         assert result is None
 
@@ -262,12 +401,20 @@ class TestCrossPlatformCanonicalization:
         c = Canonicalizer(fixture_resolver=FixtureResolver())
         # BetWarrior anchor exists, but Betsson event_id isn't linked yet.
         await c.canonicalize(
-            _snap("betwarrior-pba", "k-1", "Boca - River", "Resultado Final", "1", 2.0,
-                  timestamp=1000.0)
+            _snap(
+                "betwarrior-pba",
+                "k-1",
+                "Boca - River",
+                "Resultado Final",
+                "1",
+                2.0,
+                timestamp=1000.0,
+            )
         )
         # Betsson BTTS arrives WITHOUT a prior 1X2 anchor on f-1 — still resolves.
-        btts = _snap("betsson-pba", "f-1", "boca river",
-                     "Ambos equipos anotan", "Si", 1.85, timestamp=1001.0)
+        btts = _snap(
+            "betsson-pba", "f-1", "boca river", "Ambos equipos anotan", "Si", 1.85, timestamp=1001.0
+        )
         cq = await c.canonicalize(btts)
         assert cq is not None
         assert cq.odds_quote.market_id.endswith("|btts")
@@ -300,7 +447,11 @@ class TestUnresolvableFixtureDrops:
         cleanly — no exception."""
         c = Canonicalizer(fixture_resolver=FixtureResolver())
         snap = _snap(
-            "betsson-pba", "f-bet", "boca river", "Ganador del partido", "Boca",
+            "betsson-pba",
+            "f-bet",
+            "boca river",
+            "Ganador del partido",
+            "Boca",
             timestamp=1000.0,
         )
         assert await c.canonicalize(snap) is None
@@ -309,8 +460,12 @@ class TestUnresolvableFixtureDrops:
         c = Canonicalizer(fixture_resolver=FixtureResolver())
         # No separator anywhere
         snap = _snap(
-            "betwarrior-pba", "k-1", "MalformedNoSep",
-            "Resultado Final", "1", timestamp=1000.0,
+            "betwarrior-pba",
+            "k-1",
+            "MalformedNoSep",
+            "Resultado Final",
+            "1",
+            timestamp=1000.0,
         )
         assert await c.canonicalize(snap) is None
 
@@ -321,6 +476,7 @@ class TestUnresolvableFixtureDrops:
 class TestCanonicalMarketId:
     def test_no_line(self) -> None:
         from src.semantic.canonical import CanonicalMarket
+
         m = CanonicalMarket(code=CanonicalMarketCode.H2H_3WAY)
         assert canonical_market_id("fx-1", m) == "fx-1|1x2"
 
@@ -329,5 +485,6 @@ class TestCanonicalMarketId:
         line value participates in the canonical market_id so
         different line markets don't collide."""
         from src.semantic.canonical import CanonicalMarket
+
         m = CanonicalMarket(code=CanonicalMarketCode.H2H_3WAY, line=2.5)
         assert canonical_market_id("fx-1", m) == "fx-1|1x2|2.5"

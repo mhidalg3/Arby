@@ -24,11 +24,11 @@ from src.ingestion.scrapers.bplay_sse import (
 # /en-vivo SSR HTML with two live match IDs embedded.
 _EN_VIVO_HTML: bytes = (
     b"<!doctype html>"
-    b"<html><body><div data-live-id=\"13925270\">match-1</div>"
-    b"<div data-live-id=\"13925271\">match-2</div>"
+    b'<html><body><div data-live-id="13925270">match-1</div>'
+    b'<div data-live-id="13925271">match-2</div>'
     # The SPA SSR also embeds `matchId:"..."` patterns; the scraper
     # greps for those, not the data-live-id.
-    b"<script>window.__NUXT__ = {events: [{matchId:\"13925270\",x:1}, {matchId:\"13925271\",y:2}]}</script>"
+    b'<script>window.__NUXT__ = {events: [{matchId:"13925270",x:1}, {matchId:"13925271",y:2}]}</script>'
     b"</body></html>"
 )
 
@@ -48,12 +48,27 @@ def _odds_event_1x2() -> dict:
                         "pid": "abc",
                         "ha": "xyz",
                         "tch": {
-                            "c1": {"cid": "SNC_ACTOR_HOME", "ct": 1.58,
-                                   "ct_dsp": "1.58", "act": "Real Cundinamarca", "td": ""},
-                            "c2": {"cid": "SNC_ACTOR_DRAW", "ct": 3.25,
-                                   "ct_dsp": "3.25", "act": "Empate", "td": ""},
-                            "c3": {"cid": "SNC_ACTOR_AWAY", "ct": 6.20,
-                                   "ct_dsp": "6.20", "act": "Rionegro Águilas", "td": ""},
+                            "c1": {
+                                "cid": "SNC_ACTOR_HOME",
+                                "ct": 1.58,
+                                "ct_dsp": "1.58",
+                                "act": "Real Cundinamarca",
+                                "td": "",
+                            },
+                            "c2": {
+                                "cid": "SNC_ACTOR_DRAW",
+                                "ct": 3.25,
+                                "ct_dsp": "3.25",
+                                "act": "Empate",
+                                "td": "",
+                            },
+                            "c3": {
+                                "cid": "SNC_ACTOR_AWAY",
+                                "ct": 6.20,
+                                "ct_dsp": "6.20",
+                                "act": "Rionegro Águilas",
+                                "td": "",
+                            },
                         },
                     }
                 ],
@@ -69,12 +84,14 @@ def _odds_event_btts() -> dict:
             {
                 "qt": "Ambos equipos marcan",
                 "qlid": 2133023,
-                "bets": [{
-                    "tch": {
-                        "c1": {"cid": "39", "ct": 1.65, "act": "Sí"},
-                        "c2": {"cid": "40", "ct": 2.11, "act": "No"},
+                "bets": [
+                    {
+                        "tch": {
+                            "c1": {"cid": "39", "ct": 1.65, "act": "Sí"},
+                            "c2": {"cid": "40", "ct": 2.11, "act": "No"},
+                        }
                     }
-                }],
+                ],
             }
         ],
     }
@@ -87,12 +104,14 @@ def _odds_event_ou(line: float = 2.5) -> dict:
             {
                 "qt": "Total de Goles",
                 "qlid": 2133446,
-                "bets": [{
-                    "tch": {
-                        "c1": {"cid": "30", "ct": 2.35, "act": f"Más de {line}"},
-                        "c2": {"cid": "31", "ct": 1.55, "act": f"Menos de {line}"},
+                "bets": [
+                    {
+                        "tch": {
+                            "c1": {"cid": "30", "ct": 2.35, "act": f"Más de {line}"},
+                            "c2": {"cid": "31", "ct": 1.55, "act": f"Menos de {line}"},
+                        }
                     }
-                }],
+                ],
             }
         ],
     }
@@ -132,15 +151,18 @@ def _routes_handler(
     def _handler(req: httpx.Request) -> httpx.Response:
         if req.url.host == "deportespba.bplay.bet.ar":
             return httpx.Response(
-                200, content=en_vivo_body,
+                200,
+                content=en_vivo_body,
                 headers={"content-type": "text/html; charset=utf-8"},
             )
         if req.url.host == "events-deportespba.bplay.bet.ar":
             return httpx.Response(
-                200, content=sse_body,
+                200,
+                content=sse_body,
                 headers={"content-type": "text/event-stream"},
             )
         return httpx.Response(404)
+
     return _handler
 
 
@@ -154,7 +176,8 @@ def _make_client(handler) -> httpx.AsyncClient:
 class TestSnapshotsFromOddsPayload:
     def test_1x2_yields_three_snapshots(self) -> None:
         snaps = _snapshots_from_odds_payload(
-            _odds_event_1x2(), platform_name="bplay-pba",
+            _odds_event_1x2(),
+            platform_name="bplay-pba",
             raw_event_name="Real Cundinamarca vs Rionegro Águilas",
         )
         assert len(snaps) == 3
@@ -172,7 +195,8 @@ class TestSnapshotsFromOddsPayload:
 
     def test_btts_yields_two_snapshots(self) -> None:
         snaps = _snapshots_from_odds_payload(
-            _odds_event_btts(), platform_name="bplay-pba",
+            _odds_event_btts(),
+            platform_name="bplay-pba",
         )
         assert len(snaps) == 2
         labels = {s.raw_outcome_name: s.decimal_odds for s in snaps}
@@ -184,7 +208,8 @@ class TestSnapshotsFromOddsPayload:
         """OU `raw_market_name` is formatted as `"Total de Goles 2.5"`
         so the existing market_resolver regex finds the line."""
         snaps = _snapshots_from_odds_payload(
-            _odds_event_ou(line=2.5), platform_name="bplay-pba",
+            _odds_event_ou(line=2.5),
+            platform_name="bplay-pba",
         )
         assert len(snaps) == 2
         for s in snaps:
@@ -218,20 +243,25 @@ class TestSnapshotsFromOddsPayload:
     def test_non_v1_market_skipped(self) -> None:
         payload = {
             "match_id": "13925270",
-            "odds": [{
-                "qt": "Doble oportunidad",  # Double Chance — not v1
-                "qlid": 2133007,
-                "bets": [{"tch": {"c1": {"cid": "7", "ct": 1.5, "act": "X o Y"}}}],
-            }],
+            "odds": [
+                {
+                    "qt": "Doble oportunidad",  # Double Chance — not v1
+                    "qlid": 2133007,
+                    "bets": [{"tch": {"c1": {"cid": "7", "ct": 1.5, "act": "X o Y"}}}],
+                }
+            ],
         }
         snaps = _snapshots_from_odds_payload(payload, platform_name="bplay-pba")
         assert snaps == []
 
     def test_missing_match_id_returns_empty(self) -> None:
         assert _snapshots_from_odds_payload({}, platform_name="bplay-pba") == []
-        assert _snapshots_from_odds_payload(
-            {"odds": [_odds_event_1x2()["odds"][0]]}, platform_name="bplay-pba"
-        ) == []
+        assert (
+            _snapshots_from_odds_payload(
+                {"odds": [_odds_event_1x2()["odds"][0]]}, platform_name="bplay-pba"
+            )
+            == []
+        )
 
 
 class TestExtractOuLine:
@@ -256,10 +286,14 @@ class TestExtractOuLine:
         """Real-world data showed Bplay pushing nonsensical 54.5/55.5
         OU lines on a U21 soccer match (likely a mislabeled stat-prop
         market). Sanity-bound at 12.0 goals max."""
-        bets = [{"tch": {
-            "c1": {"cid": "30", "ct": 1.95, "act": "Más de 55.5"},
-            "c2": {"cid": "31", "ct": 1.75, "act": "Menos de 55.5"},
-        }}]
+        bets = [
+            {
+                "tch": {
+                    "c1": {"cid": "30", "ct": 1.95, "act": "Más de 55.5"},
+                    "c2": {"cid": "31", "ct": 1.75, "act": "Menos de 55.5"},
+                }
+            }
+        ]
         assert _extract_ou_line(bets) is None
 
 
@@ -268,12 +302,14 @@ class TestExtractOuLine:
 
 class TestFetchLiveSoccerEnd2End:
     async def test_full_flow_yields_v1_snapshots(self) -> None:
-        sse_body = _build_sse_body([
-            ("match", _match_event()),  # name first
-            ("odds", _odds_event_1x2()),
-            ("odds", _odds_event_btts()),
-            ("odds", _odds_event_ou(2.5)),
-        ])
+        sse_body = _build_sse_body(
+            [
+                ("match", _match_event()),  # name first
+                ("odds", _odds_event_1x2()),
+                ("odds", _odds_event_btts()),
+                ("odds", _odds_event_ou(2.5)),
+            ]
+        )
         client = _make_client(_routes_handler(sse_body=sse_body))
         s = BplayPbaSSEScraper(http_client=client, stream_duration_sec=2.0)
         snaps = [snap async for snap in s.fetch_live_soccer()]
@@ -309,9 +345,11 @@ class TestFetchLiveSoccerEnd2End:
         raw_event_name. canonicalizer's fixture_resolver will drop
         it; the next odds event will succeed once the match event
         arrives and populates the map."""
-        sse_body = _build_sse_body([
-            ("odds", _odds_event_1x2()),  # no match event before it
-        ])
+        sse_body = _build_sse_body(
+            [
+                ("odds", _odds_event_1x2()),  # no match event before it
+            ]
+        )
         client = _make_client(_routes_handler(sse_body=sse_body))
         s = BplayPbaSSEScraper(http_client=client, stream_duration_sec=2.0)
         snaps = [snap async for snap in s.fetch_live_soccer()]
@@ -327,13 +365,15 @@ class TestFetchLiveSoccerEnd2End:
         def handler(req: httpx.Request) -> httpx.Response:
             if req.url.host == "deportespba.bplay.bet.ar":
                 return httpx.Response(
-                    200, content=_EN_VIVO_HTML,
+                    200,
+                    content=_EN_VIVO_HTML,
                     headers={"content-type": "text/html"},
                 )
             if req.url.host == "events-deportespba.bplay.bet.ar":
                 seen_urls.append(str(req.url))
                 return httpx.Response(
-                    200, content=_build_sse_body([]),
+                    200,
+                    content=_build_sse_body([]),
                     headers={"content-type": "text/event-stream"},
                 )
             return httpx.Response(404)

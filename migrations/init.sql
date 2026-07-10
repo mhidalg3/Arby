@@ -71,6 +71,21 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
     raw_outcome_name TEXT NOT NULL,
     decimal_odds    DOUBLE PRECISION NOT NULL,
     max_stake       DOUBLE PRECISION,
+    -- Cross-platform lag model columns (additive, all have defaults).
+    platform_market_id  TEXT NOT NULL DEFAULT '',
+    platform_outcome_id TEXT NOT NULL DEFAULT '',
+    raw_event_name      TEXT NOT NULL DEFAULT '',
+    raw_competition     TEXT NOT NULL DEFAULT '',
+    transport           TEXT NOT NULL DEFAULT 'poll',
+    market_code         TEXT,             -- canonical: h2h_3way|btts|ou
+    line                DOUBLE PRECISION, -- OU line, else NULL
+    cell                TEXT,             -- HOME|DRAW|AWAY|YES|NO|OVER|UNDER
+    fixture_key         TEXT,             -- "home_n|away_n|YYYY-MM-DD" (kickoff UTC date); NULL when kickoff unknown
+    kickoff_utc         TIMESTAMPTZ,
+    is_change           BOOLEAN NOT NULL DEFAULT TRUE,
+    prev_observed_at    TIMESTAMPTZ,      -- last observation of this (platform, outcome) BEFORE this row — censoring lower bound
+    recorder_session_id TEXT NOT NULL DEFAULT '',  -- uuid minted once per pg_recorder process start
+    session_fixture_id  TEXT,             -- the canonicalizer's in-process fx-<uuid> — stable WITHIN one recorder session only
     CHECK (decimal_odds > 1.0)
 );
 
@@ -82,6 +97,19 @@ CREATE INDEX idx_odds_outcome_time
 
 CREATE INDEX idx_odds_platform_event
     ON odds_snapshots (platform, platform_event_id, time DESC);
+
+-- Canonical time-series index for the lag analysis (cross-platform joins).
+CREATE INDEX IF NOT EXISTS idx_odds_canonical_time
+    ON odds_snapshots (fixture_key, market_code, line, cell, time DESC)
+    WHERE fixture_key IS NOT NULL AND market_code IS NOT NULL;
+
+-- Session-scoped fallback join for rows without kickoff (no fixture_key).
+CREATE INDEX IF NOT EXISTS idx_odds_session_time
+    ON odds_snapshots (recorder_session_id, session_fixture_id, market_code, line, cell, time DESC)
+    WHERE session_fixture_id IS NOT NULL;
+
+-- Bound storage: 45-day rolling window on the hypertable.
+SELECT add_retention_policy('odds_snapshots', INTERVAL '45 days', if_not_exists => TRUE);
 
 -- ===== Detected opportunities =====
 -- One row per arbitrage opportunity surfaced to the engine.

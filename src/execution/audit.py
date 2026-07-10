@@ -23,10 +23,18 @@ from src.risk.decision import RiskDecision
 
 class AuditRecorder(Protocol):
     async def record_opportunity(
-        self, market_id: str, opp: ArbitrageOpportunity, decision: RiskDecision
+        self,
+        market_id: str,
+        opp: ArbitrageOpportunity,
+        decision: RiskDecision,
+        *,
+        adaptive_threshold_pct: float | None = None,
+        garch_variance: float | None = None,
     ) -> int | None:
         """Persist an APPROVED arb. Returns its durable id, or None if persistence
-        failed / unavailable (the caller proceeds regardless)."""
+        failed / unavailable (the caller proceeds regardless). ``adaptive_threshold_pct``
+        is the margin threshold actually applied; ``garch_variance`` is the σ²_t (scaled
+        units) backing it — both None when adaptive thresholds are off (today's rows)."""
         ...
 
     async def record_execution(
@@ -41,7 +49,13 @@ class NullRecorder:
     """Default no-op recorder (dry-run / tests / DB-less)."""
 
     async def record_opportunity(
-        self, market_id: str, opp: ArbitrageOpportunity, decision: RiskDecision
+        self,
+        market_id: str,
+        opp: ArbitrageOpportunity,
+        decision: RiskDecision,
+        *,
+        adaptive_threshold_pct: float | None = None,
+        garch_variance: float | None = None,
     ) -> int | None:
         return None
 

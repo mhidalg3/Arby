@@ -105,11 +105,7 @@ class StakeSizer:
         confidence = self._confidence(quotes)
         if confidence < self.policy.min_confidence:
             return 0.0
-        budget = (
-            self.policy.total_capital_ars
-            * self.policy.max_fraction_per_arb
-            * confidence
-        )
+        budget = self.policy.total_capital_ars * self.policy.max_fraction_per_arb * confidence
         if budget < self.policy.min_total_stake_ars:
             return 0.0
         return budget

@@ -165,9 +165,7 @@ class BplayPbaScraper(BaseScraper):
         self._guard = guard or RateLimitGuard(platform=self.platform_name)
         self._log = log.bind(platform=self.platform_name)
 
-    async def fetch_competition_quotes(
-        self, competition_id: int
-    ) -> list[RawOddsSnapshot]:
+    async def fetch_competition_quotes(self, competition_id: int) -> list[RawOddsSnapshot]:
         """Surgical per-competition fetch — exposes the same XML feed
         used by `fetch_live_soccer` but returns just one
         competition's snapshots as a list.
@@ -179,9 +177,7 @@ class BplayPbaScraper(BaseScraper):
         Raises `BplayContractError` on transport / schema failure.
         """
         label = self._competitions.get(competition_id, "")
-        return [
-            snap async for snap in self._fetch_competition(competition_id, label)
-        ]
+        return [snap async for snap in self._fetch_competition(competition_id, label)]
 
     async def fetch_live_soccer(self) -> AsyncIterator[RawOddsSnapshot]:
         for competition_id, competition_label in self._competitions.items():
@@ -207,9 +203,7 @@ class BplayPbaScraper(BaseScraper):
         url = f"{BASE_URL}{ODDS_FEED_PATH.format(competition_id=competition_id)}"
         try:
             resp = await self._guard.get(
-                lambda: self._client.get(
-                    url, headers=_XML_HEADERS, timeout=DEFAULT_HTTP_TIMEOUT
-                )
+                lambda: self._client.get(url, headers=_XML_HEADERS, timeout=DEFAULT_HTTP_TIMEOUT)
             )
         except CircuitOpenError as exc:
             # Circuit is open from a recent block/rate-limit — fail fast,

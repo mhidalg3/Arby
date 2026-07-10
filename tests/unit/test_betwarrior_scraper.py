@@ -19,15 +19,17 @@ import pytest
 from src.ingestion.scrapers.betwarrior import (
     BASE_URL,
     BRAND_ID,
+    BetWarriorContractError,
     BetWarriorPbaDepthScraper,
     BetWarriorPbaScraper,
 )
 
 # ---- Synthetic JSON responses ----
 
-# Trimmed Libertadores-style list view: two events, each with one
-# primary "Match" (1X2) betoffer. Event 1027027525 is open; event
-# 1027027526 is in "STARTED" state but still has open outcomes.
+# Trimmed Libertadores-style list view: three events, each with one
+# primary "Match" (1X2) betoffer. Event 1027027525 and 1027027527 are
+# prematch (NOT_STARTED); event 1027027526 is "STARTED" (in-play) and
+# must be dropped entirely by the prematch-only gate.
 _BODY_LIBERTADORES: bytes = json.dumps(
     {
         "events": [
@@ -77,6 +79,28 @@ _BODY_LIBERTADORES: bytes = json.dumps(
                             {"id": 100011, "label": "1", "odds": 2100, "status": "OPEN"},
                             {"id": 100012, "label": "X", "odds": 3400, "status": "OPEN"},
                             {"id": 100013, "label": "2", "odds": 3000, "status": "SUSPENDED"},
+                        ],
+                    }
+                ],
+            },
+            {
+                "event": {
+                    "id": 1027027527,
+                    "name": "Colo Colo - Fortaleza",
+                    "homeName": "Colo Colo",
+                    "awayName": "Fortaleza",
+                    "state": "NOT_STARTED",
+                    "sport": "FOOTBALL",
+                },
+                "betOffers": [
+                    {
+                        "id": 2649147286,
+                        "criterion": {"label": "Resultado Final"},
+                        "betOfferType": {"englishName": "Match"},
+                        "outcomes": [
+                            {"id": 100021, "label": "1", "odds": 2100, "status": "OPEN"},
+                            {"id": 100022, "label": "X", "odds": 3400, "status": "OPEN"},
+                            {"id": 100023, "label": "2", "odds": 3000, "status": "SUSPENDED"},
                         ],
                     }
                 ],
@@ -275,7 +299,7 @@ class TestContractErrors:
         snaps = [snap async for snap in s.fetch_live_soccer()]
         # Libertadores produces snapshots; everything else 503'd.
         assert snaps
-        assert {snap.platform_event_id for snap in snaps} == {"1027027525", "1027027526"}
+        assert {snap.platform_event_id for snap in snaps} == {"1027027525", "1027027527"}
         await client.aclose()
 
     async def test_malformed_json_skips_competition(self) -> None:
@@ -336,16 +360,27 @@ class TestOddsExtraction:
         await client.aclose()
 
     async def test_non_open_outcomes_dropped(self) -> None:
-        """Event 1027027526's "2" outcome is SUSPENDED — must not emit."""
+        """Event 1027027527's "2" outcome is SUSPENDED — must not emit."""
         client = _make_client(
             _slug_routes_handler({"copa_libertadores": (200, _BODY_LIBERTADORES)})
         )
         s = BetWarriorPbaScraper(http_client=client, competitions={"copa_libertadores": "test"})
         snaps = [snap async for snap in s.fetch_live_soccer()]
-        match2 = [s for s in snaps if s.platform_event_id == "1027027526"]
+        match2 = [s for s in snaps if s.platform_event_id == "1027027527"]
         labels = {snap.raw_outcome_name for snap in match2}
         # SUSPENDED "2" outcome dropped; "1" and "X" remain.
         assert labels == {"1", "X"}
+        await client.aclose()
+
+    async def test_started_event_excluded(self) -> None:
+        """Event 1027027526 is STARTED (in-play) — even though its "1"
+        and "X" outcomes are OPEN, the prematch gate must drop it entirely."""
+        client = _make_client(
+            _slug_routes_handler({"copa_libertadores": (200, _BODY_LIBERTADORES)})
+        )
+        s = BetWarriorPbaScraper(http_client=client, competitions={"copa_libertadores": "test"})
+        snaps = [snap async for snap in s.fetch_live_soccer()]
+        assert all(snap.platform_event_id != "1027027526" for snap in snaps)
         await client.aclose()
 
     async def test_sub_unity_odds_dropped(self) -> None:
@@ -483,16 +518,15 @@ class TestRequestShape:
 #   - 1 suspended outcome that must be skipped
 _BODY_DEPTH_EVENT: bytes = json.dumps(
     {
+        "events": [{"id": 1027027525, "name": "LDU Quito - Always Ready", "state": "NOT_STARTED"}],
         "betOffers": [
             {
                 "id": 9001,
                 "criterion": {"label": "Ambos Equipos Marcarán"},
                 "betOfferType": {"englishName": "Yes/No"},
                 "outcomes": [
-                    {"id": 90011, "label": "Sí", "type": "OT_YES",
-                     "odds": 2040, "status": "OPEN"},
-                    {"id": 90012, "label": "No", "type": "OT_NO",
-                     "odds": 1680, "status": "OPEN"},
+                    {"id": 90011, "label": "Sí", "type": "OT_YES", "odds": 2040, "status": "OPEN"},
+                    {"id": 90012, "label": "No", "type": "OT_NO", "odds": 1680, "status": "OPEN"},
                 ],
             },
             {
@@ -500,10 +534,22 @@ _BODY_DEPTH_EVENT: bytes = json.dumps(
                 "criterion": {"label": "Total de goles"},
                 "betOfferType": {"englishName": "Over/Under"},
                 "outcomes": [
-                    {"id": 90021, "label": "Más de", "type": "OT_OVER",
-                     "line": 2500, "odds": 1900, "status": "OPEN"},
-                    {"id": 90022, "label": "Menos de", "type": "OT_UNDER",
-                     "line": 2500, "odds": 1950, "status": "OPEN"},
+                    {
+                        "id": 90021,
+                        "label": "Más de",
+                        "type": "OT_OVER",
+                        "line": 2500,
+                        "odds": 1900,
+                        "status": "OPEN",
+                    },
+                    {
+                        "id": 90022,
+                        "label": "Menos de",
+                        "type": "OT_UNDER",
+                        "line": 2500,
+                        "odds": 1950,
+                        "status": "OPEN",
+                    },
                 ],
             },
             {
@@ -511,10 +557,22 @@ _BODY_DEPTH_EVENT: bytes = json.dumps(
                 "criterion": {"label": "Total de goles"},
                 "betOfferType": {"englishName": "Over/Under"},
                 "outcomes": [
-                    {"id": 90031, "label": "Más de", "type": "OT_OVER",
-                     "line": 3500, "odds": 3400, "status": "OPEN"},
-                    {"id": 90032, "label": "Menos de", "type": "OT_UNDER",
-                     "line": 3500, "odds": 1300, "status": "OPEN"},
+                    {
+                        "id": 90031,
+                        "label": "Más de",
+                        "type": "OT_OVER",
+                        "line": 3500,
+                        "odds": 3400,
+                        "status": "OPEN",
+                    },
+                    {
+                        "id": 90032,
+                        "label": "Menos de",
+                        "type": "OT_UNDER",
+                        "line": 3500,
+                        "odds": 1300,
+                        "status": "OPEN",
+                    },
                 ],
             },
             {
@@ -523,10 +581,22 @@ _BODY_DEPTH_EVENT: bytes = json.dumps(
                 "criterion": {"label": "Total de goles"},
                 "betOfferType": {"englishName": "Over/Under"},
                 "outcomes": [
-                    {"id": 90041, "label": "Más de", "type": "OT_OVER",
-                     "line": 3000, "odds": 2100, "status": "OPEN"},
-                    {"id": 90042, "label": "Menos de", "type": "OT_UNDER",
-                     "line": 3000, "odds": 1850, "status": "OPEN"},
+                    {
+                        "id": 90041,
+                        "label": "Más de",
+                        "type": "OT_OVER",
+                        "line": 3000,
+                        "odds": 2100,
+                        "status": "OPEN",
+                    },
+                    {
+                        "id": 90042,
+                        "label": "Menos de",
+                        "type": "OT_UNDER",
+                        "line": 3000,
+                        "odds": 1850,
+                        "status": "OPEN",
+                    },
                 ],
             },
             {
@@ -535,10 +605,22 @@ _BODY_DEPTH_EVENT: bytes = json.dumps(
                 "criterion": {"label": "Total de goles"},
                 "betOfferType": {"englishName": "Over/Under"},
                 "outcomes": [
-                    {"id": 90051, "label": "Más de", "type": "OT_OVER",
-                     "line": 4500, "odds": 5000, "status": "SUSPENDED"},
-                    {"id": 90052, "label": "Menos de", "type": "OT_UNDER",
-                     "line": 4500, "odds": 1150, "status": "OPEN"},
+                    {
+                        "id": 90051,
+                        "label": "Más de",
+                        "type": "OT_OVER",
+                        "line": 4500,
+                        "odds": 5000,
+                        "status": "SUSPENDED",
+                    },
+                    {
+                        "id": 90052,
+                        "label": "Menos de",
+                        "type": "OT_UNDER",
+                        "line": 4500,
+                        "odds": 1150,
+                        "status": "OPEN",
+                    },
                 ],
             },
             {
@@ -547,10 +629,8 @@ _BODY_DEPTH_EVENT: bytes = json.dumps(
                 "criterion": {"label": "Hándicap Asiático"},
                 "betOfferType": {"englishName": "Asian Handicap"},
                 "outcomes": [
-                    {"id": 90061, "label": "1", "line": -500,
-                     "odds": 1750, "status": "OPEN"},
-                    {"id": 90062, "label": "2", "line": -500,
-                     "odds": 2050, "status": "OPEN"},
+                    {"id": 90061, "label": "1", "line": -500, "odds": 1750, "status": "OPEN"},
+                    {"id": 90062, "label": "2", "line": -500, "odds": 2050, "status": "OPEN"},
                 ],
             },
             {
@@ -560,13 +640,11 @@ _BODY_DEPTH_EVENT: bytes = json.dumps(
                 "criterion": {"label": "Ambos Equipos Marcarán - 1.ª parte"},
                 "betOfferType": {"englishName": "Yes/No"},
                 "outcomes": [
-                    {"id": 90071, "label": "Sí", "type": "OT_YES",
-                     "odds": 5000, "status": "OPEN"},
-                    {"id": 90072, "label": "No", "type": "OT_NO",
-                     "odds": 1200, "status": "OPEN"},
+                    {"id": 90071, "label": "Sí", "type": "OT_YES", "odds": 5000, "status": "OPEN"},
+                    {"id": 90072, "label": "No", "type": "OT_NO", "odds": 1200, "status": "OPEN"},
                 ],
             },
-        ]
+        ],
     }
 ).encode("utf-8")
 
@@ -671,9 +749,9 @@ class TestDepthDiscoveryAndFetch:
         assert btts_yes.decimal_odds == pytest.approx(2.04)
         # OU 2.5 OVER: odds=1900 → 1.9
         ou_over_25 = next(
-            snap for snap in snaps
-            if snap.raw_market_name == "Total de goles 2.5"
-            and snap.raw_outcome_name == "Más de"
+            snap
+            for snap in snaps
+            if snap.raw_market_name == "Total de goles 2.5" and snap.raw_outcome_name == "Más de"
         )
         assert ou_over_25.decimal_odds == pytest.approx(1.9)
         await client.aclose()
@@ -720,6 +798,68 @@ class TestDepthDiscoveryAndFetch:
         assert snaps == []
         await client.aclose()
 
+    async def test_fetch_event_quotes_inplay_returns_empty(self) -> None:
+        """The reverify fail-closed layer: an in-play betoffer response
+        yields zero snapshots, so the executor aborts on the kickoff
+        boundary instead of placing on a live market."""
+        inplay = json.loads(_BODY_DEPTH_EVENT)
+        inplay["events"][0]["state"] = "STARTED"
+        inplay_body = json.dumps(inplay).encode("utf-8")
+        client = _make_client(
+            _depth_routes_handler(
+                list_view_routes={}, event_routes={"1027027525": (200, inplay_body)}
+            )
+        )
+        s = BetWarriorPbaDepthScraper(http_client=client)
+        snaps = await s.fetch_event_quotes("1027027525")
+        assert snaps == []
+        await client.aclose()
+
+    async def test_fetch_event_quotes_missing_events_metadata_raises(self) -> None:
+        """Missing 'events' metadata is a contract break → raise (fail-closed)."""
+        no_events = json.dumps({"betOffers": []}).encode("utf-8")
+        client = _make_client(
+            _depth_routes_handler(
+                list_view_routes={}, event_routes={"1027027525": (200, no_events)}
+            )
+        )
+        s = BetWarriorPbaDepthScraper(http_client=client)
+        with pytest.raises(BetWarriorContractError):
+            await s.fetch_event_quotes("1027027525")
+        await client.aclose()
+
+    async def test_depth_discovery_skips_started_events(self) -> None:
+        """A STARTED event in the list-view is never depth-polled — the
+        betoffer/event/<id> call for it must not happen (saves the
+        ~434 KB fetch for live matches)."""
+        seen: list[str] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append(req.url.path)
+            path = req.url.path
+            if path.endswith("/all/matches.json"):
+                return httpx.Response(
+                    200,
+                    content=_BODY_LIBERTADORES,
+                    headers={"content-type": "application/json"},
+                )
+            if "/betoffer/event/" in path:
+                return httpx.Response(
+                    200,
+                    content=_BODY_DEPTH_EVENT,
+                    headers={"content-type": "application/json"},
+                )
+            return httpx.Response(404)
+
+        client = _make_client(handler)
+        s = BetWarriorPbaDepthScraper(
+            http_client=client, competitions={"copa_libertadores": "test"}
+        )
+        async for _ in s.fetch_live_soccer():
+            pass
+        assert not any("/betoffer/event/1027027526" in p for p in seen)
+        await client.aclose()
+
 
 class TestDepthRequestShape:
     async def test_event_endpoint_path_and_params(self) -> None:
@@ -730,12 +870,14 @@ class TestDepthRequestShape:
             path = req.url.path
             if path.endswith("/all/matches.json"):
                 return httpx.Response(
-                    200, content=_BODY_LIBERTADORES,
+                    200,
+                    content=_BODY_LIBERTADORES,
                     headers={"content-type": "application/json"},
                 )
             if "/betoffer/event/" in path:
                 return httpx.Response(
-                    200, content=_BODY_DEPTH_EVENT,
+                    200,
+                    content=_BODY_DEPTH_EVENT,
                     headers={"content-type": "application/json"},
                 )
             return httpx.Response(404)
@@ -753,9 +895,7 @@ class TestDepthRequestShape:
         assert list_paths
         assert event_paths
         # Event endpoint format: /offering/v2018/<brand>/betoffer/event/<id>.json
-        assert event_paths[0].startswith(
-            f"/offering/v2018/{BRAND_ID}/betoffer/event/"
-        )
+        assert event_paths[0].startswith(f"/offering/v2018/{BRAND_ID}/betoffer/event/")
         assert event_paths[0].endswith(".json")
         # All calls include the required lang param.
         for _, params in seen:

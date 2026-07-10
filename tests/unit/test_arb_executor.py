@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import pytest
+import structlog.testing
 
-from src.arbitrage.dutch_book import ArbitrageOpportunity
+from src.arbitrage.dutch_book import ArbitrageOpportunity, detect_arbitrage
 from src.arbitrage.quotes import OddsQuote
 from src.execution.arb_executor import (
     execute_opportunity,
     leg_from_quote,
     legs_from_opportunity,
+    order_opportunity_for_execution,
 )
 from src.execution.executor import ExecutionOutcome, Executor, Leg, PlacementResult
 from src.execution.guardrails import Guardrails
@@ -194,7 +196,10 @@ def test_dynamic_cap_applied_to_betano_when_quote_has_no_max_stake() -> None:
     assert leg2.live_max_stake_ars is None  # non-dynamic: no fallback cap
     # a quote that already carries a cap keeps it
     q_capped = _quote("betano", "away", 1.95, max_stake=1234.0)
-    assert leg_from_quote(q_capped, 50.0, match_id="M", dynamic_stake_cap_ars=500.0).live_max_stake_ars == 1234.0
+    assert (
+        leg_from_quote(q_capped, 50.0, match_id="M", dynamic_stake_cap_ars=500.0).live_max_stake_ars
+        == 1234.0
+    )
 
 
 def _two_leg_opp_betano_uncapped() -> ArbitrageOpportunity:
@@ -260,3 +265,318 @@ async def test_no_live_cap_falls_back_to_static_cap() -> None:
     res, ap = await _execute_with_betano_cap(None)
     assert res.outcome is ExecutionOutcome.COMPLETED
     assert ap.legs[0].stake_ars == pytest.approx(300.0)
+
+
+# ---- residual recapture end-to-end through the bridge ----
+
+
+def _two_way_opp() -> ArbitrageOpportunity:
+    """2-leg arb: betsson HOME 2.5 + betano AWAY 2.5 (overround 0.8). At budget
+    1000, allocate_maxmin stakes each leg 500."""
+    opp = detect_arbitrage(
+        [_quote("betsson", "home", 2.5), _quote("betano", "away", 2.5)], 1000.0, 1.0
+    )
+    assert opp is not None
+    return opp
+
+
+class _RejectOncePlacer:
+    """Rejects the first place() with odds_rejected, accepts thereafter."""
+
+    def __init__(self) -> None:
+        self.legs: list[Leg] = []
+        self._rejected = False
+
+    async def place(self, leg: Leg) -> PlacementResult:
+        self.legs.append(leg)
+        if not self._rejected:
+            self._rejected = True
+            return PlacementResult(accepted=False, odds_rejected=True, detail="invalid odds")
+        return PlacementResult(accepted=True, stake_filled=leg.stake_ars, odds_filled=leg.odds)
+
+
+class _OverfillPlacer:
+    """Accepts but reports a FIXED stake_filled (to exhaust the residual budget)."""
+
+    def __init__(self, fill: float) -> None:
+        self.fill = fill
+
+    async def place(self, leg: Leg) -> PlacementResult:
+        return PlacementResult(accepted=True, stake_filled=self.fill, odds_filled=leg.odds)
+
+
+def _reverify_drift_on(*, drift_call: int, drift_odds: float):
+    """reverify that returns leg.odds everywhere EXCEPT the ``drift_call``-th call,
+    which returns ``drift_odds``. In these tests ``drift_call`` is set to leg B's
+    recapture refetch call (the passing assertions pin that ordinal), so the
+    residual closure sees the drifted fresh odds."""
+
+    state = {"c": 0}
+
+    async def reverify(leg: Leg) -> float:
+        state["c"] += 1
+        return drift_odds if state["c"] == drift_call else leg.odds
+
+    return reverify
+
+
+async def test_residual_recapture_completes_with_resized_stake() -> None:
+    """Leg B (betano) odds_rejected once → the bridge's _residual closure runs
+    allocate_residual around leg A's fill → leg B's second POST carries the
+    residual-solver stake/odds → COMPLETED (no naked). Hand-computed: A fills
+    500 @ 2.5 → payout 1250; B re-fetched at 3.0 → stake 1250/3 ≈ 416.67."""
+    opp = _two_way_opp()
+    bp = _Placer()  # betsson (leg A) accepts
+    rp = _RejectOncePlacer()  # betano (leg B) rejects once, then accepts
+    ex = Executor(
+        guardrails=_guard(),
+        notifier=_Notifier(),
+        recovery=_Recovery(),
+        placers={"betsson": bp, "betano": rp},
+        reverify=_reverify_drift_on(drift_call=5, drift_odds=3.0),
+    )
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=1000.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    assert bp.legs[0].stake_ars == pytest.approx(500.0)  # leg A at the revalidated stake
+    assert rp.legs[1].odds == 3.0  # leg B re-POSTed at the fresh odds
+    assert rp.legs[1].stake_ars == pytest.approx(1250.0 / 3.0, rel=1e-4)  # residual stake
+
+
+async def test_residual_unprofitable_fresh_odds_is_naked() -> None:
+    """Leg B's recapture fresh odds collapse to 1.01 → no hedge locks ≥ 0 →
+    residual returns None → today's NAKED EXPOSURE (leg A live), B never re-POSTed."""
+    opp = _two_way_opp()
+    bp = _Placer()
+    rp = _RejectOncePlacer()
+    ex = Executor(
+        guardrails=_guard(),
+        notifier=_Notifier(),
+        recovery=_Recovery(),
+        placers={"betsson": bp, "betano": rp},
+        reverify=_reverify_drift_on(drift_call=5, drift_odds=1.01),
+    )
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=1000.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert len(rp.legs) == 1  # B rejected once; recapture refused, never re-POSTed
+
+
+async def test_residual_budget_exhausted_is_naked() -> None:
+    """Leg A's reported fill consumes the whole budget → budget_remaining (= budget
+    − placed_total) ≤ 0 → allocate_residual returns None → NAKED EXPOSURE. This
+    branch can't arise from a normal allocation (each leg stakes < budget), so the
+    placer over-reports A's fill to reach it — it's a defensive-guard test."""
+    opp = _two_way_opp()
+    bp = _OverfillPlacer(fill=1000.0)  # betsson (leg A) over-reports stake_filled
+    rp = _RejectOncePlacer()  # betano (leg B) rejects once
+    ex = Executor(
+        guardrails=_guard(),
+        notifier=_Notifier(),
+        recovery=_Recovery(),
+        placers={"betsson": bp, "betano": rp},
+    )
+    res = await execute_opportunity(ex, opp, opp_id="t", budget=1000.0, min_margin_pct=1.0)
+    assert res.outcome is ExecutionOutcome.NAKED_EXPOSURE
+    assert len(rp.legs) == 1  # B rejected; no salvageable budget left → never re-POSTed
+
+
+async def test_revalidate_logs_fresh_odds_and_roi_on_abort() -> None:
+    """Edge gone at reverify → the arb_executor.revalidated line carries the
+    fresh odds and margin, so the abort is self-explanatory without scrollback."""
+
+    async def reverify(leg: Leg) -> float:
+        return 1.6  # overround 1.25 → no arb
+
+    ex = Executor(
+        guardrails=_guard(),
+        notifier=_Notifier(),
+        recovery=_Recovery(),
+        placers={"betsson": _Placer(), "betano": _Placer()},
+        reverify=reverify,
+    )
+    with structlog.testing.capture_logs() as logs:
+        res = await execute_opportunity(
+            ex, _two_way_opp(), opp_id="opp-rv1", budget=1000.0, min_margin_pct=1.0
+        )
+    assert res.outcome is ExecutionOutcome.ABORTED
+    entry = next(e for e in logs if e["event"] == "arb_executor.revalidated")
+    assert entry["opp_id"] == "opp-rv1"
+    assert entry["original_odds"] == [2.5, 2.5]
+    assert entry["current_odds"] == [1.6, 1.6]
+    assert entry["fresh_margin_pct"] == pytest.approx(-25.0)
+    assert entry["repriced_roi_pct"] is None
+
+
+async def test_revalidate_logs_repriced_roi_when_edge_survives() -> None:
+    """Edge survives at drifted-but-profitable odds → the line carries the
+    post-allocation ROI of the re-priced arb."""
+
+    async def reverify(leg: Leg) -> float:
+        return 2.4  # overround 0.8333 → margin 16.667%, realized ROI 20%
+
+    ex = Executor(
+        guardrails=_guard(),
+        notifier=_Notifier(),
+        recovery=_Recovery(),
+        placers={"betsson": _Placer(), "betano": _Placer()},
+        reverify=reverify,
+    )
+    with structlog.testing.capture_logs() as logs:
+        res = await execute_opportunity(
+            ex, _two_way_opp(), opp_id="opp-rv2", budget=1000.0, min_margin_pct=1.0
+        )
+    assert res.outcome is ExecutionOutcome.COMPLETED
+    entry = next(e for e in logs if e["event"] == "arb_executor.revalidated")
+    assert entry["current_odds"] == [2.4, 2.4]
+    assert entry["fresh_margin_pct"] == pytest.approx((1.0 - 2.0 / 2.4) * 100.0, abs=1e-3)
+    assert entry["repriced_roi_pct"] == pytest.approx(20.0, abs=1e-3)
+
+
+# ---- leg placement ordering (order_opportunity_for_execution) ----
+
+
+def _opp_real(legs: tuple[OddsQuote, ...], stakes: tuple[float, ...]) -> ArbitrageOpportunity:
+    """Build an opportunity with REAL platform ids (the live -pba suffixes) so the
+    fragile-auth / single-leg / stake ordering keys actually match."""
+    return ArbitrageOpportunity(
+        legs=legs,
+        stakes=stakes,
+        total_stake=sum(stakes),
+        guaranteed_profit=10.0,
+        margin_pct=3.0,
+        realized_roi_pct=3.0,
+        capital_utilization=1.0,
+    )
+
+
+def _q(platform: str, outcome: str, odds: float) -> OddsQuote:
+    return OddsQuote(
+        platform=platform,
+        market_id="fx-1|1x2",
+        outcome=outcome,
+        decimal_odds=odds,
+        max_stake=5000.0,
+        timestamp=0.0,
+        platform_outcome_id=f"{platform}-{outcome}",
+        platform_event_id=f"{platform}-evt",
+    )
+
+
+def test_ordering_betsson_pair_plus_bw_is_bw_first_then_betsson_by_stake() -> None:
+    """fx-366d0143f674 shape: BW HOME (large stake) + Betsson AWAY 744 + Betsson DRAW
+    1633. Rule 1 (fragile-auth first) dominates rule 3's cross-platform stake ordering;
+    within the Betsson pair, smaller stake first (rule 3)."""
+    bw = _q("betwarrior-pba", "home", 1.94)
+    bs_away = _q("betsson-pba", "away", 6.8)
+    bs_draw = _q("betsson-pba", "draw", 3.1)
+    opp = _opp_real((bw, bs_away, bs_draw), (2000.0, 744.0, 1633.0))
+    ordered = order_opportunity_for_execution(opp)
+    assert [q.platform for q in ordered.legs] == [
+        "betwarrior-pba",
+        "betsson-pba",
+        "betsson-pba",
+    ]
+    assert ordered.legs[0].outcome == "home"  # BW leg preserved
+    assert ordered.stakes == (2000.0, 744.0, 1633.0)  # AWAY (744) before DRAW (1633)
+
+
+def test_ordering_bw_pair_plus_betsson_is_smaller_bw_first() -> None:
+    """fx-ee45e93fd258 (the completed arb) shape: two BW legs + one Betsson. The
+    completed-live order was BW 563.91, BW 676.69, Betsson — exactly what the key
+    produces (both fragile-auth first, then smaller stake, then Betsson)."""
+    bw_small = _q("betwarrior-pba", "home", 1.9)
+    bw_large = _q("betwarrior-pba", "away", 2.0)
+    bs = _q("betsson-pba", "draw", 4.0)
+    opp = _opp_real((bw_small, bw_large, bs), (563.91, 676.69, 300.0))
+    ordered = order_opportunity_for_execution(opp)
+    assert [q.platform for q in ordered.legs] == [
+        "betwarrior-pba",
+        "betwarrior-pba",
+        "betsson-pba",
+    ]
+    assert ordered.stakes == (563.91, 676.69, 300.0)  # smaller BW stake first
+
+
+def test_ordering_no_bw_uses_single_leg_platform_then_stake() -> None:
+    """No fragile-auth platform: rule 2 (single-leg platform before a same-platform
+    pair) dominates. Betano (single leg) first, then the Betsson pair by stake
+    ascending — pins rule 2 without rule 1."""
+    ba = _q("betano-pba", "home", 2.0)
+    bs_a = _q("betsson-pba", "away", 3.5)
+    bs_b = _q("betsson-pba", "draw", 3.5)
+    opp = _opp_real((ba, bs_a, bs_b), (900.0, 1633.0, 744.0))
+    ordered = order_opportunity_for_execution(opp)
+    assert [q.platform for q in ordered.legs] == ["betano-pba", "betsson-pba", "betsson-pba"]
+    assert ordered.stakes == (900.0, 744.0, 1633.0)  # Betsson pair ascending
+
+
+def test_ordering_preserves_scalar_fields_and_permutes_stakes_with_legs() -> None:
+    """The permutation touches ONLY legs+stakes; all scalar fields are order-invariant
+    and stay identical (replace keeps them)."""
+    bw = _q("betwarrior-pba", "home", 2.0)
+    bs = _q("betsson-pba", "away", 2.0)
+    opp = _opp_real((bs, bw), (100.0, 90.0))
+    ordered = order_opportunity_for_execution(opp)
+    assert [q.platform for q in ordered.legs] == ["betwarrior-pba", "betsson-pba"]
+    assert ordered.stakes == (90.0, 100.0)  # permuted WITH the legs
+    # Scalars unchanged.
+    assert ordered.total_stake == opp.total_stake
+    assert ordered.guaranteed_profit == opp.guaranteed_profit
+    assert ordered.margin_pct == opp.margin_pct
+    assert ordered.realized_roi_pct == opp.realized_roi_pct
+    assert ordered.capital_utilization == opp.capital_utilization
+
+
+def test_ordering_equal_keys_keep_detector_order() -> None:
+    """Two legs on different single-leg platforms with equal stakes: the stable
+    tie-break (detector index) keeps the original order."""
+    a = _q("betsson-pba", "home", 2.0)
+    b = _q("betano-pba", "away", 2.0)
+    opp = _opp_real((a, b), (100.0, 100.0))
+    ordered = order_opportunity_for_execution(opp)
+    assert [q.platform for q in ordered.legs] == ["betsson-pba", "betano-pba"]
+
+
+def test_ordering_staleness_rank_puts_laggard_first() -> None:
+    """With staleness_rank, the laggard (perishable stale quote) is placed first
+    among non-fragile-auth legs. Betsson-pba (rank 0.9) before Betano (rank 0.1),
+    equal stakes to isolate the staleness term."""
+    a = _q("betano", "home", 2.0)
+    b = _q("betsson-pba", "away", 2.0)
+    opp = _opp_real((a, b), (100.0, 100.0))
+    rank = {"1x2": {"betano": 0.1, "betsson-pba": 0.9}}
+    ordered = order_opportunity_for_execution(opp, staleness_rank=rank)
+    assert ordered.legs[0].platform == "betsson-pba"
+
+
+def test_ordering_staleness_rank_dominated_by_fragile_auth() -> None:
+    """BW (fragile-auth) still comes first even when it's the leader (low staleness).
+    Naked-incident evidence beats latency statistics."""
+    a = _q("betwarrior-pba", "home", 2.0)
+    b = _q("betsson-pba", "away", 2.0)
+    opp = _opp_real((a, b), (100.0, 100.0))
+    rank = {"1x2": {"betwarrior-pba": 0.0, "betsson-pba": 0.9}}
+    ordered = order_opportunity_for_execution(opp, staleness_rank=rank)
+    assert ordered.legs[0].platform == "betwarrior-pba"
+
+
+def test_ordering_staleness_rank_missing_type_falls_back() -> None:
+    """A market type absent from the staleness_rank mapping → today's order
+    (staleness term constantly 0.0 for every leg)."""
+    a = _q("betano", "home", 2.0)
+    b = _q("betsson-pba", "away", 2.0)
+    opp = _opp_real((a, b), (100.0, 100.0))
+    # rank has "btts" but the opp's market_id suffix is "1x2"
+    rank = {"btts": {"betano": 0.1, "betsson-pba": 0.9}}
+    ordered = order_opportunity_for_execution(opp, staleness_rank=rank)
+    # Without staleness: single-leg platforms, equal stakes → detector order
+    assert [q.platform for q in ordered.legs] == ["betano", "betsson-pba"]
+
+
+def test_ordering_staleness_rank_none_is_today_behavior() -> None:
+    """staleness_rank=None (default) is byte-identical to today's ordering."""
+    a = _q("betano", "home", 2.0)
+    b = _q("betsson-pba", "away", 2.0)
+    opp = _opp_real((a, b), (100.0, 100.0))
+    ordered_default = order_opportunity_for_execution(opp)
+    ordered_none = order_opportunity_for_execution(opp, staleness_rank=None)
+    assert [q.platform for q in ordered_default.legs] == [q.platform for q in ordered_none.legs]

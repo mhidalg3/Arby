@@ -81,9 +81,7 @@ _OU_PATTERNS_BY_PLATFORM: Final[dict[str, re.Pattern[str]]] = {
     # name). Bplay SSE formats as "Total de Goles X.X" (line lifted
     # from outcome's `act` field by the SSE scraper for resolver
     # parity). Accept either prefix.
-    "bplay-pba": re.compile(
-        r"^(?:mas de / menos de|total de goles) (\d+(?:\.\d+)?)$"
-    ),
+    "bplay-pba": re.compile(r"^(?:mas de / menos de|total de goles) (\d+(?:\.\d+)?)$"),
     "betwarrior-pba": re.compile(r"^total de goles (\d+(?:\.\d+)?)$"),
 }
 

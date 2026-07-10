@@ -255,9 +255,7 @@ class BplayPbaSSEScraper(BaseScraper):
                 self._log.warning("sse.discovery_failed", url=url, error=str(exc))
                 continue
             if resp.status_code >= 400:
-                self._log.warning(
-                    "sse.discovery_http_error", url=url, status=resp.status_code
-                )
+                self._log.warning("sse.discovery_http_error", url=url, status=resp.status_code)
                 continue
             for m in _MATCH_ID_RE.finditer(resp.text):
                 seen.add(m.group(1))
@@ -265,9 +263,7 @@ class BplayPbaSSEScraper(BaseScraper):
 
     # ---- streaming ----
 
-    async def _stream_odds(
-        self, match_ids: list[str]
-    ) -> AsyncIterator[RawOddsSnapshot]:
+    async def _stream_odds(self, match_ids: list[str]) -> AsyncIterator[RawOddsSnapshot]:
         params = dict(SSE_QUERY_PARAMS)
         params["id"] = "|".join(match_ids)
         deadline = time.monotonic() + self._stream_duration_sec
@@ -291,9 +287,7 @@ class BplayPbaSSEScraper(BaseScraper):
                 timeout=SSE_HTTP_TIMEOUT,
             ) as response:
                 if response.status_code >= 400:
-                    self._log.warning(
-                        "sse.stream_http_error", status=response.status_code
-                    )
+                    self._log.warning("sse.stream_http_error", status=response.status_code)
                     return
                 async for event in _parse_sse_events(response):
                     if time.monotonic() >= deadline:
@@ -448,8 +442,8 @@ def _snapshots_from_odds_payload(
                 decimal_odds = float(ct)
                 if decimal_odds <= 1.0:
                     continue
-                outcome_id_str = f"{market_id_str}-{cid}" if cid is not None else (
-                    f"{market_id_str}-{act[:24]}"
+                outcome_id_str = (
+                    f"{market_id_str}-{cid}" if cid is not None else (f"{market_id_str}-{act[:24]}")
                 )
                 snapshots.append(
                     RawOddsSnapshot(
@@ -463,10 +457,11 @@ def _snapshots_from_odds_payload(
                         decimal_odds=decimal_odds,
                         max_stake=None,
                         timestamp=observed_at,
+                        transport="push",
                     )
                 )
             break  # only the first `bets` entry — they're per-line groupings
-                   # for combo markets; v1 markets have one bet each
+            # for combo markets; v1 markets have one bet each
     return snapshots
 
 
@@ -495,9 +490,7 @@ def _extract_ou_line(bets: list[Any]) -> float | None:
                 # v1 OU resolver rejects integer (push) lines; emit
                 # nothing for those at scraper time so the downstream
                 # never sees them.
-                if abs((line * 2) - round(line * 2)) > 1e-9 or (
-                    round(line * 2)
-                ) % 2 == 0:
+                if abs((line * 2) - round(line * 2)) > 1e-9 or (round(line * 2)) % 2 == 0:
                     return None
                 # Sanity-bound to plausible soccer-goals range.
                 if line > MAX_PLAUSIBLE_GOALS_LINE:

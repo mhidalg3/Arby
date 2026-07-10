@@ -301,6 +301,7 @@ def parse_betano(resp: dict[str, Any]) -> PlacementResult:
             accepted=False,
             detail=f"betano: not accepted (errors={errors!r}; "
             f"data_keys={sorted(data.keys())}; top_keys={sorted(resp.keys())})",
+            raw_response=resp,
         )
     receipt = _first(data.get("receipts"))
     return PlacementResult(
@@ -308,6 +309,7 @@ def parse_betano(resp: dict[str, Any]) -> PlacementResult:
         stake_filled=_f(receipt.get("totalAmount")),
         odds_filled=_f(receipt.get("totalOdds")),
         ref=str(receipt.get("betId", "")),
+        raw_response=resp,
     )
 
 
@@ -319,6 +321,7 @@ def parse_bplay(resp: dict[str, Any]) -> PlacementResult:
         accepted=bool(accepted),
         ref=str(resp.get("betslip_id", "") or ""),
         detail="" if accepted else str(message.get("message", "")),
+        raw_response=resp,
     )
 
 
@@ -335,7 +338,11 @@ def parse_betwarrior(resp: dict[str, Any]) -> PlacementResult:
     Kambi units: BOTH odds and stake are ×1000 (confirmed by a live placement — a 1.14
     bet echoes ``betOdds: 1140``, 50 ARS ``stake: 50000``)."""
     if resp.get("status") != "SUCCESS":
-        return PlacementResult(accepted=False, detail=f"betwarrior: status={resp.get('status')}")
+        return PlacementResult(
+            accepted=False,
+            detail=f"betwarrior: status={resp.get('status')}",
+            raw_response=resp,
+        )
     bet = _first(_d(resp.get("coupon")).get("bets"))
     # Require an ECHOED bet (stake + odds). A bare status == SUCCESS with no coupon.bets
     # is NOT a placement — the live-delay poll (``match_betwarrior_coupon``) applies the
@@ -347,21 +354,50 @@ def parse_betwarrior(resp: dict[str, Any]) -> PlacementResult:
         return PlacementResult(
             accepted=False,
             detail="betwarrior: SUCCESS without echoed coupon.bets (status ok, no bet)",
+            raw_response=resp,
         )
-    return betwarrior_fill(bet, resp.get("couponRef", ""))
+    return betwarrior_fill(bet, resp.get("couponRef", ""), raw=resp)
 
 
-def betwarrior_fill(bet: dict[str, Any], ref: Any) -> PlacementResult:
+def betwarrior_fill(
+    bet: dict[str, Any], ref: Any, *, raw: dict[str, Any] | None = None
+) -> PlacementResult:
     """Build the ACCEPTED result from a Kambi bet echo. Both ``stake`` and
     ``betOdds`` are minor units ×1000 (÷1000 → ARS / decimal odds). Shared by the
     synchronous SUCCESS parse and the live-delay history poll so the unit
-    conversion lives in exactly one place."""
+    conversion lives in exactly one place. ``raw`` is the receipt body to persist
+    (the SYNC path passes the whole placement response; the live-delay poll passes
+    the matched bet echo — bounded, never the full historyCoupons body)."""
     return PlacementResult(
         accepted=True,
         stake_filled=_f(bet.get("stake")) / 1000.0,
         odds_filled=_f(bet.get("betOdds")) / 1000.0,
         ref=str(ref),
+        raw_response=raw,
     )
+
+
+# A BetWarrior (Kambi) coupon.json placement is POSTed with allowOddsChange="NO" at
+# the exact re-verified odds (odds_x1000); if the book moves between our reverify and
+# the POST, Kambi 400s with "Invalid odds specified" — a PRE-ACCEPTANCE reject (no
+# coupon created, so one re-POST is safe). Unlike Betsson, the body carries NO
+# replacement price, so the executor must re-fetch fresh odds itself and re-price
+# through the arb layer. Matched under both observed key spellings.
+_BETWARRIOR_INVALID_ODDS = "invalid odds specified"
+
+
+def betwarrior_odds_rejected(resp: dict[str, Any]) -> bool:
+    """True iff a Kambi coupon.json 400 body names the exact-odds mismatch.
+
+    Matches both observed key spellings (``{"message": ...}`` — 2026-06-10 live
+    capture; ``{"reason": ...}`` — recon/test shape); exact literal,
+    case-insensitive, so unrelated 400s (stake limits, validation, suspended
+    outcome) never classify as an odds move and trigger a re-POST."""
+    for key in ("message", "reason"):
+        v = resp.get(key)
+        if isinstance(v, str) and v.strip().lower() == _BETWARRIOR_INVALID_ODDS:
+            return True
+    return False
 
 
 # ---- BetWarrior (Kambi) coupon/history.json poll classification ----
@@ -446,6 +482,7 @@ def parse_betsson(resp: dict[str, Any]) -> PlacementResult:
         accepted=bool(accepted),
         ref=str(status.get("couponId", "")),
         detail="" if accepted else f"betsson: {errors or status.get('couponStatusPollingResult')}",
+        raw_response=resp,
     )
 
 

@@ -33,31 +33,37 @@ class TestComputeBudget:
         """The Fluminense vs Bolivar shape: Bplay × Bplay × Betsson.
         Reliability 1.0 × 1.0 × 0.8 = 0.8. Budget = capital × 5% × 0.8."""
         sizer = StakeSizer(policy=StakeSizingPolicy(total_capital_ars=1_000_000.0))
-        budget = sizer.compute_budget([
-            _q("bplay-pba", "HOME", 1.75),
-            _q("bplay-pba", "DRAW", 5.80),
-            _q("betsson-pba", "AWAY", 10.50),
-        ])
+        budget = sizer.compute_budget(
+            [
+                _q("bplay-pba", "HOME", 1.75),
+                _q("bplay-pba", "DRAW", 5.80),
+                _q("betsson-pba", "AWAY", 10.50),
+            ]
+        )
         # 1,000,000 × 0.05 × (1.0 × 1.0 × 0.8) = 40,000 ARS
         assert budget == pytest.approx(40_000.0)
 
     def test_bplay_plus_betwarrior_yields_full_cap(self) -> None:
         """Both platforms 1.0 reliability → 100% of the max-fraction cap."""
         sizer = StakeSizer(policy=StakeSizingPolicy(total_capital_ars=1_000_000.0))
-        budget = sizer.compute_budget([
-            _q("bplay-pba", "OVER", 2.0),
-            _q("betwarrior-pba", "UNDER", 2.0),
-        ])
+        budget = sizer.compute_budget(
+            [
+                _q("bplay-pba", "OVER", 2.0),
+                _q("betwarrior-pba", "UNDER", 2.0),
+            ]
+        )
         # 1,000,000 × 0.05 × (1.0 × 1.0) = 50,000 ARS (the per-arb ceiling)
         assert budget == pytest.approx(50_000.0)
 
     def test_betsson_plus_betwarrior_2leg_btts(self) -> None:
         """Avai vs Criciuma BTTS shape: 1.0 × 0.8 = 0.8."""
         sizer = StakeSizer(policy=StakeSizingPolicy(total_capital_ars=1_000_000.0))
-        budget = sizer.compute_budget([
-            _q("betwarrior-pba", "YES", 2.04),
-            _q("betsson-pba", "NO", 1.95),
-        ])
+        budget = sizer.compute_budget(
+            [
+                _q("betwarrior-pba", "YES", 2.04),
+                _q("betsson-pba", "NO", 1.95),
+            ]
+        )
         # 1,000,000 × 0.05 × 0.8 = 40,000 ARS
         assert budget == pytest.approx(40_000.0)
 
@@ -70,33 +76,41 @@ class TestConfidenceFloor:
         """Two unknown platforms → 0.5 × 0.5 = 0.25 confidence → below
         the 0.5 floor → 0 budget."""
         sizer = StakeSizer(policy=StakeSizingPolicy(total_capital_ars=1_000_000.0))
-        budget = sizer.compute_budget([
-            _q("unknown-platform-a"),
-            _q("unknown-platform-b"),
-        ])
+        budget = sizer.compute_budget(
+            [
+                _q("unknown-platform-a"),
+                _q("unknown-platform-b"),
+            ]
+        )
         assert budget == 0.0
 
     def test_mixed_known_and_unknown(self) -> None:
         """1.0 × 0.5 = 0.5 — exactly at the floor → passes."""
         sizer = StakeSizer(policy=StakeSizingPolicy(total_capital_ars=1_000_000.0))
-        budget = sizer.compute_budget([
-            _q("bplay-pba"),
-            _q("totally-new-platform"),
-        ])
+        budget = sizer.compute_budget(
+            [
+                _q("bplay-pba"),
+                _q("totally-new-platform"),
+            ]
+        )
         # 1,000,000 × 0.05 × 0.5 = 25,000 ARS
         assert budget == pytest.approx(25_000.0)
 
     def test_single_unknown_yields_zero(self) -> None:
         """A single unknown platform leg (0.5) is below the 0.5 floor,
         not at it (strict less-than)."""
-        sizer = StakeSizer(policy=StakeSizingPolicy(
-            total_capital_ars=1_000_000.0,
-            min_confidence=0.5001,
-        ))
-        budget = sizer.compute_budget([
-            _q("bplay-pba"),
-            _q("unknown-1"),
-        ])
+        sizer = StakeSizer(
+            policy=StakeSizingPolicy(
+                total_capital_ars=1_000_000.0,
+                min_confidence=0.5001,
+            )
+        )
+        budget = sizer.compute_budget(
+            [
+                _q("bplay-pba"),
+                _q("unknown-1"),
+            ]
+        )
         assert budget == 0.0
 
 
@@ -107,13 +121,18 @@ class TestMinStakeFloor:
     def test_tiny_capital_skips(self) -> None:
         """With 1,000 ARS capital and 5% per-arb cap, max budget is
         50 ARS — well below the 500-ARS min-stake floor."""
-        sizer = StakeSizer(policy=StakeSizingPolicy(
-            total_capital_ars=1_000.0,
-            min_total_stake_ars=500.0,
-        ))
-        budget = sizer.compute_budget([
-            _q("bplay-pba"), _q("betwarrior-pba"),
-        ])
+        sizer = StakeSizer(
+            policy=StakeSizingPolicy(
+                total_capital_ars=1_000.0,
+                min_total_stake_ars=500.0,
+            )
+        )
+        budget = sizer.compute_budget(
+            [
+                _q("bplay-pba"),
+                _q("betwarrior-pba"),
+            ]
+        )
         assert budget == 0.0
 
 
@@ -133,12 +152,8 @@ class TestPolicyTuning:
 
     def test_smaller_fraction_yields_smaller_budget(self) -> None:
         """2% per-arb instead of 5% → 40% of the budget."""
-        policy_5 = StakeSizingPolicy(
-            total_capital_ars=1_000_000.0, max_fraction_per_arb=0.05
-        )
-        policy_2 = StakeSizingPolicy(
-            total_capital_ars=1_000_000.0, max_fraction_per_arb=0.02
-        )
+        policy_5 = StakeSizingPolicy(total_capital_ars=1_000_000.0, max_fraction_per_arb=0.05)
+        policy_2 = StakeSizingPolicy(total_capital_ars=1_000_000.0, max_fraction_per_arb=0.02)
         legs = [_q("bplay-pba"), _q("betwarrior-pba")]
         assert StakeSizer(policy_5).compute_budget(legs) == pytest.approx(50_000.0)
         assert StakeSizer(policy_2).compute_budget(legs) == pytest.approx(20_000.0)
@@ -149,9 +164,12 @@ class TestPolicyTuning:
             total_capital_ars=1_000_000.0,
             platform_reliability={"bplay-pba": 0.5, "betwarrior-pba": 1.0},
         )
-        budget = StakeSizer(policy).compute_budget([
-            _q("bplay-pba"), _q("betwarrior-pba"),
-        ])
+        budget = StakeSizer(policy).compute_budget(
+            [
+                _q("bplay-pba"),
+                _q("betwarrior-pba"),
+            ]
+        )
         # 1,000,000 × 0.05 × (0.5 × 1.0) = 25,000 ARS
         assert budget == pytest.approx(25_000.0)
 
@@ -170,11 +188,13 @@ class TestEdgeCases:
         + risk daemon are responsible for rejecting single-platform
         opportunities — sizing doesn't second-guess that."""
         sizer = StakeSizer(policy=StakeSizingPolicy(total_capital_ars=1_000_000.0))
-        budget = sizer.compute_budget([
-            _q("bplay-pba", "HOME"),
-            _q("bplay-pba", "DRAW"),
-            _q("bplay-pba", "AWAY"),
-        ])
+        budget = sizer.compute_budget(
+            [
+                _q("bplay-pba", "HOME"),
+                _q("bplay-pba", "DRAW"),
+                _q("bplay-pba", "AWAY"),
+            ]
+        )
         assert budget == pytest.approx(50_000.0)
 
     def test_high_leg_count_compounds_low_confidence(self) -> None:

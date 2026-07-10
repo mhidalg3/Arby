@@ -60,6 +60,7 @@ def snapshot_to_latest_hash_field_and_value(
     `json.loads(...)` + `stream_fields_to_snapshot(...)`.
     """
     import json
+
     return (
         f"{snapshot.platform}:{snapshot.platform_outcome_id}",
         json.dumps(snapshot_to_stream_fields(snapshot)),
@@ -85,6 +86,8 @@ def snapshot_to_stream_fields(snapshot: RawOddsSnapshot) -> dict[str, str]:
         "decimal_odds": str(snapshot.decimal_odds),
         "max_stake": "" if snapshot.max_stake is None else str(snapshot.max_stake),
         "timestamp": str(snapshot.timestamp),
+        "kickoff_utc": "" if snapshot.kickoff_utc is None else str(snapshot.kickoff_utc),
+        "transport": snapshot.transport,
     }
 
 
@@ -97,6 +100,7 @@ def stream_fields_to_snapshot(fields: dict[str, str]) -> RawOddsSnapshot | None:
     """
     try:
         max_stake_str = fields.get("max_stake", "")
+        kickoff_str = fields.get("kickoff_utc", "")
         return RawOddsSnapshot(
             platform=fields["platform"],
             platform_event_id=fields["platform_event_id"],
@@ -108,6 +112,8 @@ def stream_fields_to_snapshot(fields: dict[str, str]) -> RawOddsSnapshot | None:
             decimal_odds=float(fields["decimal_odds"]),
             max_stake=float(max_stake_str) if max_stake_str else None,
             timestamp=float(fields["timestamp"]),
+            kickoff_utc=float(kickoff_str) if kickoff_str else None,
+            transport=fields.get("transport", "poll"),
         )
     except (KeyError, ValueError):
         return None
@@ -182,9 +188,7 @@ class RedisSnapshotSink:
                 # redis-py's xadd/hset stubs type `fields` invariantly;
                 # our `dict[str, str]` is valid at runtime — silence
                 # the stub-narrowness warning.
-                hash_field, hash_value = snapshot_to_latest_hash_field_and_value(
-                    snapshot
-                )
+                hash_field, hash_value = snapshot_to_latest_hash_field_and_value(snapshot)
                 async with self._redis.pipeline(transaction=False) as pipe:
                     pipe.xadd(
                         self._stream_name,

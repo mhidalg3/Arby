@@ -178,11 +178,7 @@ class RiskDaemon:
                 continue
             for _stream_name, items in entries:
                 for entry_id, fields in items:
-                    last_id = (
-                        entry_id
-                        if isinstance(entry_id, str)
-                        else entry_id.decode()
-                    )
+                    last_id = entry_id if isinstance(entry_id, str) else entry_id.decode()
                     opportunities_seen += 1
                     verdict = await self._process_entry(fields)
                     if verdict is Verdict.APPROVED:
@@ -206,9 +202,7 @@ class RiskDaemon:
 
     async def _process_entry(self, fields: dict[str, Any]) -> Verdict | None:
         decoded = {
-            (k.decode() if isinstance(k, bytes) else k): (
-                v.decode() if isinstance(v, bytes) else v
-            )
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
             for k, v in fields.items()
         }
         opp = opportunity_from_stream_fields(decoded)

@@ -13,6 +13,7 @@ from typing import Any
 from src.execution.placers import (
     BetHistoryMatch,
     betsson_odds_correction,
+    betwarrior_odds_rejected,
     build_betano_request,
     build_betsson_request,
     build_betwarrior_request,
@@ -280,6 +281,33 @@ def test_betsson_odds_correction_zero_coupon_id_still_corrects() -> None:
     # couponId == "0" (Betsson's "no coupon" sentinel) → still a correction.
     c = betsson_odds_correction(_odds_invalid_resp("4.45", coupon_id="0"))
     assert c is not None and c.valid_odds == 4.45
+
+
+# ---- BetWarrior (Kambi) invalid-odds reject classification ----
+
+
+def test_betwarrior_odds_rejected_message_key() -> None:
+    # 2026-06-10 live capture shape: {"message": "Invalid odds specified"}.
+    assert betwarrior_odds_rejected({"message": "Invalid odds specified"}) is True
+
+
+def test_betwarrior_odds_rejected_reason_key() -> None:
+    # Recon/test shape: the same literal under the "reason" key.
+    assert betwarrior_odds_rejected({"reason": "Invalid odds specified"}) is True
+
+
+def test_betwarrior_odds_rejected_case_and_whitespace_insensitive() -> None:
+    assert betwarrior_odds_rejected({"message": "  invalid ODDS specified "}) is True
+
+
+def test_betwarrior_odds_rejected_non_odds_error_is_false() -> None:
+    # Unrelated 400s (funds, validation) must never classify as an odds move.
+    assert betwarrior_odds_rejected({"reason": "Insufficient funds"}) is False
+    assert betwarrior_odds_rejected({"message": "Stake below minimum"}) is False
+
+
+def test_betwarrior_odds_rejected_empty_body_is_false() -> None:
+    assert betwarrior_odds_rejected({}) is False
 
 
 def test_unrecognized_shapes_fail_closed() -> None:

@@ -88,10 +88,7 @@ def _mock_xrevrange(snapshots: list[RawOddsSnapshot]) -> AsyncMock:
     """Build a mock that returns the given snapshots (newest first)
     when XREVRANGE is called."""
     # Construct (entry_id, fields_dict) tuples in newest-first order.
-    entries = [
-        (f"{int(s.timestamp * 1000)}-0", snapshot_to_stream_fields(s))
-        for s in snapshots
-    ]
+    entries = [(f"{int(s.timestamp * 1000)}-0", snapshot_to_stream_fields(s)) for s in snapshots]
     return AsyncMock(return_value=entries)
 
 
@@ -108,9 +105,7 @@ def _make_refresher(
         # HMGET path: returns one JSON-encoded value per requested
         # field; tests rebuild the mapping by (platform, outcome_id).
         index = {
-            f"{s.platform}:{s.platform_outcome_id}": json.dumps(
-                snapshot_to_stream_fields(s)
-            )
+            f"{s.platform}:{s.platform_outcome_id}": json.dumps(snapshot_to_stream_fields(s))
             for s in snapshots
         }
 

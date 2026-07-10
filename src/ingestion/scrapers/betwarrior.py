@@ -131,6 +131,37 @@ TARGET_COMPETITIONS: Final[dict[str, str]] = {
 # we want this scraper to keep emitting clean 1X2 only until a
 # deliberate widening.
 TARGET_BET_OFFER_TYPE: Final[str] = "Match"
+# Kambi event lifecycle state we accept. Anything else (STARTED = in-play,
+# FINISHED, or a missing field) is excluded: this is a prematch-only product —
+# cross-book in-play quotes sampled seconds apart are structurally incoherent
+# around every goal and produce phantom arbs (see ledger 2026-07-04).
+PREMATCH_EVENT_STATE: Final[str] = "NOT_STARTED"
+
+
+def _is_prematch_event(event: dict[str, Any]) -> bool:
+    return event.get("state") == PREMATCH_EVENT_STATE
+
+
+def _kambi_event_start(event: dict[str, Any]) -> float | None:
+    """Extract kickoff (unix epoch seconds) from a Kambi event's ``start`` field.
+
+    The field is epoch milliseconds when numeric (Kambi mobile schema) or an
+    ISO-8601 string (Kambi web schema). Returns ``None`` when absent or
+    unparseable — never guesses."""
+    raw = event.get("start")
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw) / 1000.0 if raw > 1e12 else float(raw)
+    if isinstance(raw, str):
+        try:
+            from datetime import datetime
+
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
 
 # Kambi serves odds as integers scaled by this factor.
 KAMBI_ODDS_SCALE: Final[float] = 1000.0
@@ -250,8 +281,11 @@ class BetWarriorPbaScraper(BaseScraper):
         event_id = event.get("id")
         if event_id is None:
             return
+        if not _is_prematch_event(event):
+            return  # in-play / finished — prematch-only product
         event_id_str = str(event_id)
         raw_event_name = _event_name(event)
+        kickoff_utc = _kambi_event_start(event)
 
         for offer in bet_offers:
             if not isinstance(offer, dict):
@@ -309,6 +343,7 @@ class BetWarriorPbaScraper(BaseScraper):
                     decimal_odds=decimal_odds,
                     max_stake=None,
                     timestamp=observed_at,
+                    kickoff_utc=kickoff_utc,
                 )
 
     async def _get_json(self, url: str) -> Any:
@@ -353,6 +388,7 @@ def _snapshots_for_kambi_match(
     raw_event_name: str,
     observed_at: float,
     platform_name: str,
+    kickoff_utc: float | None = None,
 ) -> list[RawOddsSnapshot]:
     """Extract Match (1X2) snapshots from a Kambi betoffer.
 
@@ -368,9 +404,7 @@ def _snapshots_for_kambi_match(
     market_id_str = str(market_id)
     criterion = offer.get("criterion")
     criterion_label = criterion.get("label") if isinstance(criterion, dict) else None
-    raw_market_name = (
-        criterion_label if isinstance(criterion_label, str) else TARGET_BET_OFFER_TYPE
-    )
+    raw_market_name = criterion_label if isinstance(criterion_label, str) else TARGET_BET_OFFER_TYPE
     outcomes = offer.get("outcomes")
     if not isinstance(outcomes, list):
         return []
@@ -404,6 +438,7 @@ def _snapshots_for_kambi_match(
                 decimal_odds=decimal_odds,
                 max_stake=None,
                 timestamp=observed_at,
+                kickoff_utc=kickoff_utc,
             )
         )
     return snapshots
@@ -448,6 +483,33 @@ BET_OFFER_TYPE_OU: Final[str] = "Over/Under"
 KAMBI_LINE_SCALE: Final[float] = 1000.0
 
 
+def _betoffer_event_is_prematch(data: dict[str, Any], event_id: str) -> bool:
+    """True when the betoffer response's event metadata says NOT_STARTED.
+
+    Missing/malformed ``events`` metadata is a contract break (Kambi always
+    sends it) → raise, so callers fail closed instead of trading blind.
+    """
+    events = data.get("events")
+    if not (isinstance(events, list) and events and isinstance(events[0], dict)):
+        raise BetWarriorContractError(f"betoffer/event/{event_id} missing 'events' metadata")
+    return _is_prematch_event(events[0])
+
+
+def _betoffer_event_kickoff(data: dict[str, Any]) -> float | None:
+    """Extract kickoff (epoch seconds) from the betoffer response's event metadata.
+
+    The per-event betoffer JSON carries an ``events`` array whose first element
+    is the event dict (same shape as the list-view ``event`` block). Called only
+    after ``_betoffer_event_is_prematch`` has already validated the metadata
+    exists (and would have raised on a contract break), so ``None`` here means
+    the kickoff field itself is absent — not a schema problem.
+    """
+    events = data.get("events")
+    if isinstance(events, list) and events and isinstance(events[0], dict):
+        return _kambi_event_start(events[0])
+    return None
+
+
 class BetWarriorPbaDepthScraper(BaseScraper):
     """Per-event depth poll for BetWarrior — BTTS + OU goals.
 
@@ -467,9 +529,7 @@ class BetWarriorPbaDepthScraper(BaseScraper):
         guard: RateLimitGuard | None = None,
     ) -> None:
         self._client = http_client
-        self._competitions = (
-            competitions if competitions is not None else dict(TARGET_COMPETITIONS)
-        )
+        self._competitions = competitions if competitions is not None else dict(TARGET_COMPETITIONS)
         self._guard = guard or RateLimitGuard(platform=self.platform_name)
         self._log = log.bind(platform=self.platform_name, mode="depth")
         self._platform_headers: dict[str, str] = {
@@ -493,14 +553,16 @@ class BetWarriorPbaDepthScraper(BaseScraper):
         data = await self._get_json(url)
         bet_offers = data.get("betOffers")
         if not isinstance(bet_offers, list):
-            raise BetWarriorContractError(
-                f"betoffer/event/{event_id} missing 'betOffers' list"
-            )
+            raise BetWarriorContractError(f"betoffer/event/{event_id} missing 'betOffers' list")
+        if not _betoffer_event_is_prematch(data, event_id):
+            self._log.warning("depth.event_inplay", event_id=event_id)
+            return []
         observed_at = time.time()
         # `raw_event_name` populated when the response carries event
         # metadata; otherwise empty. The verifier doesn't use it
         # (it matches on `platform_outcome_id`).
         raw_event_name = ""
+        kickoff_utc = _betoffer_event_kickoff(data)
         snapshots: list[RawOddsSnapshot] = []
         for offer in bet_offers:
             if not isinstance(offer, dict):
@@ -516,26 +578,24 @@ class BetWarriorPbaDepthScraper(BaseScraper):
             if bo_type_name == TARGET_BET_OFFER_TYPE:
                 snapshots.extend(
                     _snapshots_for_kambi_match(
-                        offer, event_id, raw_event_name, observed_at,
+                        offer,
+                        event_id,
+                        raw_event_name,
+                        observed_at,
                         platform_name=self.platform_name,
+                        kickoff_utc=kickoff_utc,
                     )
                 )
-            elif (
-                bo_type_name == BET_OFFER_TYPE_BTTS
-                and criterion_label == CRITERION_BTTS
-            ):
+            elif bo_type_name == BET_OFFER_TYPE_BTTS and criterion_label == CRITERION_BTTS:
                 snapshots.extend(
                     self._snapshots_for_btts(
-                        event_id, raw_event_name, offer, observed_at
+                        event_id, raw_event_name, offer, observed_at, kickoff_utc
                     )
                 )
-            elif (
-                bo_type_name == BET_OFFER_TYPE_OU
-                and criterion_label == CRITERION_OU_GOALS
-            ):
+            elif bo_type_name == BET_OFFER_TYPE_OU and criterion_label == CRITERION_OU_GOALS:
                 snapshots.extend(
                     self._snapshots_for_ou_goals(
-                        event_id, raw_event_name, offer, observed_at
+                        event_id, raw_event_name, offer, observed_at, kickoff_utc
                     )
                 )
         return snapshots
@@ -563,9 +623,7 @@ class BetWarriorPbaDepthScraper(BaseScraper):
         # in JSON parsing, not network).
         for event_id, raw_event_name in event_ids:
             try:
-                async for snapshot in self._fetch_event_depth(
-                    event_id, raw_event_name
-                ):
+                async for snapshot in self._fetch_event_depth(event_id, raw_event_name):
                     yield snapshot
             except BetWarriorContractError as exc:
                 self._log.warning(
@@ -576,21 +634,19 @@ class BetWarriorPbaDepthScraper(BaseScraper):
 
     # ---- internals ----
 
-    async def _discover_events(
-        self, slug: str, label: str
-    ) -> AsyncIterator[tuple[str, str]]:
+    async def _discover_events(self, slug: str, label: str) -> AsyncIterator[tuple[str, str]]:
         url = BASE_URL + LIST_VIEW_PATH.format(brand=BRAND_ID, slug=slug)
         data = await self._get_json(url)
         events = data.get("events")
         if not isinstance(events, list):
-            raise BetWarriorContractError(
-                f"listView for {slug!r} missing 'events' list"
-            )
+            raise BetWarriorContractError(f"listView for {slug!r} missing 'events' list")
         for block in events:
             if not isinstance(block, dict):
                 continue
             event = block.get("event")
             if not isinstance(event, dict):
+                continue
+            if not _is_prematch_event(event):
                 continue
             event_id = event.get("id")
             if event_id is None:
@@ -604,10 +660,10 @@ class BetWarriorPbaDepthScraper(BaseScraper):
         data = await self._get_json(url)
         bet_offers = data.get("betOffers")
         if not isinstance(bet_offers, list):
-            raise BetWarriorContractError(
-                f"betoffer/event/{event_id} missing 'betOffers' list"
-            )
-
+            raise BetWarriorContractError(f"betoffer/event/{event_id} missing 'betOffers' list")
+        if not _betoffer_event_is_prematch(data, event_id):
+            return
+        kickoff_utc = _betoffer_event_kickoff(data)
         observed_at = time.time()
         for offer in bet_offers:
             if not isinstance(offer, dict):
@@ -620,20 +676,14 @@ class BetWarriorPbaDepthScraper(BaseScraper):
             bo_type_name = bo_type.get("englishName")
             criterion_label = criterion.get("label")
 
-            if (
-                bo_type_name == BET_OFFER_TYPE_BTTS
-                and criterion_label == CRITERION_BTTS
-            ):
+            if bo_type_name == BET_OFFER_TYPE_BTTS and criterion_label == CRITERION_BTTS:
                 for snapshot in self._snapshots_for_btts(
-                    event_id, raw_event_name, offer, observed_at
+                    event_id, raw_event_name, offer, observed_at, kickoff_utc
                 ):
                     yield snapshot
-            elif (
-                bo_type_name == BET_OFFER_TYPE_OU
-                and criterion_label == CRITERION_OU_GOALS
-            ):
+            elif bo_type_name == BET_OFFER_TYPE_OU and criterion_label == CRITERION_OU_GOALS:
                 for snapshot in self._snapshots_for_ou_goals(
-                    event_id, raw_event_name, offer, observed_at
+                    event_id, raw_event_name, offer, observed_at, kickoff_utc
                 ):
                     yield snapshot
             # All other markets (AH, player props, corners, cards, etc.)
@@ -645,6 +695,7 @@ class BetWarriorPbaDepthScraper(BaseScraper):
         raw_event_name: str,
         offer: dict[str, Any],
         observed_at: float,
+        kickoff_utc: float | None = None,
     ) -> Iterator[RawOddsSnapshot]:
         market_id = offer.get("id")
         if market_id is None:
@@ -662,6 +713,7 @@ class BetWarriorPbaDepthScraper(BaseScraper):
                 raw_market_name=CRITERION_BTTS,
                 market_id_str=market_id_str,
                 observed_at=observed_at,
+                kickoff_utc=kickoff_utc,
             )
             if snapshot is not None:
                 yield snapshot
@@ -672,6 +724,7 @@ class BetWarriorPbaDepthScraper(BaseScraper):
         raw_event_name: str,
         offer: dict[str, Any],
         observed_at: float,
+        kickoff_utc: float | None = None,
     ) -> Iterator[RawOddsSnapshot]:
         market_id = offer.get("id")
         if market_id is None:
@@ -713,6 +766,7 @@ class BetWarriorPbaDepthScraper(BaseScraper):
                 raw_market_name=raw_market_name,
                 market_id_str=market_id_str,
                 observed_at=observed_at,
+                kickoff_utc=kickoff_utc,
             )
             if snapshot is not None:
                 yield snapshot
@@ -725,6 +779,7 @@ class BetWarriorPbaDepthScraper(BaseScraper):
         raw_market_name: str,
         market_id_str: str,
         observed_at: float,
+        kickoff_utc: float | None = None,
     ) -> RawOddsSnapshot | None:
         if not isinstance(outcome, dict):
             return None
@@ -753,6 +808,7 @@ class BetWarriorPbaDepthScraper(BaseScraper):
             decimal_odds=decimal_odds,
             max_stake=None,
             timestamp=observed_at,
+            kickoff_utc=kickoff_utc,
         )
 
     async def _get_json(self, url: str) -> Any:
@@ -770,12 +826,8 @@ class BetWarriorPbaDepthScraper(BaseScraper):
         except httpx.HTTPError as exc:
             raise BetWarriorContractError(f"GET {url} failed: {exc!s}") from exc
         if resp.status_code >= 400:
-            raise BetWarriorContractError(
-                f"GET {url} returned HTTP {resp.status_code}"
-            )
+            raise BetWarriorContractError(f"GET {url} returned HTTP {resp.status_code}")
         try:
             return resp.json()
         except ValueError as exc:
-            raise BetWarriorContractError(
-                f"GET {url} returned non-JSON body: {exc!s}"
-            ) from exc
+            raise BetWarriorContractError(f"GET {url} returned non-JSON body: {exc!s}") from exc

@@ -10,6 +10,7 @@ enough to read in a single screen, real enough to catch parser drift.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -486,6 +487,134 @@ class TestOddsExtraction:
         snaps = [snap async for snap in s.fetch_live_soccer()]
         assert len(snaps) == 1
         assert snaps[0].raw_outcome_name == "No"
+        await client.aclose()
+
+    async def test_past_deadline_market_dropped(self) -> None:
+        """A market whose betting deadline has passed is in-play — drop it
+        (prematch-only product). Mirrors the silent status skip."""
+        body = {
+            "data": {
+                "accordions": {
+                    "MW3W": {
+                        "markets": [
+                            {
+                                "id": "m-f-EVT-MW3W",
+                                "marketFriendlyName": "Ganador del partido",
+                                "lineValue": "",
+                                "status": "Open",
+                                "deadline": "2020-01-01T00:00:00Z",
+                            }
+                        ],
+                        "selections": [
+                            {
+                                "marketId": "m-f-EVT-MW3W",
+                                "id": "s-m-f-EVT-MW3W-home",
+                                "label": "Home",
+                                "odds": 2.0,
+                                "status": "Open",
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path.endswith("/categories/v2"):
+                return httpx.Response(200, json=_CATEGORIES_OK)
+            return httpx.Response(200, json=body)
+
+        client = _make_client(handler)
+        s = BetssonScraper(http_client=client)
+        snaps = [snap async for snap in s.fetch_live_soccer()]
+        assert snaps == []
+        await client.aclose()
+
+    async def test_future_deadline_market_kept(self) -> None:
+        """A market with a future deadline stays in scope — fail-open on
+        absent deadlines, fail-closed only on a parseable past one."""
+        body = {
+            "data": {
+                "accordions": {
+                    "MW3W": {
+                        "markets": [
+                            {
+                                "id": "m-f-EVT-MW3W",
+                                "marketFriendlyName": "Ganador del partido",
+                                "lineValue": "",
+                                "status": "Open",
+                                "deadline": "2100-01-01T00:00:00Z",
+                            }
+                        ],
+                        "selections": [
+                            {
+                                "marketId": "m-f-EVT-MW3W",
+                                "id": "s-m-f-EVT-MW3W-home",
+                                "label": "Home",
+                                "odds": 2.0,
+                                "status": "Open",
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path.endswith("/categories/v2"):
+                return httpx.Response(200, json=_CATEGORIES_OK)
+            return httpx.Response(200, json=body)
+
+        client = _make_client(handler)
+        s = BetssonScraper(http_client=client)
+        snaps = [snap async for snap in s.fetch_live_soccer()]
+        assert len(snaps) == 1
+        assert snaps[0].raw_outcome_name == "Home"
+        assert (
+            snaps[0].kickoff_utc == datetime.fromisoformat("2100-01-01T00:00:00+00:00").timestamp()
+        )
+        await client.aclose()
+
+    async def test_absent_deadline_kickoff_none(self) -> None:
+        """A market with no `deadline` key is kept (fail-open) but its
+        snapshot carries no kickoff — never guess a kickoff we don't have."""
+        body = {
+            "data": {
+                "accordions": {
+                    "MW3W": {
+                        "markets": [
+                            {
+                                "id": "m-f-EVT-MW3W",
+                                "marketFriendlyName": "Ganador del partido",
+                                "lineValue": "",
+                                "status": "Open",
+                            }
+                        ],
+                        "selections": [
+                            {
+                                "marketId": "m-f-EVT-MW3W",
+                                "id": "s-m-f-EVT-MW3W-home",
+                                "label": "Home",
+                                "odds": 2.0,
+                                "status": "Open",
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path.endswith("/categories/v2"):
+                return httpx.Response(200, json=_CATEGORIES_OK)
+            return httpx.Response(200, json=body)
+
+        client = _make_client(handler)
+        s = BetssonScraper(http_client=client)
+        snaps = [snap async for snap in s.fetch_live_soccer()]
+        assert len(snaps) == 1
+        assert snaps[0].raw_outcome_name == "Home"
+        assert snaps[0].kickoff_utc is None
         await client.aclose()
 
 

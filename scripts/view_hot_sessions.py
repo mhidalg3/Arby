@@ -50,6 +50,7 @@ _PORT_OFFSET = {"betano": 0, "betsson": 1, "betwarrior": 2}
 # "block" / "session-expired" looks like. Private names, but a sibling recon script
 # importing them keeps the two in lockstep (a divergence here would be a bug).
 from src.execution.session import (  # noqa: E402
+    _BETSSON_AUTH_SCAN_JS,
     _BLOCK_SCAN_JS,
     _RG_BLOCK_PHRASES,
     _SESSION_EXPIRED_PHRASES,
@@ -116,14 +117,40 @@ _ARB_EVENTS = {
 }
 _EXEC_EVENTS = {
     "executor.dry_run_place",
+    "executor.leg_placement",
     "executor.completed",
     "executor.aborted",
     "executor.naked_exposure",
     "executor.pending_unknown",
+    "executor.recaptured",
+    "executor.recapture_no_arb",
+    "executor.recapture_guardrail",
+    "executor.recapture_shape_mismatch",
+    "executor.recapture_unverifiable",
     "executor.escalating",
 }
 _SESSION_EVENTS = {
     "transport.betwarrior_auth_dead",
+    # Betsson auto re-auth lifecycle (operator-authorized 2026-07-02). Success is also
+    # surfaced via hot_sessions.session_reauth_ok; these cover the decision points +
+    # failure modes. `betsson_relogin_not_configured` is the operator-critical signal that
+    # a required trigger/password/submit selector is blank.
+    "transport.betsson_auth_probe_error",
+    "transport.betsson_context_skipped_blocked",
+    "transport.betsson_relogin_already_logged_in",
+    "transport.betsson_relogin_auth_ambiguous",
+    "transport.betsson_relogin_auth_unreadable",
+    "transport.betsson_relogin_error",
+    "transport.betsson_relogin_email_prefilled",
+    "transport.betsson_relogin_form_incomplete",
+    "transport.betsson_relogin_logout_failed",
+    "transport.betsson_relogin_no_creds",
+    "transport.betsson_relogin_no_ctx_after_login",
+    "transport.betsson_relogin_no_form",
+    "transport.betsson_relogin_open_miss",
+    "transport.betsson_relogin_not_configured",
+    "transport.betsson_relogin_ok",
+    "transport.betsson_relogin_timeout",
     "transport.block_detected",
     "transport.block_probe_error",
     "transport.reality_check_dismissed",
@@ -132,6 +159,9 @@ _SESSION_EVENTS = {
     "transport.promotions_home_error",
     "hot_sessions.promotions_home_recovered",
     "hot_sessions.promotions_home_failed",
+    "hot_sessions.reality_check_close_failed",
+    "hot_sessions.reality_check_resume_reprobes_exhausted",
+    "hot_sessions.session_reauth_deferred",
     "transport.session_expired",
     "guardrails.kill_switch_tripped",
     "guardrails.kill_switch_reset",
@@ -151,10 +181,24 @@ _BW_POLL_EVENTS = {
     "leg_placer.betwarrior_poll_error",
     "leg_placer.betwarrior_poll_http_error",
 }
-_WATCH_EVENTS = _ARB_EVENTS | _EXEC_EVENTS | _SESSION_EVENTS | _BW_POLL_EVENTS
+# Betsson server-truth odds-correction signals (vector 2 surfacing): these events carry
+# the submitted + valid_odds delta, the server's own replacement price on an
+# E_BETTING_ODDS_INVALID reject — the closest thing to a pre-POST confirmation source.
+_PLACER_EVENTS = {
+    "leg_placer.betsson_odds_resubmit",
+    "leg_placer.betsson_odds_unfavorable",
+    "leg_placer.betsson_odds_tag_mismatch",
+}
+_WATCH_EVENTS = _ARB_EVENTS | _EXEC_EVENTS | _SESSION_EVENTS | _BW_POLL_EVENTS | _PLACER_EVENTS
 
 
-def _classify(platform: str, scan: dict[str, Any], shadow: list[Any], url: str) -> str:
+def _classify(
+    platform: str,
+    scan: dict[str, Any],
+    shadow: list[Any],
+    url: str,
+    auth: dict[str, Any] | None = None,
+) -> str:
     """Coarse state label for one window. Independent of the bot's own classification —
     a divergence here is itself a post-mortem signal (e.g. viewer sees a Betsson popup
     the bot logged as clear)."""
@@ -166,6 +210,22 @@ def _classify(platform: str, scan: dict[str, Any], shadow: list[Any], url: str) 
     for p in _SESSION_EXPIRED_PHRASES:
         if p in blob:
             return "session_expired"
+    # Betsson renders its header in open shadow DOM: the light-DOM scan + the modal-
+    # shaped _SHADOW_COLLECT_JS are both blind to a logged-out header, so the viewer
+    # reported `ok` while the bot was logged out (2026-07-05). Same scan as the bot's
+    # _BETSSON_AUTH_SCAN_JS (imported — the two must not drift): no balance + visible
+    # login trigger = logged out. SINGLE-SAMPLE by design — the viewer is observational
+    # and clicks nothing, so it does NOT get the bot's _betsson_auth_settled debounce; a
+    # mid-hydration tick can print a transient `logged_out` that flips back next tick
+    # (the `(was ...)` marker makes the flap visible). The bot's own classification and
+    # relogin decisions are the debounced ones.
+    if (
+        platform == "betsson"
+        and isinstance(auth, dict)
+        and auth.get("hasBalance") is not True
+        and auth.get("loggedOut") is True
+    ):
+        return "logged_out"
     for m in _LOGGED_OUT_MARKERS:
         if m in blob and "balance" not in blob:
             return "login_page"
@@ -282,11 +342,16 @@ class Viewer:
                 if p in ((scan.get("overlayText") or "") + (scan.get("bodyText") or "")).lower()
             ]
             shadow: list[Any] = []
+            auth: dict[str, Any] | None = None
             if platform == "betsson":
                 with contextlib.suppress(Exception):
                     shadow = await page.evaluate(_SHADOW_COLLECT_JS)
+                with contextlib.suppress(Exception):
+                    auth = await page.evaluate(_BETSSON_AUTH_SCAN_JS)
             rec["shadow_modals"] = shadow[:5]
-            rec["state"] = _classify(platform, scan, shadow, page.url)
+            if auth is not None:
+                rec["auth"] = auth
+            rec["state"] = _classify(platform, scan, shadow, page.url, auth)
         except Exception as exc:  # noqa: BLE001 — one window faulting must not sink the watch
             rec["state"] = "error"
             rec["error"] = str(exc)[:300]
@@ -301,7 +366,7 @@ class Viewer:
         prev = self.last_state.get(rec["platform"])
         flag = rec["state"]
         marker = ""
-        if flag in ("rg_lockout", "session_expired", "naked"):
+        if flag in ("rg_lockout", "session_expired", "logged_out", "naked"):
             marker = " 🚫"
         elif flag in ("reality_check", "modal_visible", "login_page"):
             marker = " ⚠️"
@@ -365,6 +430,25 @@ class Viewer:
                     "attempts",
                     "body",
                     "error",
+                    "missing",
+                    "stage",
+                    "evidence",
+                    "leg",
+                    "detected_odds",
+                    "preflight_odds",
+                    "arb_odds",
+                    "preplace_odds",
+                    "odds_requested",
+                    "server_valid_odds",
+                    "stake_requested",
+                    "stake_filled",
+                    "odds_filled",
+                    "ref",
+                    "accepted",
+                    "detail",
+                    "submitted",
+                    "valid_odds",
+                    "placement_order",
                 )
                 if k in e
             }
@@ -406,6 +490,25 @@ class Viewer:
                     "roi_pct",
                     "age_sec",
                     "error",
+                    "missing",
+                    "stage",
+                    "evidence",
+                    "leg",
+                    "detected_odds",
+                    "preflight_odds",
+                    "arb_odds",
+                    "preplace_odds",
+                    "odds_requested",
+                    "server_valid_odds",
+                    "stake_requested",
+                    "stake_filled",
+                    "odds_filled",
+                    "ref",
+                    "accepted",
+                    "detail",
+                    "submitted",
+                    "valid_odds",
+                    "placement_order",
                     "_wall",
                 )
                 if k in e
@@ -448,6 +551,22 @@ class Viewer:
                     for e in events:
                         if e.get("event") == "orchestrator.executed":
                             executed_seen = e
+                # Loud, periodic nudge when the bot log has produced zero bytes —
+                # the silent failure of 2026-07-03 (viewer watching an empty file;
+                # dense capture could never arm). offset 0 + empty/missing = the
+                # bot has written nothing since this viewer started.
+                if self.cycle % 5 == 0 and self.log_offset == 0:
+                    try:
+                        log_empty = self.log_path.stat().st_size == 0
+                    except OSError:
+                        log_empty = True
+                    if log_empty:
+                        print(
+                            f"  ⚠️ c{self.cycle} bot log {self.log_path} is empty/missing — "
+                            "arb-triggered dense capture CANNOT fire. Is run_hot_loop "
+                            "running (it writes this file itself since the in-process "
+                            "tee) and --log pointing at the right path?"
+                        )
                 # 2) observe each window
                 dense = time.time() < self.dense_until
                 for platform in self.platforms:

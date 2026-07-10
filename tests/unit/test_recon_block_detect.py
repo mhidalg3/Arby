@@ -16,7 +16,7 @@ class TestKnownBlockPages:
         """The exact block we hit: Kaizen splash iframe + title."""
         title = "Betano Splash Screen"
         html = (
-            '<html><head><title>Betano Splash Screen</title></head>'
+            "<html><head><title>Betano Splash Screen</title></head>"
             '<body><iframe src="https://landingpages.kaizengaming.com/'
             'betano-splash-screen-bz/index.html"></iframe></body></html>'
         )
@@ -43,7 +43,7 @@ class TestKnownBlockPages:
         """A genuine CF managed-challenge interstitial — caught by its
         title + body text, not by the always-present orchestration script."""
         html = (
-            '<html><head><title>Just a moment...</title></head><body>'
+            "<html><head><title>Just a moment...</title></head><body>"
             "Enable JavaScript and cookies to continue."
             '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate">'
             "</script></body></html>"
@@ -53,10 +53,7 @@ class TestKnownBlockPages:
 
     def test_unusual_activity_challenge(self) -> None:
         """The registration-flow warning Betano showed (named our IP)."""
-        html = (
-            "<div>We detected unusual activity from your device or "
-            "network.</div>"
-        )
+        html = "<div>We detected unusual activity from your device or network.</div>"
         reason = block_reason_from("Verify", html)
         assert reason is not None
 
@@ -65,7 +62,7 @@ class TestRealPages:
     def test_normal_sportsbook_home_not_flagged(self) -> None:
         title = "Apuestas deportivas online | Betano"
         html = (
-            '<html><head><title>Apuestas deportivas online | Betano'
+            "<html><head><title>Apuestas deportivas online | Betano"
             '</title></head><body><div class="sportsbook">'
             '<a href="/sport/futbol/">Fútbol</a></div></body></html>'
         )
@@ -80,7 +77,7 @@ class TestRealPages:
         every Betano recon on the homepage (2026-05-29)."""
         title = "Apuestas deportivas online | Betano"
         html = (
-            '<html><head><title>Apuestas deportivas online | Betano</title>'
+            "<html><head><title>Apuestas deportivas online | Betano</title>"
             '</head><body><div class="sportsbook">'
             '<a href="/sport/futbol/">Fútbol</a></div>'
             '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate">'

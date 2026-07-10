@@ -43,6 +43,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -145,6 +146,21 @@ class BetssonContractError(RuntimeError):
     framework level — a sustained schema break should stop ingestion,
     not silently drop data.
     """
+
+
+def _deadline_epoch(deadline: object) -> float | None:
+    """Epoch seconds of a market's betting deadline. For a prematch market the
+    deadline IS kickoff — the same semantic the in-play gate relies on
+    (deadline passed ⇒ in-play). None when absent/unparseable — never guess."""
+    if not isinstance(deadline, str) or not deadline:
+        return None
+    try:
+        dt = datetime.fromisoformat(deadline)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
 
 
 @dataclass(frozen=True)
@@ -340,6 +356,9 @@ class BetssonScraper(BaseScraper):
                     continue
                 if mkt.get("status") != "Open":
                     continue
+                kickoff = _deadline_epoch(mkt.get("deadline"))
+                if kickoff is not None and kickoff <= observed_at:
+                    continue  # betting deadline past ⇒ in-play — prematch-only product
                 market_id = str(mkt.get("id", ""))
                 if not market_id:
                     continue
@@ -368,6 +387,7 @@ class BetssonScraper(BaseScraper):
                         max_stake=None,  # not in public response; bet-slip only
                         timestamp=observed_at,
                         raw_competition=raw_competition,
+                        kickoff_utc=kickoff,
                     )
 
     @staticmethod

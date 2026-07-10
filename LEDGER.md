@@ -1,5 +1,709 @@
 # Project Ledger
 
+
+## 2026-07-09 — Betsson reality-check auto-close restoration (tiered finder)
+
+**Context:** The Betsson reality-check popup auto-close silently started logging the session out. Live incident 2026-07-08: the scan still CLASSIFIED the popup (`betsson_context_skipped_blocked kind=reality_check`) but the close-target finder returned null while a single visible orange "Cerrar" was on screen (screenshot proof `rg_blocks/betsson_1783544501.png`, session logged-in). Popup stuck ~52 min → server-side session kill → destructive relogin ran (login itself succeeded, but the post-login `establish_betsson_context` `networkidle` goto timed out → `session_reauth_failed`). So "reality check logs out" was a CASCADE from the CLOSE MISS, not the close itself. `git show cdc2896` proved the close JS was byte-identical to the live-validated version — Betsson's DOM drifted out from under an exact-match finder.
+
+**Decisions:**
+- **Tiered, scan-tolerant close finder** (`_BETSSON_REALITY_CHECK_CLOSE_JS`): replaced the exact `testId === 'reality-check-btn-1'` + host-`innerText==='cerrar'` match with three tolerance tiers mirroring the (still-working) scan — (1) a SINGLE guard-passing prefix-testId candidate labelled "cerrar"; (2) the single guard-passing prefix candidate, any/empty label; (3) exactly one page-wide button labelled "cerrar". Label read from the innermost visible shadow `<button>` (falling back to host) — non-slotted shadow labels are invisible to host `innerText` (same bug class fixed for login clicks 2026-07-05). Covers all three plausible drift axes (exact-testId change / shadow-hidden label / cross-root restructure) at once.
+- **Logout guard + ambiguity**: any candidate whose label contains "sesión"/"sesion"/"desconect" is rejected at every tier — that is the logout control, never the popup close. Tier 1 requires a SINGLE cerrar (two visible cerrar controls → no click + evidence), honoring the documented "Ambiguity at any tier → no click" — the first-cut `find` silently first-matched (advisor-flagged pre-gate, fixed).
+- **Global walk flags**: phrase + button collected across the whole shadow walk, not the old per-root conjunction that broke when they stopped sharing a shadow root.
+- **Dict return contract** (was `[x,y]`): success `{found,x,y,tier,tag,testId,label}`; miss `{found:false,reason,candidates:[{tag,testId,label}...]}`. One caller (`attempt_reality_check_close`); `tier`/`testId` identify the real drift axis in the live drill, `candidates` is the one-episode diagnosability.
+- **Evidence-on-miss**: the missing-target path now logs `reason`/`candidates`/`evidence` and screenshots via `_capture_betsson_relogin_evidence` (added `reality_check_target_missing` to its screenshot stage set); new success log `transport.reality_check_close_target`.
+- **Deferred (by decision)**: the downstream relogin wedge (login OK but establish goto `networkidle` timeout). NOT flipping `attempt_betsson_relogin` to True on logged-in-but-no-ctx — callers treat True as fully recovered; a logged-in-no-ctx session is picked up by the next heartbeat by design. Separate task if `betsson_relogin_error`/`session_reauth_failed` reproduces after the RC fix is live.
+
+**State:** Code + tests land; gates green (942 unit pass, mypy src clean, ruff clean). Cooldown (5.25s), 3-attempt retry, and all `hot_session.py` orchestration unchanged — live evidence showed they behaved as designed; only the finder missed. Live re-validation PENDING: armed hot-loop drill watching for `transport.reality_check_close_target` (tier/tag/testId) → `reality_check_dismissed` → `hot_sessions.reality_check_closed`, with NO `betsson_relogin_*` / `kind=session_expired` afterwards.
+
+**Errors:** No test/CI failures. Two ambiguity bugs caught before live: advisor flagged tier-1 silent first-match `find` (fixed → single-cerrar); the post-gate reviewer pass found a BLOCKING tier-3 gap — `cerrarHosts` excluded prefix buttons, so an unrelated non-prefix `cerrar` could click through after prefix ambiguity (fixed → tier 3 counts prefix+non-prefix `cerrar` together, deduped as one set). Code/tests/review complete; live re-validation still pending explicit operator go.
+
+
+## 2026-07-07 — GARCH(1,1) adaptive margin threshold wired into the hot loop
+
+**Context:** The hot loop's minimum-margin gate was static (`detect_arbitrage(..., min_margin_pct=1.0)`). The cross-platform implied-prob spread clusters around team news / kickoff (non-constant variance), so a static gate under-admits in calm regimes and over-admits around volatility spikes. Wire the architecture-endorsed GARCH(1,1) adaptive threshold into `ArbOrchestrator`'s money path and persist the applied threshold + variance into the always-NULL `opportunities.adaptive_threshold_pct` / `opportunities.garch_variance` columns (no schema change).
+
+**Decisions:**
+- **Pure module `src/arbitrage/garch.py`** (new): GARCH(1,1) math only — no I/O, no async, no LLM. `AdaptiveThreshold` holds per-(market, cell) σ²_t state evolved once per full cycle; `decide()` returns a per-market threshold. `spread_observations()` extracts PAIR_ORDER first-two-present spreads (one rule shared by offline fit and live extractor so fitted/live units can't drift). 100% line coverage (module convention).
+- **Threshold formula**: `clamp(base · (1 + sensitivity · (ratio − 1)), floor, max(floor, 3·base))` where `ratio = max over cells of √(σ²_t / σ²_uncond)`. Linear response for operator explainability; symmetric (goes below base when calm), floored at the risk policy's 0.5% so detection never admits what risk rejects. The clamp upper bound is `max(floor, 3·base)` so a tiny base can't invert the band.
+- **Offline fit** (`fit_garch_per_market_type` in `analyze_lag_structure.py --garch`): per market type, median GARCH(1,1) params across per-(fixture, cell) spread series (≥3 accepted fits required; non-stationary fits discarded). Mirrors `discrepancy_variance`'s series construction (60s grid, keep="last", ffill limit 2) exactly, with the PAIR_ORDER rule replacing all-pairwise. Artifact gains `garch_per_market_type`.
+- **Live spread extraction** (`OverlapQuoteSource.cycle_spreads()`): reads the union cache (`_last_canonical`), staleness-filtered. Duck-typed by the orchestrator (same pattern as `market_names` / `stale_platforms`). The cache is refreshed by both `fetch()` and `trigger_fetch()` — INTENTIONAL: the cadence contract governs WHEN we sample (`observe_cycle` once per full cycle only), and the offline fit's keep="last" per grid bucket is the matching estimator. A fetch()-only shadow cache would bias σ² down on the markets that just moved.
+- **Orchestrator gate**: `observe_cycle` called once in `run_once` after `fetch()` (never on the trigger path — the recursion needs even spacing). `decide()` runs in `_process_market` (shared by full + trigger paths), threading the SAME `min_margin` into `detect_arbitrage` AND `execute_opportunity`'s reverify gate. `adaptive_threshold=None` ⇒ byte-identical static behavior.
+- **Recording semantics**: adaptive-on with missing params/state records `(base, NULL)`; adaptive-off records `(NULL, NULL)` — today's rows. `PostgresAuditRecorder` threads both kwargs through to the `Opportunity` row.
+- **Composition root**: `_load_garch_thresholds` reads `GARCH_ADAPTIVE` (default `1`), validates artifact entries via `GarchParams.from_artifact`, reads `MIN_MARGIN_PCT_BASE` / `GARCH_SENSITIVITY` from env directly (not `get_settings` — money path must not require a full validated `.env`). `floor_pct` wired from `risk.policy.min_margin_pct`. Fail-open to static base on missing/empty/malformed artifact or no validated entry.
+- **Hot-loop-only scope**: `semantic/arb_detector.py` (stream daemon) and `run_arb_loop.py` (diagnostic) keep static thresholds — neither writes the `opportunities` columns this task populates, and the stream detector's event-driven cadence needs its own observation design. The pure helpers take arbitrage-layer types only, so later adoption is additive.
+
+**State:** Code + tests land; full gates green (pytest -m "not integration", mypy src, ruff). Needs ≥7-day tick dataset + `uv run python scripts/analyze_lag_structure.py --days 7 --garch --write-artifact` regeneration before the feature activates (with <3 series per market type the section is `{}` and the hot loop runs static — expected, not a failure). The `opportunities.adaptive_threshold_pct` / `garch_variance` columns will be non-NULL once adaptive is active.
+
+**Errors:** Multiple hashline-anchored edit mangles during the orchestrator constructor and `audit_recorder._write_opportunity` edits (auto-repair dropped lines, duplicated tails) — resolved by whole-block rewrites. A test-logic bug (huge spread only inflates σ² on the NEXT cycle) caught by the recursion tests before gates.
+
+
+## 2026-07-07 — Concurrent hot-loop + tick-recorder collection (no double Betsson traffic)
+
+**Context:** Make `run_hot_loop.py` (arb detection/execution) and `RECORD_TO_PG=1 run_ingestion_daemon.py` (7-day lag-dataset collection) safe to run simultaneously without doubling requests to Betsson (WAF-sensitive). The hot loop already scrapes Betsson via its overlap linker; running the daemon's Betsson poller too would double that footprint.
+
+**Decisions:**
+- **Tee-all from the hot loop**: `OverlapQuoteSource.snapshot_sink` (optional `asyncio.Queue`) copies every raw snapshot the source already scrapes (Betano/BW bulk, Betsson linker, trigger-cycle fetches) into the Redis `odds:raw` sink. Non-blocking `put_nowait` + drop-on-full with a throttled `quote_source.tee_dropped` warning — recording NEVER back-pressures or stalls the money path. Teed BEFORE canonicalize so canonicalization-failure rows still record.
+- **`RECORD_TICKS=1`** hot-loop knob: builds a `RedisSnapshotSink` on a bounded queue (maxsize 10_000), best-effort — Redis unreachable at startup → one `log.error`, tee disabled, hot loop runs normally; startup-close failure suppressed. Graceful drain in `finally` (`stop_event.set()` + `wait_for(timeout=10)`), no bare cancel that would drop queued snaps.
+- **`DISABLE_BETSSON=1`** daemon knob (mirrors `DISABLE_BPLAY`): daemon omits its Betsson scraper; the hot loop's linker tee supplies Betsson ticks. Daemon keeps Betano/BW-list/BW-depth/Bplay so the dataset retains BTTS/OU depth the hot loop can't provide (no BW-depth scraper; Betano danae is 1X2-only).
+- **Betsson `kickoff_utc` root fix**: stamp it from each market's betting `deadline` (prematch deadline == kickoff — same semantic the in-play gate relies on). Replaced `_deadline_passed` with a single-parse `_deadline_epoch` feeding both the in-play gate and the kickoff, so their semantics can't drift. This lets `PgRecorder._stamp_canonical` derive a date-bucketed `fixture_key` so Betsson rows join cross-platform instead of only under session-scoped keys.
+- **Rejected**: flipping `analyze_lag_structure._join_key` to session-first (recorder restarts would fragment fixtures across sessions and regress the working Betano↔BW cross-session joins); a cross-process shared circuit breaker (unneeded once only one process scrapes Betsson).
+
+**State:** Operator runbook for the 7-day collection = both processes concurrently (Terminal A `RECORD_TO_PG=1 DISABLE_BETSSON=1` daemon, Terminal B `RECORD_TICKS=1` hot loop). Documented in `docs/cross_platform_lag_strategy.md` (runbook + env-knob table). Interleaved same-platform observations tighten `prev_observed_at` censoring (recorder state is per `(platform, platform_outcome_id)` across producers).
+
+**Errors:** None — all four code steps landed clean; gates green (890 unit pass, mypy src clean, ruff clean).
+
+## 2026-07-06 — Cross-platform update-lag model: tick recording, bootstrap analysis, triggered scanning, lag-informed priorities
+
+**Context:** Increase arb-find rate and reduce placement failures from cross-leg odds drift by modeling the cross-platform update-lag structure. Arbs appear when a price-leader updates and a laggard hasn't; the arb window IS the lag.
+
+**Decisions:**
+- **Recorder design**: second independent Redis consumer of `odds:raw` via XREADGROUP consumer group, change-compressed (change rows + ≤1/60s heartbeats). Best-effort — Postgres outage logs+drops, never crashes the daemon. Idempotent XGROUP CREATE (swallows BUSYGROUP).
+- **Censoring handling**: poll-observed changes are interval-censored; analysis carries pessimistic/optimistic bounds. Push feeds (`betsson_ws`, `bplay_sse`) stamped `transport="push"`. Unified `join_key` column: `fixture_key` (date-bucketed kickoff) when available, else `(recorder_session_id, session_fixture_id)` session-scoped fallback.
+- **Hot-loop-scoped model**: the lag model that drives live policy is scoped to the hot-loop universe (betano/betwarrior-pba/betsson-pba); bplay data is analysis-only.
+- **Gates**: Phase C/D OFF by default. Gate = some platform has `leader_share ≥ 0.6` on ≥1 market type with `n_matched_moves ≥ 50` AND `lag_p90_s ≥ 60s`. Gate fails → C/D stay off.
+- **D×T-only v1**: D = spread std, T = trigger recency via hot-set windows. L deferred to execution-time cap_refresh; C uniform prematch.
+- **Staleness as ordering key #2**: `staleness_rank` (1 − leader_share per market type) added to `order_opportunity_for_execution` as key #2 after fragile-auth. Missing market type or `staleness_rank=None` → today's order (term constantly 0.0).
+- **`_process_market` refactor**: extracted from `run_once` loop body so trigger mini-cycles share the identical detect→risk→order→execute path. No placement shortcut for triggered arbs.
+- **Bulk-only move baseline**: `_last_odds` scoped to bulk platforms only to prevent self-triggering on Betsson linker updates.
+- **Actual artifact grammar**: `CanonicalMarketCode` StrEnum values (`1x2`, `btts`, `ou_goals|2.5`), NOT the plan's illustrative `h2h_3way`.
+
+**State:** Phases A/B/C/D land now. C/D off until gate passes. No historical odds data exists yet (0 rows in `odds_snapshots`) — operator must run `RECORD_TO_PG=1` daemon for ≥7 days first.
+
+**Errors:** Multiple piecemeal-edit corruptions during BW kickoff threading and test file construction — resolved by full-section rewrites. Lesson: use whole-block replacements, not incremental line swaps, for multi-function changes in hot-path files.
+
+## 2026-07-06 — Per-leg execution telemetry, receipt capture, Betsson reject language, BW-first leg ordering
+
+**Context:** Vector audit of five proposed improvement vectors against the codebase.
+
+**Decisions:**
+- **No pre-POST Betsson confirmation call** (vector 2 resolved as "no new confirmation source").
+  The placement POST at exact odds + `E_BETTING_ODDS_INVALID`/`validOdds` handshake IS Betsson's
+  price-confirmation contract (LEDGER 2026-06-24); no coupon-validation read endpoint exists
+  in-tree, and a pre-POST call adds a round trip that widens the drift window. The existing
+  server-truth signals are now surfaced in the viewer tail + postmortem instead.
+- **`executor.leg_placement` structured telemetry event** (vector 1): one event per placement
+  attempt (accepted AND rejected) carrying the full odds ladder — `detected_odds` /
+  `preflight_odds` / `arb_odds` / `preplace_odds` / `odds_requested` / `server_valid_odds` /
+  `odds_filled` + `stake_filled` / `ref` / `detail`. New `PlacementResult` fields
+  `odds_requested` + `server_valid_odds` (set only on Betsson correction branches). `preplace_odds`
+  tracks the last ACTUALLY-attempted price (`attempted_odds`), so a reauth-then-drift-no-retry
+  never misreports the non-attempted price.
+- **Betsson reject language** (vector 3): odds-invalid rejects now read "server repriced before
+  acceptance" with the submitted→validOdds delta (3 detail-rewrite branches). Abort/naked
+  semantics byte-identical; NO `odds_rejected=True` on Betsson (the deliberate reject-path
+  decision stands — unfavorable correction never observed live, recapture would re-price from
+  the feed not server truth).
+- **Receipt capture** (vector 4): `PlacementResult.raw_response` attached in every parser
+  (sync + BW live-delay poll path via `betwarrior_fill(raw=…)`); `PostgresAuditRecorder`
+  now persists `fill.raw_response` to the existing `placements.raw_response` JSONB column
+  (was hardcoded None). Failed legs still get no placements row — `executor.leg_placement`
+  is their system of record.
+- **BW-first hand-coded leg ordering** (vector 5): `arb_executor.order_opportunity_for_execution`
+  applies rules 1/2/3/5 (fragile-auth first → single-leg platform → smaller stake → detector
+  order) at the orchestrator seam, before alert/record/execute. Rule 4 (residual-tail scorer)
+  deferred. Empirical basis: both live naked incidents (fx-61bcbcd4cc28, fx-366d0143f674) were
+  Betsson×N filled → BW failure; the one completed arb (fx-ee45e93fd258) executed BW, BW,
+  Betsson — exactly the order the key produces.
+
+**State:** All source + tests land; full gates green (pytest -m "not integration", mypy, ruff).
+`orchestrator.arb_found` now logs `placement_order`. Viewer tail + postmortem show the full
+ per-leg ladder + receipt ref. Pending live proof: a real BW-including arb executing BW-first
+ with one `executor.leg_placement` line per leg; non-null `raw_response` on new fills.
+
+**Errors:** None — pure additive telemetry + receipt capture + leg permutation; no placement-
+ behavior change except leg order.
+
+
+
+## 2026-07-06 — Betsson relogin: land the clicks on the real controls
+
+**Context:** The autonomous relogin pipeline (`attempt_betsson_relogin` →
+`_open_betsson_login_form` → `_fill_betsson_login` → `_await_betsson_logged_in`) already
+existed end-to-end, but failed live: the first click targeted the `[data-test-id='login-button']`
+wrapper (`router-link-v2`), and saved evidence showed its computed center hit
+`site-header-version-manager` — the popup never opened (`transport.betsson_relogin_open_miss`
+/ `no_form`). Operator DOM facts (2026-07-06): the real clickables are custom-element hosts
+(`fdsp-button`/`fds-button`) with the actual `<button>` inside an open shadow root.
+
+**Decisions:**
+- **Inner-button resolution for click sites only.** New finders resolve host/wrapper matches
+  to the innermost visible shadow `<button>` before measuring the click center:
+  `_BETSSON_FIND_CLICKABLE_CENTER_JS` (generic, for the geolocation CTA and the popup submit)
+  and `_BETSSON_FIND_LOGIN_TRIGGER_CENTER_JS` (the header trigger). Input finders
+  (`_betsson_password_xy`, email lookup, logout/balance lookups) and the password trace
+  (`_BETSSON_PASSWORD_TRACE_JS`) are deliberately untouched.
+- **Wrapper anchor kept; bare `btn-1` rejected** as a non-unique component-library counter.
+  Stable anchors stay `[data-test-id='login-button']` (wrapper) and the existing
+  `account-login-btn-1` / `geolocation-cta-content-btn-1` testIds.
+- **Trigger label fallback** to a visible `fdsp-button` labelled "iniciar sesión" in the
+  header band (top 20% of the viewport), used only when the `login-button` wrapper testId is
+  absent. Restricted to `fdsp-button` so it cannot match the popup submit (`fds-button`).
+- **Geolocation CTA no longer followed by an immediate trigger re-click** — operator
+  observation 2026-07-06: the login popup auto-opens after "Permitir acceso". The delayed
+  `_click_trigger()` fallback still fires if it does not.
+- **Auth scan (`_BETSSON_AUTH_SCAN_JS`) deliberately unchanged.** The `login-button` wrapper
+  is still present in current live evidence, so its `hasLoginTrigger` check stays valid;
+  widening `loggedOut = !hasBalance && hasLoginTrigger` with text matching would reintroduce
+  the false-positive class the 2026-07-05 debounce work closed.
+- **Evidence parity** for the three click-site keys only: `_BETSSON_RELOGIN_EVIDENCE_JS` now
+  reports `center`/`pointTarget` from the resolved inner button (expect `pointTarget.testId`
+  like `btn-1-button` on a healthy read). No new evidence schema fields; the Python sanitizer
+  allow-list is unchanged.
+
+**State:** Full gates pass — `uv run pytest -m "not integration"` (841 passed),
+`uv run mypy src`, `uv run ruff check`, `uv run ruff format --check` all green; targeted
+`tests/unit/test_session_blocked.py` (67) green; reviewer pass clean. Keyring `betsson`
+creds configured. **Live proof still pending operator action:** the manual-logout drill
+(`scripts/drill_betsson_relogin.py scan` then `full` on a logged-out window, bot + viewer
+stopped) and the in-bot sentinel (`touch /tmp/arby_force_betsson_reauth` →
+`transport.betsson_relogin_ok`).
+
+**Errors:** none during implementation.
+
+## 2026-07-05 — Betsson relogin failure evidence from the live bot path
+
+**Context:** The forced Betsson reauth sentinel (`touch /tmp/arby_force_betsson_reauth`)
+still opened the `Iniciar Sesión` popup but did not enter credentials. A separate sidecar
+capture would fight the persistent-profile SingletonLock and would not observe the bot's
+own failure branch, so the evidence must be produced by `attempt_betsson_relogin()` where
+the failure occurs.
+
+**Decisions:**
+- **`_capture_betsson_relogin_evidence()`** writes lock-free artifacts under
+  `recon/artifacts/betsson_relogin/` from inside the existing relogin page lock. It
+  captures auth booleans plus selector metadata for trigger/email/password/submit/
+  geolocation; it does not store full HTML, input values, or balance selector text.
+- Evidence is attached to terminal failure events (`transport.betsson_relogin_no_form`,
+  `transport.betsson_relogin_form_incomplete`, `transport.betsson_relogin_timeout`,
+  `transport.betsson_relogin_error`) via `evidence=...`, preserving current
+  log-review/viewer filters. A new non-terminal `transport.betsson_relogin_open_miss`
+  event preserves the pre-reload artifact even if the second open attempt later succeeds.
+- Screenshots are saved only before credentials can be typed
+  (`open_miss_before_reload`, `no_form_after_reload`). Post-typing failures keep JSON
+  selector/auth state only, avoiding email/password leakage in PNGs.
+- The runbook now makes the live path first-class: run the sentinel, tail
+  `transport.betsson_relogin_*`, inspect the attached evidence path. The session viewer's
+  live/postmortem event summaries include `evidence`, `missing`, and `stage` for these
+  relogin events. `probe_betsson_auth.py`
+  and `drill_betsson_relogin.py full` are offline follow-ups only after stopping bot/viewer
+  because `recon/profile/betsson` is SingletonLocked.
+- Follow-up from the next live evidence: the 2026-07-05 18:24/18:25 UTC
+  `open_miss_before_reload` artifacts showed `loggedOut=true`, no geolocation CTA, and
+  the real login form selectors (`email`, `password`, `account-login-btn-1`) visible in
+  the screenshot/selector snapshot. The later `no_form_after_reload` artifacts lost the
+  form because the opener reloaded after the false miss.
+- Root cause: `_BETSSON_FIND_VISIBLE_CENTER_JS` stopped its shadow-DOM walk at 8,000
+  visited elements while `_BETSSON_RELOGIN_EVIDENCE_JS` used 10,000. The evidence walker
+  could see the deep Betsson login form that the opener walker missed, so
+  `_open_betsson_login_form()` returned `False` despite the usable form being present.
+- Fix: both Betsson selector walkers now share `_BETSSON_SHADOW_WALK_DEPTH` and
+  `_BETSSON_SHADOW_WALK_LIMIT`, with the limit set to 10,000. The trigger locator/center
+  fallback remains unchanged; no geolocation-specific policy was added because the saved
+  artifacts had `geolocation: null`.
+- Follow-up from the Telegram failure: the bot now keeps `password-input` as the primary
+  password target but falls back to the **bottommost** visible
+  `[data-test-id='input-container']` when the direct password selector is absent. The
+  same fallback gates `_open_betsson_login_form()` readiness and `_fill_betsson_login()`
+  typing, so the bot can type the stored keyring password into the remembered-user bottom
+  field. Evidence keeps the artifact key as `password` and marks `fallback=true` when the
+  container path wins. The config guard only aborts when BOTH password selectors are blank.
+- Follow-up recon: newer `open_miss_before_reload` evidence showed the computed
+  `login-button` center hit `site-header-version-manager` and no password/submit selectors
+  existed, so one live failure was still an opener/hit-target miss. For the separate
+  visible-password-but-no-typing symptom, `_fill_betsson_login()` now records a sanitized
+  one-shot `passwordTrace` before click, after click, and after type: shadow-recursive
+  `activePath`, `elementFromPoint` `hitPath`, and `focusin`/`keydown`/`beforeinput`/`input`
+  event presence/paths. It stores no values, full HTML, screenshots, typed keys, exact
+  password length, or selection offsets.
+  Selector evidence also records whether the password selector is a descendant input of a
+  fallback container (`descendantInput`, `container`) so wrapper clicks are visible.
+
+**State:** Relogin evidence/opener/password-fallback/password-trace coverage expanded in
+`tests/unit/test_session_blocked.py`; 841 passed (`-m "not integration"`), mypy strict
+clean, ruff clean, format clean. NOT live-proven yet — restart/redeploy the hot loop, rerun
+`touch /tmp/arby_force_betsson_reauth`, and inspect `passwordTrace`, `selectors.password`,
+`transport.betsson_relogin_password_trace`, and any `transport.betsson_relogin_error`
+evidence if the visible field still receives no text.
+
+**Errors:** Initial artifact design risked leaking balance/input state and losing the
+pre-reload miss; fixed with selector/auth allow-lists, screenshot stage gating, and the
+`transport.betsson_relogin_open_miss` event. A first attempted `query_selector`/handle
+branch contradicted the Betsson shadow-DOM rationale; reworked to Playwright `locator`
+for the trigger only.
+
+## 2026-07-05 — Betsson reality-check → false-relogin logout: debounced auth truth
+
+**Context:** Since the auto re-auth generalization (2026-07-02), resolving a Betsson
+reality-check popup logged the session OUT: the operator reported "whenever it attempts
+to resolve it the betsson page becomes logged out", the relogin never recovered it, the
+session viewer kept reporting `ok`, and only Telegram showed "session cold". The Cerrar
+click itself was never the problem (exact-match `fds-button[data-test-id=
+'reality-check-btn-1']`, text `cerrar`). Root cause chain: (1) `_apply_recovered` probed
+IMMEDIATELY after the close → `establish_betsson_context` hard-goto'd into the
+still-settling SPA; (2) `_BETSSON_AUTH_SCAN_JS` classified `loggedOut` from ONE sample
+(`!hasBalance && hasLoginTrigger`) — Betsson renders the header login trigger BEFORE
+session hydration, so the settling page read as logged out → `session_expired` overlay →
+relogin scheduled on a HEALTHY session; (3) `attempt_betsson_relogin`'s own single-sample
+scan hit the same window and drove the login-form flow against a live session (killing
+it); (4) `_await_betsson_logged_in` demanded strict `loggedIn` (balance AND
+Retirar/Depósito header text) while the healthy gate used `hasBalance` — a SUCCESSFUL
+login could read as failure; (5) the viewer's `_classify` never read Betsson's shadow-DOM
+header → logged-out showed `ok`.
+
+**Decisions:**
+- **`_betsson_auth_settled()` (session.py)** — debounced auth read: a BAD state
+  (logged-out header OR expired phrase) must persist across `_BETSSON_AUTH_SETTLE_SAMPLES=3`
+  samples `_BETSSON_AUTH_SETTLE_GAP_S=2.0` apart (page lock per sample, sleeps outside);
+  healthy/ambiguous short-circuits (happy path = one evaluate). Wired into
+  `check_session_blocked` AND `attempt_betsson_relogin`. Worst case +4s on genuine logout
+  detection vs a false relogin that logs a healthy session out. Raises on page faults —
+  callers keep their fail-open policy (`betsson_auth_probe_error` → None).
+- **Relogin decision is tri-state, with a bounded ambiguous escalation** — destructive
+  logout→login ONLY on a SETTLED bad read; healthy → `betsson_relogin_already_logged_in`
+  + cheap re-establish; ambiguous (neither marker, mid-render) → NEW
+  `transport.betsson_relogin_auth_ambiguous` + cheap re-establish. Reviewer-driven fix:
+  the manager runs ONE reauth per block episode (`_session_reauth_attempted` persists
+  while the block persists), so a do-nothing ambiguous attempt would strand a genuinely
+  dead session — if the ambiguous re-establish fails, ONE more settled read runs and
+  only a settled bad result escalates to the destructive flow; still unreadable →
+  `transport.betsson_relogin_auth_unreadable` (one-shot `betsson_relogin_unreadable`
+  flag on the transport — a bool return can't carry the distinction, and raising would
+  escape into the executor's reactive path) and the manager DISCARDS the episode's
+  attempted-guard (`hot_sessions.session_reauth_deferred`) so the next heartbeat
+  retries once the SPA settles — an unreadable outcome never consumes the single
+  auto-reauth attempt. The suspend + SESSION EXPIRED alert stays up throughout, so
+  even a persistently unreadable page degrades to manual login, never silence.
+  `_captured_ctx` is invalidated only on the destructive branch (an ambiguous read must
+  not manufacture `no_ctx_after_login`). The page lock now wraps only the destructive
+  choreography; the scan runs before it. NOTE (residual, accepted): the auth scan's
+  phrase breadth means a PERSISTENT visible expired-phrase text (e.g. ambient marketing
+  copy exactly matching "volver a iniciar sesión") would still read bad — no such copy
+  observed live; the debounce guards transients only.
+- **`_await_betsson_logged_in` gate = `hasBalance` + no expired phrase** — balance-button
+  renders only when authenticated; the stricter `loggedIn` under-detects on header-layout
+  variants and turned successful logins into reported failures.
+- **`_apply_recovered` sleeps before EVERY probe (incl. the first)** — no more hard goto
+  into the just-closed popup's settling SPA. Tests patch
+  `_REALITY_CHECK_RESUME_REPROBE_DELAY_S`; one timing-sensitive test converted to a
+  deadline loop on the semantic outcome (kill-switch reset) instead of a fixed sleep.
+- **Betsson excluded from the generic light-DOM `_SESSION_EXPIRED_PHRASES` OVERLAY loop**
+  in `check_session_blocked` — a one-sample overlay hit there would bypass the debounce
+  and queue the destructive relogin. Betsson expiry truth routes exclusively through the
+  debounced auth scan (whose walk covers light DOM too). The body-text BANNER loop stays
+  platform-wide (a banner never schedules reauth — recoveries are overlay-scoped). The
+  auth scan's all-visible-text phrase breadth is KEPT deliberately (the expired-popup-
+  over-mounted-session case drives the logout leg) and is safe only behind the debounce —
+  documented at `_BETSSON_AUTH_SCAN_JS`.
+- **Viewer reads Betsson auth truth** — `view_hot_sessions.py` imports
+  `_BETSSON_AUTH_SCAN_JS` (lockstep with the bot, read-only evaluate), records
+  `rec["auth"]`, and classifies a new `logged_out` state (🚫) when the header shows the
+  login trigger without balance. `transport.betsson_relogin_auth_ambiguous` added to
+  `_SESSION_EVENTS`.
+- **Stale test pins updated** — `test_betsson_logged_in_with_body_expired_phrase_is_banner`
+  repointed to BetWarrior (on real Betsson DOM a visible phrase surfaces via the auth
+  scan, never as a body-only banner); `test_establish_gotos_on_session_expired_banner`
+  now injects the banner `SessionBlock` directly (structural pin of the overlay-scoped
+  goto guard). `_FakePage` gained `auth_payloads` sequences + `auth_scan_calls` to model
+  a hydrating header.
+- **Remembered-user login popup supported** — `_open_betsson_login_form()` now gates
+  readiness on the password field (present in both fresh and remembered-user popups)
+  instead of requiring `email-input`; `_fill_betsson_login()` skips the email field when
+  absent and logs `transport.betsson_relogin_email_prefilled`. The selector guard now
+  requires trigger+password+submit: each blank required selector aborts before page
+  access, while blank email remains allowed. The geolocation CTA branch is pinned:
+  trigger click -> geolocation CTA -> trigger click -> password readiness, with no
+  reload/no_form.
+
+**State:** 15 new debounce/relogin/gate/login-form tests in
+`tests/unit/test_session_blocked.py` + 1 manager-level deferred-retry test in
+`tests/unit/test_hot_session.py`; 828 passed
+(`-m "not integration"`), mypy strict clean, ruff clean. NOT live-proven yet —
+the relogin login-form choreography remains live-DOM work. Two drills, mutually
+exclusive (same persistent profile → SingletonLock):
+- Bot running → `touch /tmp/arby_force_betsson_reauth` after a manual logout: runs
+  the production `attempt_betsson_relogin` on the bot's own transport; expect
+  `hot_loop.reauth_trigger_result platform=betsson ok=True` + `betsson_relogin_ok`.
+- Bot STOPPED → `scripts/drill_betsson_relogin.py {scan,noop,full}` (NEW): standalone
+  Betsson-only window on the same profile. `scan` = raw-vs-settled auth read right
+  after a goto (shows the hydration window live); `noop` = relogin on a healthy
+  session MUST be a no-op (the 2026-07-05 regression drill); `full` = manual logout →
+  real form-flow relogin, keyring creds, typed confirmation.
+For the end-to-end path: restart the bot, wait for a reality-check episode and expect
+`reality_check_dismissed` → NO `session_expired` block → no relogin; on a genuine
+logout expect `betsson_relogin_ok`.
+
+**Errors:** Three pre-existing RC resume tests assumed an immediate post-close probe;
+fixed by patching the settle delay + waiting on observable outcomes.
+
+## 2026-07-05 — Hot loop writes its own log file (in-process tee)
+
+**Context:** The session viewer (`scripts/view_hot_sessions.py`) tails
+`/tmp/arby_hot_loop.log` for arb JSON events (dense capture + postmortem triggers), but
+the bot only wrote that file via *shell redirection* in the runbook launch command —
+`configure_logging()` sent everything to `sys.stdout`. Operators launched without the
+redirection at least twice (LEDGER 2026-06-27, 2026-07-03): file 0 B, viewer sees nothing,
+dense capture/postmortem never fired. End state: `run_hot_loop.py` writes the file
+**in-process** (tee: stdout + file), truncating at startup; the viewer warns loudly when
+the log stays empty; the runbook drops the now-obsolete redirection.
+
+**Decisions:**
+- **`_Tee` + `tee_path` param in `src/logging_setup.py`**: a write-only `io.TextIOBase`
+  that duplicates every `write`/`flush` to several streams. `logging.basicConfig(...,
+  force=True)` replaces pre-existing root handlers, so stdlib logging/httpx and structlog
+  both route through the same stream (content parity with the old `>> log 2>&1` era).
+  `cast(TextIO, ...)` unconditional — duck-typing is the contract; `io.TextIOBase` does
+  not satisfy `TextIO` under mypy strict.
+- **Mode `"w"` (truncate-on-start), `buffering=1` (line-buffered)**: automates the
+  runbook `: > /tmp/arby_hot_loop.log` clean-slate step (LEDGER 2026-06-25 decided
+  policy — stale kill-switch replay); line-buffered so the viewer's size-polling tail
+  sees each event immediately (same lesson as the viewer's own `line_buffering=True`).
+- **Tee is unconditional for the hot loop, no opt-out flag, no Settings field**: the path
+  `_HOT_LOOP_LOG` is a fixed operational contract shared with the viewer's `--log`
+  default; a third (env) source would only create divergence. The other 7
+  `configure_logging()` callers stay zero-arg.
+- **If `open()` fails, let it propagate**: `configure_logging` runs first thing in
+  `main()`; failing fast at startup beats an unobserved armed bot (the silent mode was
+  this very bug).
+- **stderr no longer captured in `/tmp/arby_hot_loop.log`**: raw tracebacks that bypass
+  logging go to the terminal (Option B) or `/tmp/arby_hot_loop_console.log` (Option A).
+  The viewer never parsed non-JSON lines anyway.
+- **Viewer empty-log warning** (`scripts/view_hot_sessions.py` `Viewer.run()`): every 5
+  cycles when `log_offset == 0` and the file is empty/missing, print a `⚠️` naming the
+  bot as the writer. Goes quiet the moment the first byte is drained.
+
+**State:** Tee live in `run_hot_loop.py`; viewer warning live; runbook cut over (Options
+A/B updated, truncation steps dropped, "never redirect to arby_hot_loop.log" warning
+added). Unit test `tests/unit/test_logging_setup.py` covers truncate-then-mirror,
+JSON-parseability, stdout tee, and stdlib logging tee despite a pre-existing root handler.
+All gates green (836 passed, mypy clean, ruff clean).
+E2E verified: tee write-through, appended arb event → dense capture armed
+(`events.jsonl` populated), empty-log warning fires at cycle 5.
+
+**Errors:** None during implementation. Hash-anchor churn in the runbook edits (each
+edit advanced the tag) — recovered by re-reading between edits.
+
+**Operator note:** any currently-running hot loop uses old code and still writes nothing
+to the file — restart bot AND viewer per the updated runbook to activate the tee.
+
+## 2026-07-05 — Audit-store outage alerting + Postgres port unsquat (5432→5433)
+
+**Context:** `arby-postgres` had been `Exited (128)` for 7 days while host port 5432 was
+squatted by the unrelated `inlyneserver-db-1` container (auto-started with Docker Desktop),
+so `docker compose up` could not rebind it. During the outage every audit write failed with
+only a `log.warning` (`audit.opportunity_failed` / `audit.execution_failed`) — no operator
+alert, defeating the `partition_validations`/`opportunities` audit mandate (AGENTS.md). The
+gap was silent: no arbs for a stretch meant no failed writes, hence no signal at all.
+
+**Decisions:**
+- **Port remap over squatter-stop** (5432→5433 host, container stays 5432): chosen because
+  `inlyneserver-db-1` belongs to another project with a restart policy and returns with
+  Docker Desktop; remapping makes arby immune permanently. The named volume `postgres_data`
+  is reused on container recreate — no data loss. Touched `docker-compose.yml`, `.env`,
+  `.env.example`, `.mcp.json`. Everything routes through `src.config.get_settings()`.
+- **Alert-and-continue, never halt** (matching every existing alert pattern): the mandate
+  gap was the missing alert, not missing halts. Placement is fail-soft by design; the
+  recorder now surfaces outages via the same `Notifier` seam the orchestrator/executor use.
+- **State machine in `PostgresAuditRecorder`** (`src/storage/audit_recorder.py`): a `_down`
+  boolean toggled synchronously — `_note_failure`/`_note_success` are sync methods that
+  fire-and-forget the notification via a background `asyncio.Task` (held in `_bg` to prevent
+  GC). This was a reviewer-driven fix: the initial implementation awaited the notification on
+  the placement path, which would delay a bet by up to 10s (Telegram's HTTP timeout) when the
+  audit store was down — violating fail-soft. Now the flag toggles instantly and the send runs
+  off the placement path; alert-once is preserved (single-threaded event loop → the `_down`
+  check inside `_note_failure` serializes). Wired into both `record_opportunity` and
+  `record_execution` — the existing fail-soft returns/warnings are byte-identical in semantics
+  (same `return None` / silent swallow), just with an alert added.
+- **`healthcheck()` + `_probe()`**: bounded `SELECT 1` (`_AUDIT_TIMEOUT_SEC=3.0`). `except
+  Exception` does NOT catch `CancelledError` (BaseException in 3.13) — watchdog cancellation
+  propagates cleanly. Drives the same down/recovered state as the write paths.
+- **`audit_watchdog()` module-level coroutine**: probe-first loop (600s default). Closes the
+  silent-week gap — an outage alerts within one interval even when no arbs (hence no audit
+  writes) occur. The immediate first probe doubles as the arm-time health check.
+- **Composition root** (`scripts/run_hot_loop.py`): recorder hoisted before
+  `ArbOrchestrator` (shared by write paths + watchdog); `reauth_triggers` renamed
+  `background_tasks` (now owns the watchdog task too); the existing `finally` cancels/awaits
+  it unchanged. Watchdog gated on `recorder is not None` (dry-run has no recorder).
+- **Notifier protocol** (`src/execution/notify.py`, unchanged): `send()` never raises — no
+  try needed around sends. `NullNotifier` (logs only) is the default when Telegram isn't
+  configured. Injecting the notifier into the recorder is consistent layering: the recorder
+  already imports from `src.execution.*`.
+- **Did NOT add a `partition_validations` writer** (out of scope): only
+  `PostgresAuditRecorder` writes today (opportunities/placements). This is DB-liveness
+  alerting, which covers all audit tables when those writers land.
+
+**State:** All code + tests green. `tests/unit/test_audit_recorder.py` (5 new tests:
+alert-once, recover-once, write-path failure drives down alert, healthy sends nothing,
+watchdog probes repeatedly). `uv run pytest -m "not integration"` → 808 passed (no
+regressions). `mypy src` clean. `ruff check`/`ruff format --check` clean. Live: arby-postgres
+recreated on 5433 with `inlyneserver-db-1` still holding 5432 — both coexist;
+`pg_isready` accepting; `healthcheck()` → `True`; integration round-trip (2 tests) green
+against the restored store on 5433.
+
+**Errors:** The first live `healthcheck()` probe hit port 5432 (the squatter) and got
+`password authentication failed` — cause was a stale `DATABASE_URL` shell env var overriding
+`.env` (pydantic-settings prioritizes real env vars). Fixed by unsetting it for the probe
+(`env -u DATABASE_URL`); the `.env` file itself was correct. Operator note: any shell with
+`DATABASE_URL` exported to 5432 must be updated or unset.
+
+**Operator notes:**
+- The armed hot loop (if still running PID 26218 from 2026-07-04) uses OLD code — restart
+  required to pick up recorder alerting + watchdog.
+- Watchdog cadence is 600s (worst-case alert latency 10 min). Change `interval_sec` default
+  only for faster/slower.
+- Alert-once per outage per process: a restarted hot loop re-alerts on its first probe.
+
+## 2026-07-04 — In-play (live-event) filter across the ingestion + reverify pipeline
+
+**Context:** The armed hot loop detected a phantom 14.73% arb on a match that was ~20
+minutes in-play (goal landed at 18:21:17Z between the books' repricing; Betsson served
+pre-goal prices flagged `Open` ~40 s later). No scraper filtered live events: BetWarrior
+passed `state: "STARTED"` events, Betsson ignored the market `deadline` field, and
+Betano's prematch coupon events weren't checked against `startTime`. Cross-book in-play
+quotes sampled seconds apart are structurally incoherent around every goal and mint phantom
+arbs.
+
+**Decisions:**
+- Filtering lives in the **scrapers only** — no `kickoff_utc` plumbing through
+  `RawOddsSnapshot`/`CanonicalQuote`/`assemble_partitions`. The reverify path reuses the
+  same scraper methods (`fetch_event_quotes` / `fetch_live_soccer`), so scraper-level gates
+  cover both detection and the kickoff boundary; central gating would add plumbing with no
+  extra protection.
+- BetWarrior (fail-closed): keep only Kambi `state == "NOT_STARTED"`. A missing/unknown
+  state is dropped (Kambi always sends it; if it ever vanishes, BW ingestion goes quiet and
+  the orchestrator's per-platform `stale_platforms` alert fires after 180 s). Gated at four
+  points — `_snapshots_for_event` (list-view 1X2), `_discover_events` (depth enumeration,
+  also saves the ~434 KB per-event fetch for live matches), and BOTH betoffer consumers
+  (`fetch_event_quotes` + `_fetch_event_depth`). The betoffer gate adds a contract check:
+  `_betoffer_event_is_prematch` raises `BetWarriorContractError` on missing `events`
+  metadata (Kambi always sends it) so the reverify path fails closed.
+- Betsson (fail-open): market `deadline` gate in the accordion parse (shared by
+  `fetch_live_soccer` and the reverify `fetch_event_quotes`). A parseable past deadline ⇒
+  in-play ⇒ dropped; absent/unparseable deadline ⇒ kept (older recon fixtures lack it, and
+  a live Betsson event can't form a detected market without a bulk-book anchor anyway).
+- Betano (fail-closed, prematch only): `_parse_danae_soccer_1x2` gains `exclude_inplay`;
+  `mode="prematch"` drops events flagged `liveNow` or whose `startTime` (epoch ms) isn't
+  provably future. `mode="live"` is untouched — it is never wired into a detection loop.
+- Resulting executor behavior needs NO executor change: `BetWarriorQuoteRefresher.refresh`
+  gets `[]` → `_not_found_quote` → `FreshQuote.decimal_odds=None` → reverifier returns 0.0
+  → abort "odds unverifiable"; a raised `BetWarriorContractError` is caught by the
+  reverifier's blanket except → same abort. A match kicking off between detection and
+  placement now aborts with zero exposure instead of placing on a live market.
+- Asymmetry (BW fail-closed vs Betsson fail-open) is intentional: Kambi's `state` is always
+  present; Betsson's `deadline` is absent from older recon. No pre-kickoff buffer — books
+  suspend prematch at kickoff themselves and the reverify layer now aborts on the boundary.
+
+**State:** All code + tests green (`uv run pytest -m "not integration"` → 801 passed;
+`mypy src` clean; `ruff check`/`ruff format --check` clean). 7 new tests pin the new
+behavior: `test_started_event_excluded`, `test_fetch_event_quotes_inplay_returns_empty`,
+`test_fetch_event_quotes_missing_events_metadata_raises`,
+`test_depth_discovery_skips_started_events`, `test_past_deadline_market_dropped`,
+`test_future_deadline_market_kept`, `test_prematch_drops_started_event`. One sibling fixture
+fix: `test_overlap_pipeline_wiring.py`'s Betano prematch event `startTime` bumped to a
+future date (the new fail-closed gate drops past-start events). The armed hot loop
+(PID 26218) is still running old code — **it needs a restart to pick up the in-play
+filtering**. Live smoke (`scripts/smoke_betwarrior.py`) is vacuous outside an Argentine
+matchday; rely on the unit tests until then.
+
+## 2026-07-03 — Betsson relogin live triage: selectors + geolocation interstitial
+
+**Context:** Betsson was manually logged out while the armed hot loop was running. The
+question was whether detection failed, reauth dispatch failed, or the Betsson relogin
+mechanism itself could not log back in.
+
+**Decisions:**
+- CDP-attached read-only to the live Betsson window on port 9223 and evaluated the same
+  auth-state predicate shape as `_BETSSON_AUTH_SCAN_JS`: the logged-out page returned
+  `hasBalance=False`, `hasLoginTrigger=True`, `loggedOut=True`, so DOM detection is viable.
+- The live process could not reauth because it had loaded blank
+  `_BETSSON_LOGIN_EMAIL_SEL` / `_BETSSON_LOGIN_PASSWORD_SEL` constants; editing the file is
+  not enough for the already-running process.
+- Captured the live login-popup inputs after clearing Betsson's app-level geolocation
+  interstitial: email `[data-test-id='email-input']`, password
+  `[data-test-id='password-input']`. Added first-class geolocation constants for
+  `[data-test-id='geolocation-container']` and `[data-test-id='geolocation-cta-content-btn-1']`.
+- `_open_betsson_login_form()` now handles the geolocation interstitial by clicking the CTA
+  and re-clicking the login trigger before continuing to poll for the email input. No CDP
+  sidecar script shipped: a mutating sidecar would not share the bot's `_page_lock`; the
+  lock-safe independent drill remains `/tmp/arby_force_betsson_reauth` inside `run_hot_loop`.
+
+**State:** Syntax, ruff, mypy, affected tests, and full non-integration tests are green.
+The running hot-loop process still needs a restart before it can load the filled selectors
+and geolocation handling. Live validation path: restart/run through normal startup gates,
+manually log Betsson out, then `touch /tmp/arby_force_betsson_reauth`; expect
+`transport.betsson_relogin_ok` and `hot_loop.reauth_trigger_result platform=betsson ok=True`.
+
+**Errors:** `/tmp/arby_hot_loop.log` was empty because this run logs structlog to stdout,
+so it could not prove whether detection fired. A first attempted CDP sidecar was discarded
+before use because it would race the live bot's page lock.
+
+## 2026-07-02 — Generalize auto re-auth: BetWarrior → BetWarrior + Betsson
+
+**Context:** Detect a logged-out Betsson session via header truth (balance button +
+"Retirar"/"Depósito" when logged in; "Iniciar sesión" trigger when logged out) and run an
+automated logout→login on the bot's own window, "same as betwarrior" — BOTH the manager
+path (heartbeat detects → suspend → auto-relogin → resume) AND the executor's mid-arb
+reactive retry on a placement 401. The BW re-auth pipeline already existed in three
+BetWarrior-only spots (the re-auth gate, `_relogin_session`, the executor `_reauth`); this
+generalizes them to Betsson and adds Betsson-specific detection + relogin.
+
+**Decisions:**
+- Betsson auth truth read via a NEW bounded open-shadow walk `_BETSSON_AUTH_SCAN_JS`
+  (copies `_BETSSON_REALITY_CHECK_SCAN_JS`'s vis filter + depth/visited caps). Returns
+  {loggedIn, loggedOut, expiredPhrase}. loggedIn = visible `[data-test-id="balance-button"]`
+  AND visible "Retirar"/"Depósito" text scoped to the header band (top 20% of the viewport —
+  so promo/body copy can't false-green); loggedOut = no logged-in markers AND the login
+  trigger visible (the positive signal is required — absence alone false-positives mid-
+  render). The session-expired phrase list is injected from the Python tuple (single source
+  of truth). Selectors grounded by read-only recon 2026-07-02 + operator DOM facts.
+- `check_session_blocked` RESTRUCTURED: the Betsson branch (reality-check scan → new auth
+  scan) now runs BEFORE the generic light-DOM phrase loops, so a logged-out header / shadow
+  session-expired popup classifies as a blocking overlay that schedules auto-reauth, not a
+  body-only banner. Reality-check still wins first inside the branch. Fail-open per scan.
+- `establish_betsson_context` guard widened: skip the hard goto on a `session_expired`
+  OVERLAY too (not just reality_check) — a goto can reset the login popup mid-relogin and
+  can never revive a dead session; the manager's `attempt_betsson_relogin` owns recovery.
+  `is_overlay` scoping kept EXACT so a body-only session_expired banner still gotos (a
+  recoverable cold session must not be stranded). Event renamed
+  `betsson_context_skipped_reality_check` → `betsson_context_skipped_blocked` (kind=...).
+- `attempt_betsson_relogin` is SCAN-FIRST (differs from BW deliberately): it trusts the
+  header truth, so a caller may invoke it on any suspected auth problem without risking a
+  logout of a healthy session — this prevents pointless relogins on ctx-loss and turns a
+  manager/executor double-relogin race into a cheap re-establish. Betsson renders its ENTIRE
+  SPA in open shadow DOM. The login trigger opener now uses a bounded Playwright locator
+  click after `_BETSSON_FIND_VISIBLE_CENTER_JS` proves a visible trigger, then falls back
+  to the same center-finder + REAL pointer path used for geolocation/logout/input/submit.
+  Text is typed via `page.keyboard` into the focused input. Establish
+  gate runs OUTSIDE the page lock (non-reentrant).
+- Relogin fail-safety refinements (reviewer-driven): the healthy/logout decisions key on
+  `hasBalance` (exposed from the scan), NOT the stricter `loggedIn` — a header-text under-
+  detection must not drop a healthy (balance-visible) session into the form/reload flow; the
+  recon-gated selector check sits at the very top (unconfigured = fully inert: no scan, no
+  nav, just `betsson_relogin_not_configured`); and the establish gate runs INSIDE the fail-
+  soft try (a goto timeout returns False instead of escaping to trip the kill switch).
+- Reactive classifier is 401-ONLY on the Betsson placer (the mirror of BW). Missing-ctx is
+  deliberately NOT reactive (context-loss ≠ logged out; the manager owns it). Step 2's
+  scan-first shape makes a future widening safe, but not done now.
+- Manager + executor generalized: re-auth gate `name in ("betwarrior","betsson")`;
+  `_relogin_session` dispatches `attempt_betsson_relogin` for betsson; `WarmTransport`
+  protocol gains `attempt_betsson_relogin`; executor notice + comment made platform-neutral
+  (`leg.platform`); `run_hot_loop._reauth` dispatches by platform.
+
+**State:** All code + tests land green (latest: `uv run pytest -m "not integration"` → 794
+passed; `mypy src` clean; `ruff check` clean). The email + password login-popup input
+selectors are RECON-GATED — headless recon could not open the popup (Betsson's fraud stack
+and OneTrust banner block headless), so they ship as empty constants and
+`attempt_betsson_relogin` logs `transport.betsson_relogin_not_configured` + returns False
+before any scan/page touch until the operator runs `scripts/probe_betsson_auth.py` (the
+decision-record script) and transcribes the two literals. Until then Betsson reauth is
+inert-but-safe (never adds exposure; the session is picked up by the next heartbeat). No
+transport-level test of the relogin click choreography (matching BW, which has none) — it is
+live-DOM work proven by the operator post-deploy.
+
+**Live-proof checklist (operator, post-deploy):**
+- [ ] Run `uv run python scripts/probe_betsson_auth.py`; transcribe the email/password
+      selectors into `_BETSSON_LOGIN_EMAIL_SEL` / `_BETSSON_LOGIN_PASSWORD_SEL`.
+- [ ] Direct drill after selector transcription: run the hot loop (dry-run is enough), log
+      out the Betsson window manually, then `touch /tmp/arby_force_betsson_reauth`; expect
+      `hot_loop.reauth_trigger_result platform=betsson ok=True` plus
+      `transport.betsson_relogin_ok`.
+- [ ] Heartbeat path: log out the Betsson window manually → within one heartbeat: suspend
+      alert "🔌 SESSION EXPIRED (header logged out …)" → `transport.betsson_relogin_ok` →
+      `hot_sessions.session_reauth_ok` → "✅ Sessions ready again", and a placement succeeds
+      afterwards (ctx- re-established).
+- [ ] Reactive leg: the first real Betsson 401 in the placement audit log proves the
+      executor retry (cannot be operator-triggered safely on demand).
+
+## 2026-07-02 — Betsson Reality Check: harden the post-close resume leg + pin it with tests
+
+**Context:** Request was to "trigger a heartbeat right after the close finishes" so the
+chain (close popup → check Betsson → reactivate auto-placement) doesn't wait for the
+periodic heartbeat. Grounded finding: that hook already existed — `_apply_recovered`
+(`src/execution/hot_session.py`) runs on every success path of the close task and does
+exactly `_probe_readiness()` → `_apply_health()` → `_start_pending_recoveries()`, which
+resets the kill-switch trip and sends "✅ Sessions ready again." Adding a NEW post-close
+hook (or routing through the public `heartbeat()`, which only probes+logs and never calls
+`_apply_health`, so it can't unsuspend) would have been wrong. The real gaps were: (1)
+`_apply_recovered` probed exactly ONCE, so if `establish_betsson_context()` returned False
+right after the Cerrar click (SPA still settling / transient nav fault), resume waited up
+to `heartbeat_sec` (300 s in prod) for the next periodic probe; (2) every existing RC test
+ran `heartbeat_sec=0.01`, masking any regression that deleted `_apply_recovered` entirely.
+
+**Decisions:**
+- Bounded re-probe retry loop in `_apply_recovered`: one immediate probe +
+  `_REALITY_CHECK_RESUME_REPROBES=3` extra probes at `_REALITY_CHECK_RESUME_REPROBE_DELAY_S=15.0`
+  (~45 s budget on top of each probe's own ≤120 s `_PROBE_TIMEOUT_S`), then give up to the
+  periodic heartbeat. Never loops forever. Break is `name not in not_ready` (Betsson
+  placeable), not `not not_ready`, so a concurrent cold platform correctly leaves its kill
+  switch to the heartbeat. `_apply_health` alerts only on transitions, so repeated
+  still-not-ready probes never spam.
+- A `_probe_readiness()` fault is consumed as a retry (logs
+  `hot_sessions.reality_check_reprobe_error`, `continue`s) instead of aborting the recovery;
+  exhaustion logs `hot_sessions.reality_check_resume_reprobes_exhausted`. Note: this guard
+  wraps `_probe_readiness()` itself (reachable only if e.g. `_record_new_blocks` raises),
+  NOT the per-platform probe — those are already swallowed by `_probe_readiness`'s internal
+  `_safe`/`_block` wrappers and surface as a normal not-ready result.
+- Scope held: popup-APPEARANCE→detection latency (also up to 300 s) is a different fix
+  class (new probe source / faster cadence) and was explicitly declined. `_keepalive_loop`
+  and the 300 s `heartbeat_sec` are untouched. Promotions/re-auth recovery tasks keep their
+  single-shot re-probe (no evidence of delayed readiness there).
+
+**State:** 3 new tests in `tests/unit/test_hot_session.py` (resume without periodic
+heartbeat; delayed readiness resumes via retries; reprobe budget is bounded — pins
+`establish_calls == 1 + 1 + _REALITY_CHECK_RESUME_REPROBES`). `_FakeTransport` gained a
+`context_ok_pending`/`establish_fail_after_close` knob for "ready only N probes after the
+close". `scripts/view_hot_sessions.py` `_SESSION_EVENTS` gained
+`hot_sessions.reality_check_close_failed` + `hot_sessions.reality_check_resume_reprobes_exhausted`.
+`uv run pytest -m "not integration"` 780 passed; `ruff check --fix`+`format` clean; `mypy src` clean.
+Live proof (operator, post-deploy): RC close → `reality_check_reprobe_error`* →
+`guardrails.kill_switch_reset` + "ready again" should complete within ~2 probe durations,
+never a 5-minute wait; `resume_reprobes_exhausted` recurring means the budget needs tuning.
+
+## 2026-07-02 — BetWarrior bet-recapture: salvage odds-change rejects instead of blind reject
+
+**Context:** When BetWarrior (Kambi) odds move between the pre-place reverify and the
+`coupon.json` POST (we place with `allowOddsChange:"NO"` at exact `odds_x1000`), Kambi
+400s with `"Invalid odds specified"` and the executor aborted (leg A) or went naked
+(later legs). Same for a pre-place tolerance failure on a later leg — the biggest
+exposure window (up to 16s of BW live-delay polling on the previous leg). Betsson already
+recaptured its analogous reject via a server-supplied `validOdds`; Kambi's reject carries
+NO replacement price, so recapture had to re-fetch fresh odds itself and re-price through
+the arb layer.
+
+**Decisions:**
+- New pure allocator `allocate_residual` in `src/arbitrage/stake_allocator.py`: closed-form
+  MaxMin around already-filled legs (target `C = min(min placed payout, budget/Σ(1/o),
+  min cap·o)`; `s_j = floor(C/o_j)`). Default floor 0 ARS — once money is live, a locked
+  break-even beats naked exposure. Mirrors `allocate_maxmin`'s cap/increment/min_stake gates.
+- `odds_rejected` flag on `PlacementResult`; `betwarrior_odds_rejected` classifier
+  (matches `"Invalid odds specified"` under `message`/`reason`, case-insensitive) wired
+  into `BetWarriorLegPlacer.place`'s 400 branch. No in-placer retry (unlike Betsson) — the
+  executor owns the recapture.
+- Executor place loop restructured `for`→`while` with TWO bounded recapture triggers per
+  leg (pre-place drift; `odds_rejected` after a clean, non-`pending_unknown` reject),
+  each gated by a per-leg-index `recaptured` set (one attempt per leg, no loop). A new
+  `ResidualReprice` callback (injected by the bridge) re-prices the not-yet-placed suffix;
+  leg-A recapture reuses the existing `revalidate` (full re-price). `allowOddsChange` stays
+  `"NO"` — we re-fetch from our Tier-2 feed and re-price, never accept a worse price blind.
+- Architecture honored: the executor never decides profitability — all re-pricing lives in
+  `src/arbitrage/`, reached via injected callbacks from `arb_executor.py` (the `_residual`
+  closure), exactly like the existing `_revalidate`/`detect_arbitrage` pattern.
+- Advisor/reviewer-driven hardening: (a) a `_repricing_matches` identity guard
+  (platform/match/market/outcome/selection+event refs + length) fails a recapture CLOSED
+  on any book/selection drift, and the SAME guard also covers the phase-2 `revalidate`
+  result (consistency — the leg-A recapture path already validated that callback); (b)
+  `_recapture` validates the re-priced suffix CUMULATIVELY against the per-match/total
+  caps (tentative record+release so each leg sees the prior suffix legs' exposure), so a
+  multi-leg re-price can't slip B+C past a cap that each leg passes alone.
+
+**State:** Focused suite green — `test_stake_allocator`/`test_placers`/`test_leg_placer`/
+`test_executor`/`test_arb_executor` (155 passed incl. the hand-computed residual example:
+placed payout 1000 / stake 700, remaining odds 4.0, budget 1000 → stake 250, profit 50).
+mypy strict + ruff clean on changed src. The recapture is bounded to once per leg index;
+`pending_unknown` and non-odds rejects never recapture; no-`residual` default keeps today's
+naked behavior. Live proof pending (operator): watch for `executor.recaptured` following a
+`leg_placer.http_error status=400` invalid-odds event; the completion alert shows the
+re-sized stakes. No schema/migration change; no new deps.
+
 ## 2026-06-29 — Betsson reality-check: exclusive detection (phrase AND close button)
 
 **Context:** The bot overreported reality-check popups — it fired on any Betsson page

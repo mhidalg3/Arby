@@ -68,9 +68,7 @@ async def main() -> int:
         )
         for cycle in range(1, cycles + 1):
             partitions = await source.fetch()
-            cross = {
-                m: q for m, q in partitions.items() if len({leg.platform for leg in q}) >= 2
-            }
+            cross = {m: q for m, q in partitions.items() if len({leg.platform for leg in q}) >= 2}
             log.info(
                 "loop.cycle",
                 cycle=cycle,

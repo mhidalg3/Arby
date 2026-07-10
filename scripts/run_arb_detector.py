@@ -102,16 +102,12 @@ async def main() -> int:
     run_seconds = float(run_seconds_env) if run_seconds_env else None
     min_margin_pct = _read_float_env("DETECTOR_MIN_MARGIN_PCT", DEFAULT_MIN_MARGIN_PCT)
     staleness_sec = _read_float_env("DETECTOR_STALENESS_SEC", DEFAULT_STALENESS_SEC)
-    emit_throttle_sec = _read_float_env(
-        "DETECTOR_EMIT_THROTTLE_SEC", DEFAULT_EMIT_THROTTLE_SEC
-    )
+    emit_throttle_sec = _read_float_env("DETECTOR_EMIT_THROTTLE_SEC", DEFAULT_EMIT_THROTTLE_SEC)
 
     # Stake-sizing knobs. Total capital MUST be tuned per deployment;
     # the default is a placeholder (~1M ARS ≈ $800-1k USD). Other
     # knobs default to the StakeSizingPolicy class defaults.
-    total_capital_ars = _read_float_env(
-        "RISK_TOTAL_CAPITAL_ARS", DEFAULT_TOTAL_CAPITAL_ARS
-    )
+    total_capital_ars = _read_float_env("RISK_TOTAL_CAPITAL_ARS", DEFAULT_TOTAL_CAPITAL_ARS)
     max_fraction_per_arb = _read_float_env(
         "RISK_MAX_FRACTION_PER_ARB", StakeSizingPolicy().max_fraction_per_arb
     )

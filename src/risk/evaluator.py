@@ -50,9 +50,7 @@ class RiskEvaluator:
 
     policy: RiskPolicy
 
-    def evaluate(
-        self, opp: ArbitrageOpportunity, now: float | None = None
-    ) -> RiskDecision:
+    def evaluate(self, opp: ArbitrageOpportunity, now: float | None = None) -> RiskDecision:
         """Run the rule cascade. Return the decision."""
         evaluated_at = now if now is not None else time.time()
         rules_evaluated: list[str] = []
@@ -64,9 +62,7 @@ class RiskEvaluator:
         fixture_id = market_id.split("|", 1)[0] if "|" in market_id else market_id
         platforms = tuple(sorted({leg.platform for leg in opp.legs}))
         confidence = self._compute_confidence(opp)
-        high_margin_warning = (
-            opp.realized_roi_pct >= self.policy.high_margin_warning_pct
-        )
+        high_margin_warning = opp.realized_roi_pct >= self.policy.high_margin_warning_pct
 
         def _reject(reason: str) -> RiskDecision:
             return RiskDecision(
@@ -116,9 +112,7 @@ class RiskEvaluator:
         for leg, stake in zip(opp.legs, opp.stakes, strict=True):
             effective_cap = leg.max_stake if leg.max_stake is not None else per_leg_cap
             if not math.isfinite(stake) or stake <= 0:
-                return _reject(
-                    f"non-positive stake {stake} on {leg.platform}/{leg.outcome}"
-                )
+                return _reject(f"non-positive stake {stake} on {leg.platform}/{leg.outcome}")
             if stake > effective_cap:
                 return _reject(
                     f"leg stake {stake:.2f} on {leg.platform}/{leg.outcome} "
@@ -128,10 +122,7 @@ class RiskEvaluator:
         # Rule 5: confidence (product of per-platform reliability)
         rules_evaluated.append("confidence")
         if confidence < self.policy.min_confidence:
-            return _reject(
-                f"confidence={confidence:.3f} below "
-                f"min={self.policy.min_confidence}"
-            )
+            return _reject(f"confidence={confidence:.3f} below min={self.policy.min_confidence}")
 
         # All rules passed.
         return RiskDecision(

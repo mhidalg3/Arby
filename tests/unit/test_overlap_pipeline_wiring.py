@@ -47,7 +47,7 @@ _BETANO_PREMATCH: dict[str, Any] = {
                         {"name": "Belgrano", "teamId": 2},
                     ],
                     "url": "/cuotas-de-partido/gimnasia-jujuy-belgrano/700001/",
-                    "startTime": 1780156800000,
+                    "startTime": 4102444800000,
                 }
             },
             "markets": {
@@ -103,12 +103,27 @@ _BETSSON_ACCORDION: dict[str, Any] = {
                     }
                 ],
                 "selections": [
-                    {"marketId": "m-GJB-MW3W", "id": "s-home", "label": "Gimnasia Jujuy",
-                     "odds": 3.95, "status": "Open"},
-                    {"marketId": "m-GJB-MW3W", "id": "s-draw", "label": "Empate",
-                     "odds": 3.05, "status": "Open"},
-                    {"marketId": "m-GJB-MW3W", "id": "s-away", "label": "Belgrano",
-                     "odds": 2.02, "status": "Open"},
+                    {
+                        "marketId": "m-GJB-MW3W",
+                        "id": "s-home",
+                        "label": "Gimnasia Jujuy",
+                        "odds": 3.95,
+                        "status": "Open",
+                    },
+                    {
+                        "marketId": "m-GJB-MW3W",
+                        "id": "s-draw",
+                        "label": "Empate",
+                        "odds": 3.05,
+                        "status": "Open",
+                    },
+                    {
+                        "marketId": "m-GJB-MW3W",
+                        "id": "s-away",
+                        "label": "Belgrano",
+                        "odds": 2.02,
+                        "status": "Open",
+                    },
                 ],
             }
         }
@@ -141,7 +156,7 @@ async def test_real_scrapers_and_canonicalizer_form_a_cross_platform_market() ->
         out = await src.fetch()
 
     assert len(out) == 1, f"expected one cross-platform 1X2 market, got {list(out)}"
-    (market_id, quotes), = out.items()
+    ((market_id, quotes),) = out.items()
     assert market_id.endswith("|1x2")
     platforms = {q.platform for q in quotes}
     # THE regression guard: Betsson must link (empty slug would drop it).

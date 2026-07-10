@@ -62,8 +62,15 @@ _BASE_URL = {
 # equivalents of "is the place button green". `--capture-session` records these so
 # the per-platform readiness check is built against the real contract, not a guess.
 _READINESS_HINTS = (
-    "validate", "balance", "account", "wallet", "session", "punter",
-    "user-context", "profile", "kambicdn.com/player/",
+    "validate",
+    "balance",
+    "account",
+    "wallet",
+    "session",
+    "punter",
+    "user-context",
+    "profile",
+    "kambicdn.com/player/",
 )
 
 
@@ -488,7 +495,9 @@ async def _capture_bplay_ui(args: argparse.Namespace) -> None:
             print("\n=== RESULT ===\nno bettingslip POST observed (no bet placed in the window)")
             return
         complete = _placed()
-        tag = "COMPLETE" if complete else "INCOMPLETE — the PLACE call (.../bettingslip) was NOT seen"
+        tag = (
+            "COMPLETE" if complete else "INCOMPLETE — the PLACE call (.../bettingslip) was NOT seen"
+        )
         print(f"\n=== CAPTURED bettingslip flow on bplay ({len(calls)} calls) — {tag} ===")
         for c in calls:
             print(f"\n  POST {c['url']}")
@@ -498,7 +507,11 @@ async def _capture_bplay_ui(args: argparse.Namespace) -> None:
             if rp:
                 print(f"     -> {rp[0]}  {rp[1]}")
         out = REPO_ROOT_ARTIFACTS / f"bplay_betslip_capture_{int(_time.time())}.json"
-        out.write_text(json.dumps({"calls": calls, "responses": {k: list(v) for k, v in resps.items()}}, indent=2))
+        out.write_text(
+            json.dumps(
+                {"calls": calls, "responses": {k: list(v) for k, v in resps.items()}}, indent=2
+            )
+        )
         print(f"\n  saved → {out}")
         if not complete:
             print("  ⚠️  Re-run and actually PLACE the bet — I need the .../bettingslip POST.")
@@ -566,7 +579,9 @@ async def _capture_session(platform: str) -> None:
                 print(f"     -> {resp[0]}  {resp[1]}")
         out = REPO_ROOT_ARTIFACTS / f"{platform}_session_capture_{int(_time.time())}.json"
         out.write_text(
-            json.dumps({"requests": reqs, "responses": {k: list(v) for k, v in resps.items()}}, indent=2)
+            json.dumps(
+                {"requests": reqs, "responses": {k: list(v) for k, v in resps.items()}}, indent=2
+            )
         )
         print(f"\n  saved → {out}")
         print("  Paste the validate / balance / session call (URL, method, body, response) and")
@@ -689,7 +704,9 @@ async def _capture_betwarrior_ui(args: argparse.Namespace) -> None:
 
     from scripts.recon.stealth import apply_stealth  # noqa: PLC0415
 
-    print(f"⚠️  CAPTURE MODE on betwarrior — you place via the app; I record it.\n  {_BASE_URL['betwarrior']}")
+    print(
+        f"⚠️  CAPTURE MODE on betwarrior — you place via the app; I record it.\n  {_BASE_URL['betwarrior']}"
+    )
     cap: dict[str, object] = {}
 
     def on_request(req: object) -> None:
@@ -787,8 +804,10 @@ async def _arm_betwarrior(args: argparse.Namespace) -> None:
         # Dynamic capture: re-read the CURRENT odds right now (not the stale CLI value).
         current = await _betwarrior_live_odds(args.event_id, args.selection)
         if current is None:
-            print("\n=== RESULT (betwarrior) ===\nABORT: couldn't read live odds for that "
-                  "selection (check --event-id / --selection from --discover) — nothing placed")
+            print(
+                "\n=== RESULT (betwarrior) ===\nABORT: couldn't read live odds for that "
+                "selection (check --event-id / --selection from --discover) — nothing placed"
+            )
             return
         floor = args.odds * (1.0 - args.odds_tolerance_pct / 100.0)
         print(
@@ -806,8 +825,12 @@ async def _arm_betwarrior(args: argparse.Namespace) -> None:
         # Place AT the verified current odds — Kambi wants the EXACT current odds with
         # allowOddsChange:NO (as the app does); a sub-second move just 400s and we retry.
         leg = Leg(
-            platform="betwarrior-pba", match_id=args.event_id, market="1X2",
-            outcome=args.outcome, stake_ars=args.stake, odds=current,
+            platform="betwarrior-pba",
+            match_id=args.event_id,
+            market="1X2",
+            outcome=args.outcome,
+            stake_ars=args.stake,
+            odds=current,
             platform_outcome_id=args.selection,
         )
         res = await BetWarriorLegPlacer(transport).place(leg)
@@ -937,7 +960,12 @@ def main() -> None:
     p.add_argument("--event-id", default="", help="Betano eventId (from --discover)")
     p.add_argument("--slug", default="", help="Betsson event-page slug (from --discover)")
     p.add_argument("--outcome", default="home", help="label only, for logging")
-    p.add_argument("--odds", type=float, default=0.0, help="expected odds (from discovery) — the re-verify floor reference")
+    p.add_argument(
+        "--odds",
+        type=float,
+        default=0.0,
+        help="expected odds (from discovery) — the re-verify floor reference",
+    )
     p.add_argument(
         "--odds-tolerance-pct",
         type=float,

@@ -150,7 +150,9 @@ class BetanoScraper(BaseScraper):
         block = self._extract_feed_block(data)
         observed_at = time.time()
         n = 0
-        for snapshot in _parse_danae_soccer_1x2(block, observed_at=observed_at):
+        for snapshot in _parse_danae_soccer_1x2(
+            block, observed_at=observed_at, exclude_inplay=self.mode == "prematch"
+        ):
             n += 1
             yield snapshot
         self._log.debug("scraper.parsed", snapshots=n)
@@ -203,14 +205,19 @@ class BetanoScraper(BaseScraper):
 
 
 def _parse_danae_soccer_1x2(
-    block: dict[str, Any], *, observed_at: float
+    block: dict[str, Any], *, observed_at: float, exclude_inplay: bool = False
 ) -> Iterator[RawOddsSnapshot]:
     """Yield 1X2 snapshots for real soccer matches from a danae feed block.
 
-    Pure function over the normalized `{events, markets, selections}`
+    Pure function over the normalized ``{events, markets, selections}``
     shape shared by the live and pre-match endpoints. Skips outright
     markets, virtuals, and esports; emits only the standard MRES 1X2
     market (home / draw / away) for events with two participants.
+
+    When ``exclude_inplay`` is set (prematch mode), drop events flagged
+    ``liveNow`` or whose ``startTime`` (epoch ms) isn't provably in the
+    future — fail-closed so a goal-straddling in-play quote can't form
+    a cross-book phantom arb.
     """
     events: dict[str, Any] = block["events"]
     markets: dict[str, Any] = block["markets"]
@@ -224,6 +231,13 @@ def _parse_danae_soccer_1x2(
         url = str(event.get("url", ""))
         if "esports" in url.lower() or url.startswith("/virtuals/"):
             continue
+        start_ms = event.get("startTime")
+        if exclude_inplay:
+            if event.get("liveNow"):
+                continue
+            # Fail-closed: no parseable future start time ⇒ not provably prematch.
+            if not isinstance(start_ms, int | float) or float(start_ms) / 1000.0 <= observed_at:
+                continue
         participants = event.get("participants")
         if not (isinstance(participants, list) and len(participants) == 2):
             continue  # outright / non-head-to-head
@@ -261,6 +275,7 @@ def _parse_danae_soccer_1x2(
                 decimal_odds=float(price),
                 max_stake=None,  # not in public feed; bet-slip only
                 timestamp=observed_at,
+                kickoff_utc=float(start_ms) / 1000.0 if isinstance(start_ms, int | float) else None,
             )
 
 

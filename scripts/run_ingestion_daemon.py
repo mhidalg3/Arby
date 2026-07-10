@@ -52,6 +52,11 @@ import os
 import signal
 import sys
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.ingestion.pg_recorder import PgRecorder
+
 
 import httpx
 import structlog
@@ -61,6 +66,7 @@ from src.config import get_settings
 from src.ingestion.rate_limit import RateLimitGuard
 from src.ingestion.redis_sink import RedisSnapshotSink
 from src.ingestion.scrapers.base import BaseScraper, RawOddsSnapshot
+from src.ingestion.scrapers.betano import BetanoScraper
 from src.ingestion.scrapers.betsson import BetssonScraper
 from src.ingestion.scrapers.betwarrior import (
     BetWarriorPbaDepthScraper,
@@ -108,6 +114,7 @@ def _build_scrapers(
     bplay_sse_http: httpx.AsyncClient,
     betwarrior_http: httpx.AsyncClient,
     betwarrior_depth_http: httpx.AsyncClient,
+    betano_http: httpx.AsyncClient,
 ) -> list[BaseScraper]:
     """One scraper per supported platform-and-mode.
 
@@ -125,17 +132,21 @@ def _build_scrapers(
     Set `DISABLE_BPLAY=1` to omit both Bplay scrapers — used when
     Bplay is rate-limited / blocked and we want to keep running
     Betsson + BetWarrior only.
+
+    Set DISABLE_BETSSON=1 when the hot loop is running with RECORD_TICKS=1 —
+    the hot loop's overlap-linker tee supplies Betsson ticks, and running both
+    Betsson pollers doubles traffic to the WAF-sensitive book.
     """
     # BetWarrior's two scrapers hit the same Kambi host — share one
     # circuit so a block detected by either protects both.
     betwarrior_guard = RateLimitGuard(platform="betwarrior-pba")
     scrapers: list[BaseScraper] = [
-        BetssonScraper(http_client=betsson_http, subdomain="pba"),
+        BetanoScraper(http_client=betano_http, mode="prematch"),
         BetWarriorPbaScraper(http_client=betwarrior_http, guard=betwarrior_guard),
-        BetWarriorPbaDepthScraper(
-            http_client=betwarrior_depth_http, guard=betwarrior_guard
-        ),
+        BetWarriorPbaDepthScraper(http_client=betwarrior_depth_http, guard=betwarrior_guard),
     ]
+    if os.environ.get("DISABLE_BETSSON", "").strip() not in ("1", "true", "yes"):
+        scrapers.append(BetssonScraper(http_client=betsson_http, subdomain="pba"))
     if os.environ.get("DISABLE_BPLAY", "").strip() not in ("1", "true", "yes"):
         # Bplay XML + SSE also share a host (deportespba.bplay.bet.ar);
         # one shared circuit means a 403 on either source immediately
@@ -158,6 +169,7 @@ async def _run_pipeline(
     sink: RedisSnapshotSink,
     run_seconds: float | None,
     log: structlog.BoundLogger,
+    recorder: PgRecorder | None = None,
 ) -> None:
     """Start every producer + the consumer, manage graceful shutdown."""
     producers: list[asyncio.Task[None]] = [
@@ -180,12 +192,19 @@ async def _run_pipeline(
         _maybe_auto_stop_after(stop_event, run_seconds), name="auto_stop"
     )
 
+    # The recorder is a SECOND, independent Redis consumer (XREADGROUP on
+    # odds:raw). It is NOT part of the sink's producer-drain gate — the sink
+    # shuts down when producers finish, regardless of the recorder. But it IS
+    # watched + surfaced so a silent Postgres/consumer-group failure doesn't
+    # leave the operator thinking ticks are being recorded when they aren't.
+    recorder_task: asyncio.Task[None] | None = None
+    if recorder is not None:
+        recorder_task = asyncio.create_task(recorder.run(stop_event), name="pg_recorder")
+
     watch_tasks: list[asyncio.Task[None]] = [*producers, consumer]
+    if recorder_task is not None:
+        watch_tasks.append(recorder_task)
     try:
-        # If any single watched task exits before stop is set, treat
-        # it as unexpected: log + trip stop so the rest shut down
-        # cleanly. (One producer crashing should not silently leave
-        # the others running with no visibility.)
         done, _ = await asyncio.wait(watch_tasks, return_when=asyncio.FIRST_COMPLETED)
         if not stop_event.is_set():
             log.warning(
@@ -198,7 +217,10 @@ async def _run_pipeline(
     finally:
         auto_stop.cancel()
         # Surface task exceptions so an early failure is visible.
-        for t in (*producers, aggregator, consumer, auto_stop):
+        scan_tasks = (*producers, aggregator, consumer, auto_stop)
+        if recorder_task is not None:
+            scan_tasks = (*scan_tasks, recorder_task)
+        for t in scan_tasks:
             if t.done() and not t.cancelled() and t.exception():
                 log.exception(
                     "daemon.task_failed",
@@ -250,10 +272,15 @@ async def main() -> int:
         httpx.AsyncClient(
             headers=headers, timeout=depth_timeout, follow_redirects=True
         ) as betwarrior_depth_http,
+        httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as betano_http,
     ):
         scrapers = _build_scrapers(
-            betsson_http, bplay_http, bplay_sse_http,
-            betwarrior_http, betwarrior_depth_http,
+            betsson_http,
+            bplay_http,
+            bplay_sse_http,
+            betwarrior_http,
+            betwarrior_depth_http,
+            betano_http,
         )
         log.info("daemon.scrapers_initialized", platforms=[s.platform_name for s in scrapers])
 
@@ -266,7 +293,26 @@ async def main() -> int:
             log.info("daemon.redis_connected")
 
             sink = RedisSnapshotSink(redis_client=redis_client)
-            await _run_pipeline(scrapers, queue, stop_event, sink, run_seconds, log)
+
+            # Postgres tick recording: off by default. Enable with RECORD_TO_PG=1.
+            # The recorder reads odds:raw via its own consumer group (decoupled
+            # from the daemon's asyncio.Queue) and writes change-compressed rows
+            # to the odds_snapshots hypertable.
+            recorder: PgRecorder | None = None
+            if os.environ.get("RECORD_TO_PG", "").strip() in ("1", "true", "yes"):
+                from src.ingestion.pg_recorder import PgRecorder
+                from src.semantic.canonicalizer import Canonicalizer
+                from src.semantic.fixture_resolver import FixtureResolver
+
+                recorder = PgRecorder(
+                    redis_client=redis_client,
+                    canonicalizer=Canonicalizer(fixture_resolver=FixtureResolver()),
+                )
+                log.info("daemon.pg_recorder_enabled")
+
+            await _run_pipeline(
+                scrapers, queue, stop_event, sink, run_seconds, log, recorder=recorder
+            )
         finally:
             await redis_client.aclose()
             log.info("daemon.stopped")

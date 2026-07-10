@@ -20,10 +20,11 @@ import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 import structlog
 
+from src.arbitrage.garch import SpreadObs, spread_observations
 from src.arbitrage.quotes import OddsQuote
 from src.ingestion.scrapers.base import RawOddsSnapshot
 from src.semantic.canonical import EXPECTED_CELLS, CanonicalQuote
@@ -141,6 +142,14 @@ class OverlapQuoteSource:
     # the raw overlap balloons (200+ bulk fixtures ⇒ 130+ matched Betsson events); a
     # burst that size trips Betsson's WAF. Cap it so the footprint stays sustainable.
     max_linker_events: int = 50
+    # Lag model artifact (data/lag_model.json). None when absent/malformed →
+    # trigger features use built-in defaults, burst_eligible gating is skipped.
+    lag_model: dict[str, Any] | None = None
+    # Optional recording tee: every raw snapshot this source scrapes (bulk, linker,
+    # trigger paths) is copied here NON-BLOCKING for the Redis odds:raw sink.
+    # None ⇒ disabled. put_nowait + drop-on-full: recording must never stall or
+    # back-pressure the money path.
+    snapshot_sink: asyncio.Queue[RawOddsSnapshot] | None = None
     # Per-platform ingestion liveness: wall-clock of each configured book's last fresh
     # scrape (a bulk source yielded ≥1 snapshot; a linker's fixture-list call succeeded).
     # A single book going dark (WAF 403 / a block that also kills its public feed) is
@@ -151,6 +160,19 @@ class OverlapQuoteSource:
     # ``fetch()`` (rebuilt every cycle). Duck-typed by the orchestrator to render
     # fixture names in alerts; empty when a cycle produced no markets.
     market_names: dict[str, tuple[str, str]] = field(init=False, default_factory=dict)
+    # C1 trigger caches (updated, never cleared, by fetch(); trigger_fetch reads them):
+    # market_id → (cell, platform) → freshest CanonicalQuote (union across full cycles).
+    _last_canonical: dict[str, dict[tuple[str, str], CanonicalQuote]] = field(
+        init=False, default_factory=dict
+    )
+    # (market_id, platform, cell) → last seen odds (for move detection).
+    _last_odds: dict[tuple[str, str, str], float] = field(init=False, default_factory=dict)
+    # market_id → (event_id, slug) for linker surgical refetch in trigger cycles.
+    _linker_event_by_market: dict[str, tuple[str, str]] = field(init=False, default_factory=dict)
+    # market_id → hot-until timestamp (set by trigger_fetch on detected moves).
+    _hot_until: dict[str, float] = field(init=False, default_factory=dict)
+    # Count of snaps dropped because snapshot_sink was full (recording lag/outage).
+    _tee_dropped: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
         # Seed each configured book at "now" so it isn't flagged stale before its first
@@ -159,6 +181,16 @@ class OverlapQuoteSource:
             name = getattr(src, "platform_name", None)
             if isinstance(name, str) and name:
                 self._platform_last_fresh.setdefault(name, self.now_fn())
+
+    def _tee(self, snap: RawOddsSnapshot) -> None:
+        if self.snapshot_sink is None:
+            return
+        try:
+            self.snapshot_sink.put_nowait(snap)
+        except asyncio.QueueFull:
+            self._tee_dropped += 1
+            if self._tee_dropped % 500 == 1:
+                log.warning("quote_source.tee_dropped", dropped=self._tee_dropped)
 
     def stale_platforms(self, max_age_sec: float) -> dict[str, float]:
         """Configured books whose last fresh scrape is older than `max_age_sec`, mapped
@@ -172,6 +204,33 @@ class OverlapQuoteSource:
             if now - last > max_age_sec
         }
 
+    def cycle_spreads(self) -> list[SpreadObs]:
+        """Cross-platform spread observations as of NOW, from the union cache
+        (``_last_canonical``), staleness-filtered. Duck-typed by the orchestrator
+        (same pattern as ``market_names`` / ``stale_platforms``).
+
+        The cache is refreshed by both ``fetch()`` and ``trigger_fetch()``; that is
+        INTENTIONAL here. The GARCH cadence contract governs when the orchestrator
+        CALLS ``observe_cycle`` (once per full cycle — even sampling instants), not
+        the provenance of the sampled values: the offline fit series takes
+        ``keep="last"`` per 60s grid bucket, i.e. the freshest value as of each
+        sample instant, and the union cache is exactly that estimator. Excluding
+        trigger-refreshed quotes would sample staler values on precisely the
+        markets that just moved, biasing sigma² down when it should rise. Do NOT
+        build a fetch()-only shadow cache."""
+        now = self.now_fn()
+        out: list[SpreadObs] = []
+        for market_id, by_cell_platform in self._last_canonical.items():
+            out.extend(
+                spread_observations(
+                    market_id,
+                    (cq.odds_quote for cq in by_cell_platform.values()),
+                    now,
+                    self.staleness_sec,
+                )
+            )
+        return out
+
     async def fetch(self) -> dict[str, list[OddsQuote]]:
         by_market: dict[str, list[CanonicalQuote]] = defaultdict(list)
         targets: set[str] = set()  # canonical "home away" of every bulk fixture
@@ -183,6 +242,7 @@ class OverlapQuoteSource:
         for source in self.bulk_sources:
             try:
                 async for snap in source.fetch_live_soccer():
+                    self._tee(snap)
                     fresh.add(snap.platform)  # raw snapshot = the scrape reached the book
                     cq = await self.canonicalizer.canonicalize(snap)
                     if cq is not None:
@@ -248,11 +308,18 @@ class OverlapQuoteSource:
                         )
                         return []
 
-            for snaps in await asyncio.gather(*(_fetch(eid, slug) for eid, slug in overlap)):
+            for (eid, slug), snaps in zip(
+                overlap,
+                await asyncio.gather(*(_fetch(eid, slug) for eid, slug in overlap)),
+                strict=True,
+            ):
                 for snap in snaps:
+                    self._tee(snap)
                     cq = await self.canonicalizer.canonicalize(snap)
                     if cq is not None:
-                        by_market[cq.odds_quote.market_id].append(cq)
+                        mid = cq.odds_quote.market_id
+                        by_market[mid].append(cq)
+                        self._linker_event_by_market[mid] = (eid, slug)
 
         log.info(
             "overlap_quote_source.fetched",
@@ -261,6 +328,7 @@ class OverlapQuoteSource:
         )
         self._mark_fresh(fresh)
         out, self.market_names = assemble_partitions(by_market, self.now_fn(), self.staleness_sec)
+        self._update_caches(by_market)
         return out
 
     def _mark_fresh(self, platforms: set[str]) -> None:
@@ -270,3 +338,148 @@ class OverlapQuoteSource:
         now = self.now_fn()
         for p in platforms:
             self._platform_last_fresh[p] = now
+
+    def _update_caches(self, by_market: dict[str, list[CanonicalQuote]]) -> None:
+        """Populate C1 trigger caches from the latest full-cycle quotes.
+
+        Updates (never clears) so trigger cycles between fulls see the union of
+        fresh bulk quotes + cached linker quotes. Entries older than ``staleness_sec``
+        are dropped by ``assemble_partitions`` at detection time anyway.
+
+        ``_last_odds`` is scoped to BULK platforms only — linker odds must never
+        enter the move-detection baseline (would self-trigger on Betsson updates)."""
+        bulk_platforms = {getattr(s, "platform_name", "") for s in self.bulk_sources}
+        for market_id, quotes in by_market.items():
+            cache = self._last_canonical.setdefault(market_id, {})
+            for cq in quotes:
+                cell = cq.outcome.cell
+                platform = cq.odds_quote.platform
+                cache[(cell, platform)] = cq
+                if platform in bulk_platforms:
+                    self._last_odds[(market_id, platform, cell)] = cq.odds_quote.decimal_odds
+
+    def _diff_moves(self, fresh: dict[tuple[str, str, str], float]) -> set[str]:
+        """Return market_ids where any (platform, cell) odds changed ≥0.5% relative.
+
+        First sightings (no prior odds) are NOT moves. Updates ``_last_odds``."""
+        moved: set[str] = set()
+        for key, odds in fresh.items():
+            prev = self._last_odds.get(key)
+            if prev is None:
+                continue
+            if prev > 0 and abs(odds - prev) / prev >= 0.005:
+                moved.add(key[0])
+        self._last_odds.update(fresh)
+        return moved
+
+    async def trigger_fetch(self, *, burst_budget: int = 3) -> dict[str, list[OddsQuote]]:
+        """Leader-triggered burst: fetch ONLY bulk sources, detect moves, surgically
+        refetch hot linker events. Returns partitions for hot markets only; empty dict
+        when nothing hot or the Phase C gate hasn't passed.
+
+        The gate is ``TRIGGER_POLL`` (the caller only invokes this when
+        ``trigger_interval_sec > 0``). ``lag_model`` TUNES behavior, it does not
+        gate it: when ``None`` (missing/malformed artifact) all trigger features
+        use built-in defaults (120s windows) and the ``burst_eligible_market_types``
+        filter is skipped. When the artifact is present but ``burst_eligible_market_types``
+        is empty (B-report gate failed for every type), nothing bursts."""
+        # burst_eligible: None ⇒ permissive (no artifact); list ⇒ filter to those types.
+        # Malformed nested shapes degrade to safe defaults — never crash the hot loop.
+        burst_eligible: list[str] | None = None
+        if self.lag_model is not None:
+            raw_be = self.lag_model.get("burst_eligible_market_types", [])
+            burst_eligible = [str(x) for x in raw_be] if isinstance(raw_be, list) else []
+            if not burst_eligible:
+                return {}  # artifact present but gate failed for every type → no bursting
+
+        now = self.now_fn()
+
+        # 1. Fetch bulk only, canonicalize, merge into caches.
+        fresh_odds: dict[tuple[str, str, str], float] = {}
+        for source in self.bulk_sources:
+            try:
+                async for snap in source.fetch_live_soccer():
+                    self._tee(snap)
+                    cq = await self.canonicalizer.canonicalize(snap)
+                    if cq is not None:
+                        mid = cq.odds_quote.market_id
+                        cell = cq.outcome.cell
+                        platform = cq.odds_quote.platform
+                        fresh_odds[(mid, platform, cell)] = cq.odds_quote.decimal_odds
+                        self._last_canonical.setdefault(mid, {})[(cell, platform)] = cq
+            except Exception as exc:  # noqa: BLE001
+                log.warning("quote_source.trigger_bulk_error", error=str(exc))
+
+        if not fresh_odds:
+            return {}
+
+        # 2. Detect moved markets.
+        moved = self._diff_moves(fresh_odds)
+
+        # 3. Hot windows for moved markets (filtered by burst_eligible when present).
+        raw_per_type = self.lag_model.get("per_market_type", {}) if self.lag_model else {}
+        per_type = raw_per_type if isinstance(raw_per_type, dict) else {}
+        for mid in moved:
+            mt = mid.split("|", 1)[1] if "|" in mid else ""
+            if burst_eligible is not None and mt not in burst_eligible:
+                continue
+            entry = per_type.get(mt, {})
+            raw_window = entry.get("lag_p90_s", 120.0) if isinstance(entry, dict) else 120.0
+            window = raw_window if isinstance(raw_window, int | float) else 120.0
+            window = max(30.0, min(180.0, float(window)))
+            self._hot_until[mid] = now + window
+
+        # 4. Collect currently-hot markets (re-filter by burst_eligible when present).
+        hot = {
+            mid
+            for mid, exp in self._hot_until.items()
+            if exp > now
+            and (
+                burst_eligible is None
+                or (mid.split("|", 1)[1] if "|" in mid else "") in burst_eligible
+            )
+        }
+        if not hot:
+            return {}
+
+        # 5. Surgical linker refetch for hot markets with known events (oldest first).
+        hot_with_linker = sorted(
+            (mid for mid in hot if mid in self._linker_event_by_market),
+            key=lambda m: self._hot_until.get(m, 0),
+        )[:burst_budget]
+        for mid in hot_with_linker:
+            event_id, slug = self._linker_event_by_market[mid]
+            for linker in self.linkers:
+                try:
+                    snaps = await linker.fetch_event_quotes(event_id, slug)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "quote_source.trigger_event_error", event_id=event_id, error=str(exc)
+                    )
+                    continue
+                for snap in snaps:
+                    self._tee(snap)
+                    cq = await self.canonicalizer.canonicalize(snap)
+                    if cq is not None:
+                        cell = cq.outcome.cell
+                        platform = cq.odds_quote.platform
+                        # Store under the QUOTE's own market_id — a linker event
+                        # can return 1X2 + BTTS + OU; storing under the outer hot
+                        # market_id would mix quotes into wrong partitions.
+                        cq_mid = cq.odds_quote.market_id
+                        self._last_canonical.setdefault(cq_mid, {})[(cell, platform)] = cq
+
+        # 6. Assemble partitions over hot markets only. Use a FRESH timestamp for the
+        # staleness filter — `now` was captured before the bulk scrapes + surgical
+        # linker refetches, so a cached quote could have aged past staleness during
+        # those network calls; re-checking against the current time prevents a stale
+        # quote from forming a false triggered arb (which would consume the market's
+        # one dedup shot before the executor reverify aborts).
+        hot_by_market: dict[str, list[CanonicalQuote]] = defaultdict(list)
+        for mid in hot:
+            for cq in self._last_canonical.get(mid, {}).values():
+                hot_by_market[mid].append(cq)
+        out, self.market_names = assemble_partitions(
+            hot_by_market, self.now_fn(), self.staleness_sec
+        )
+        return out

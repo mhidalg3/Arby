@@ -31,6 +31,7 @@ Pure-function math:
 - Dutch book detection: `1/o_a + 1/o_b < 1` and margin above threshold.
 - Optimal stake allocation: `s_a = K/o_a, s_b = K/o_b` with proportional scaling under liquidity caps.
 - GARCH-adaptive thresholds: adjust the minimum margin requirement based on recent cross-platform spread volatility.
+- Cross-platform lag model: leader-triggered burst scanning + lag-informed placement order. See `docs/cross_platform_lag_strategy.md`.
 
 No I/O. No LLM. No async. Fully testable as pure functions.
 
